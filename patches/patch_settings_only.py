@@ -30,8 +30,11 @@ def write_file_content(path: str, content: str) -> None:
 
 
 def patch_ui_widget(base_dir: str) -> None:
-    file_path = os.path.join(base_dir, "ui_widget.c")
+    file_path = os.path.join(base_dir, "source", "interface", "ui_widget.c")
     if not os.path.exists(file_path):
+        file_path = os.path.join(base_dir, "ui_widget.c")
+    if not os.path.exists(file_path):
+        print("[WARN] ui_widget.c nicht gefunden.")
         return
 
     create_backup(file_path)
@@ -57,8 +60,12 @@ def patch_ui_widget(base_dir: str) -> None:
 
 
 def patch_event_dispatcher(base_dir: str) -> None:
-    file_path = os.path.join(base_dir, "ui_widget_event_handler_functions.c")
+    file_path = os.path.join(base_dir, "source", "interface",
+                              "ui_widget_event_handler_functions.c")
     if not os.path.exists(file_path):
+        file_path = os.path.join(base_dir, "ui_widget_event_handler_functions.c")
+    if not os.path.exists(file_path):
+        print("[WARN] ui_widget_event_handler_functions.c nicht gefunden.")
         return
 
     create_backup(file_path)
@@ -68,7 +75,8 @@ def patch_event_dispatcher(base_dir: str) -> None:
         "\n#include <stdint.h>\n"
         "#ifndef PC_MENU_FUNCTION_BASE\n"
         "#define PC_MENU_FUNCTION_BASE 0x8000\n"
-        "extern uint32_t pc_menu_event_function_invoke(int32_t function_index, int32_t widget_index, void *event_data);\n"
+        "extern uint32_t pc_menu_event_function_invoke(int32_t function_index, "
+        "int32_t widget_index, void *event_data);\n"
         "#endif\n"
     )
 
@@ -79,7 +87,8 @@ def patch_event_dispatcher(base_dir: str) -> None:
         replacement = (
             r"\1\n"
             r"    if (function_index >= PC_MENU_FUNCTION_BASE) {\n"
-            r"        return pc_menu_event_function_invoke((int32_t)function_index, (int32_t)widget_index, event_data);\n"
+            r"        return pc_menu_event_function_invoke((int32_t)function_index, "
+            r"(int32_t)widget_index, event_data);\n"
             r"    }\n"
         )
         content, count = re.subn(pattern, replacement, content, count=1)
@@ -87,11 +96,18 @@ def patch_event_dispatcher(base_dir: str) -> None:
         if count > 0:
             write_file_content(file_path, content)
             print("[OK] ui_widget_event_handler_functions.c gepatcht.")
+        else:
+            print("[WARN] ui_widget_event_handler_function_invoke nicht gefunden.")
 
 
 def patch_game_data_dispatcher(base_dir: str) -> None:
-    file_path = os.path.join(base_dir, "ui_widget_game_data_input_functions.c")
+    file_path = os.path.join(base_dir, "source", "interface",
+                              "ui_widget_game_data_input_functions.c")
     if not os.path.exists(file_path):
+        file_path = os.path.join(base_dir,
+                                  "ui_widget_game_data_input_functions.c")
+    if not os.path.exists(file_path):
+        print("[WARN] ui_widget_game_data_input_functions.c nicht gefunden.")
         return
 
     create_backup(file_path)
@@ -99,7 +115,8 @@ def patch_game_data_dispatcher(base_dir: str) -> None:
 
     hook_header = (
         "\n#include <stdint.h>\n"
-        "extern void pc_menu_game_data_function_invoke(int32_t function_index, int32_t widget_index, void *data);\n"
+        "extern void pc_menu_game_data_function_invoke(int32_t function_index, "
+        "int32_t widget_index, void *data);\n"
     )
 
     if "pc_menu_game_data_function_invoke" not in content:
@@ -109,7 +126,8 @@ def patch_game_data_dispatcher(base_dir: str) -> None:
         replacement = (
             r"\1\n"
             r"    if (function_index >= 0x8000) {\n"
-            r"        pc_menu_game_data_function_invoke((int32_t)function_index, (int32_t)widget_index, data);\n"
+            r"        pc_menu_game_data_function_invoke((int32_t)function_index, "
+            r"(int32_t)widget_index, data);\n"
             r"        return;\n"
             r"    }\n"
         )
@@ -121,7 +139,11 @@ def patch_game_data_dispatcher(base_dir: str) -> None:
 
 
 def patch_android_build_includes(root_dir: str) -> None:
-    """Nutzt 'tomlc17' als verlässlichen Anker zur Injektion von Expat & Zlib Include-Pfaden."""
+    """Ersetzt NUR das erste Vorkommen von "port/third_party/tomlc17" in
+    android_build.py. Das erste Vorkommen ist die Include-Liste; weitere
+    Vorkommen sind Argumente von os.path.join() und dürfen NICHT ersetzt
+    werden, sonst entsteht ein verketteter Pfad (siehe Build-Fehler
+    'port/third_party/tomlc17/port/third_party/expat/lib/.../tomlc17.c')."""
     candidates = [
         os.path.join(root_dir, "android_build.py"),
         os.path.join(root_dir, "tools", "android_build.py"),
@@ -133,66 +155,116 @@ def patch_android_build_includes(root_dir: str) -> None:
             create_backup(build_py_path)
             content = read_file_content(build_py_path)
 
-            # Nur die Zeile mit dem Include-Pfad ändern, nicht die Pfadkonstruktion
-            old_str = 'f"-I{TOML_DIR}",'
+            if "port/third_party/expat/lib" in content:
+                print(f"[INFO] {os.path.basename(build_py_path)} hat die "
+                      f"Expat/Zlib-Pfade bereits.")
+                patched = True
+                continue
+
+            old_str = '"port/third_party/tomlc17"'
+            if old_str not in content:
+                print(f"[WARN] Anker {old_str} in {build_py_path} nicht "
+                      f"gefunden.")
+                continue
+
             new_str = (
-                'f"-I{TOML_DIR}",\n'
-                '    f"-I{EXPAT_DIR}/lib",\n'
-                '    f"-I{EXPAT_DIR}",\n'
-                '    f"-I{ZLIB_DIR}",'
+                '"port/third_party/tomlc17",\n'
+                '    "port/third_party/expat/lib",\n'
+                '    "port/third_party/expat",\n'
+                '    "port/third_party/zlib"'
             )
 
-            if 'f"-I{EXPAT_DIR}/lib"' not in content:
-                if old_str in content:
-                    content = content.replace(old_str, new_str, 1)
-                    write_file_content(build_py_path, content)
-                    print(f"[OK] {os.path.basename(build_py_path)} erfolgreich mit Expat/Zlib Pfaden erweitert.")
-                    patched = True
-                else:
-                    print(f"[WARN] Anker {old_str} in {build_py_path} nicht gefunden.")
-            else:
-                print(f"[INFO] {os.path.basename(build_py_path)} enthält bereits Expat/Zlib Pfade.")
+            # count=1: NUR das erste Vorkommen (die Include-Liste).
+            # Alle weiteren Vorkommen sind os.path.join()-Argumente.
+            content = content.replace(old_str, new_str, 1)
+            write_file_content(build_py_path, content)
+            print(f"[OK] {os.path.basename(build_py_path)} mit Expat/Zlib-"
+                  f"Pfaden erweitert (nur erstes Vorkommen).")
+            patched = True
 
     if not patched:
         print("[WARN] Keine android_build.py Datei zur Anpassung gefunden.")
 
 
+def patch_linux_build_includes(root_dir: str) -> None:
+    """Fügt Expat/Zlib-Include-Pfade auch für den Linux-Build hinzu."""
+    candidates = [
+        os.path.join(root_dir, "linux_build.py"),
+        os.path.join(root_dir, "tools", "linux_build.py"),
+    ]
+    for build_py_path in candidates:
+        if not os.path.exists(build_py_path):
+            continue
+        create_backup(build_py_path)
+        content = read_file_content(build_py_path)
+        if "port/third_party/expat/lib" in content:
+            print(f"[INFO] {os.path.basename(build_py_path)} hat die "
+                  f"Expat/Zlib-Pfade bereits.")
+            continue
+        # In linux_build.py heißt die Quelle typischerweise anders;
+        # wir hängen die Pfade an eine existierende Include-Liste an,
+        # die den String "tomlc17" enthält.
+        if '"port/third_party/tomlc17"' in content:
+            content = content.replace(
+                '"port/third_party/tomlc17"',
+                '"port/third_party/tomlc17",\n'
+                '    "port/third_party/expat/lib",\n'
+                '    "port/third_party/expat",\n'
+                '    "port/third_party/zlib"',
+                1,
+            )
+            write_file_content(build_py_path, content)
+            print(f"[OK] {os.path.basename(build_py_path)} mit Expat/Zlib-"
+                  f"Pfaden erweitert.")
+
+
 def patch_cache_files(base_dir: str) -> None:
-    file_path = os.path.join(base_dir, "cache_files.c")
+    file_path = os.path.join(base_dir, "source", "cache", "cache_files.c")
     if not os.path.exists(file_path):
+        file_path = os.path.join(base_dir, "cache_files.c")
+    if not os.path.exists(file_path):
+        print("[WARN] cache_files.c nicht gefunden.")
         return
 
     create_backup(file_path)
     content = read_file_content(file_path)
 
     if "menu_tags_loaded" not in content:
-        decl = "\nextern void menu_tags_loaded(void);\nextern void menu_tags_unloaded(void);\n"
+        decl = ("\nextern void menu_tags_loaded(void);\n"
+                "extern void menu_tags_unloaded(void);\n")
         content = decl + content
 
         content = re.sub(
             r"(cache_file_load\s*\([^)]*\)\s*\{)",
             r"\1\n    menu_tags_loaded();",
             content,
-            count=1
+            count=1,
         )
         content = re.sub(
             r"(cache_file_unload\s*\([^)]*\)\s*\{)",
             r"\1\n    menu_tags_unloaded();",
             content,
-            count=1
+            count=1,
         )
 
         write_file_content(file_path, content)
         print("[OK] cache_files.c gepatcht.")
 
 
-def patch_buildsystem_and_shim(root_dir: str) -> None:
-    shim_src = os.path.join(root_dir, "port_settings_shim.c")
+def patch_buildsystem_and_shim(root_dir: str, patches_dir: str) -> None:
+    """Kopiert port_settings_shim.c aus patches/ in den Quellbaum und
+    trägt libdl in port.json ein."""
+    shim_src = os.path.join(patches_dir, "port_settings_shim.c")
     target_dir = os.path.join(root_dir, "port", "linux", "game")
 
     if os.path.exists(shim_src) and os.path.exists(target_dir):
         shutil.copy2(shim_src, os.path.join(target_dir, "port_settings_shim.c"))
-        print(f"[OK] {shim_src} nach {target_dir} kopiert.")
+        print(f"[OK] port_settings_shim.c nach {target_dir} kopiert.")
+    else:
+        if not os.path.exists(shim_src):
+            print(f"[WARN] {shim_src} nicht gefunden.")
+        if not os.path.exists(target_dir):
+            print(f"[WARN] Zielordner {target_dir} nicht gefunden.")
 
     json_path = os.path.join(root_dir, "port.json")
     if os.path.exists(json_path):
@@ -206,17 +278,22 @@ def patch_buildsystem_and_shim(root_dir: str) -> None:
 
 def main():
     root_dir = os.getcwd()
+    patches_dir = os.getcwd()
     if len(sys.argv) > 1:
         root_dir = sys.argv[1]
+    if len(sys.argv) > 2:
+        patches_dir = sys.argv[2]
 
     print(f"=== Starte Patch-Vorgang in: {root_dir} ===")
+    print(f"=== Patches-Verzeichnis: {patches_dir} ===")
 
     patch_ui_widget(root_dir)
     patch_event_dispatcher(root_dir)
     patch_game_data_dispatcher(root_dir)
     patch_android_build_includes(root_dir)
+    patch_linux_build_includes(root_dir)
     patch_cache_files(root_dir)
-    patch_buildsystem_and_shim(root_dir)
+    patch_buildsystem_and_shim(root_dir, patches_dir)
 
     print("=== Patch-Vorgang abgeschlossen! ===")
 
