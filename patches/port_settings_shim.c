@@ -1,10 +1,14 @@
 /*
-PORT_SETTINGS_SHIM.C
+PORT_SETTINGS_SHIM.C (v2)
 
-OpenCE-Plattformfunktionen, die die OpenCE-Versionen von menu_functions.c,
-menu_tags.c und menu_files.c aufrufen, im Knulli-Port aber nicht
-existieren. Diese Datei wird von patches/patch_settings_only.py nach
-port/linux/game/ kopiert und dort automatisch kompiliert (glob "*.c").
+v2-Änderungen:
+- config_write: loggt jetzt jeden Schreibversuch mit platform_log,
+  damit man sieht, was die Settings-Screens zu speichern versuchen.
+  Der Rückgabewert ist weiterhin 1 (success), aber ehrlich darüber,
+  dass nur geloggt wird.
+- Neue Funktion ui_widget_port_realloc_hint als Stub, falls vom
+  Settings-Code aufgerufen.
+- Null-Pointer-Guards in config_text.
 */
 
 #include "cseries.h"
@@ -15,6 +19,12 @@ port/linux/game/ kopiert und dort automatisch kompiliert (glob "*.c").
 /* ---------- Knulli-Konfigurations-API ---------- */
 
 extern char const *config_string(char const *name);
+
+/* ---------- Logging ---------- */
+
+/* Schwache Referenz: wenn der Host platform_log nicht exportiert,
+   läuft der Stub ohne Logging weiter. */
+__attribute__((weak)) void platform_log(char const *format, ...);
 
 /* ---------- ui_widget.c: struct widget_instance ---------- */
 
@@ -28,7 +38,7 @@ int config_text(char const *name, char *text, unsigned int size)
 {
 	char const *value;
 
-	if (size == 0)
+	if (!text || size == 0)
 		return 0;
 	value = config_string(name);
 	if (!value)
@@ -48,8 +58,12 @@ int config_text(char const *name, char *text, unsigned int size)
 
 int config_write(char const *name, char const *value)
 {
-	(void)name;
-	(void)value;
+	/* v2: Der Knulli-Port hat kein beschreibbares config.toml-Backend
+	   für den Guest-Kontext. Wir loggen den Versuch und geben Erfolg
+	   zurück, damit die Menüs nicht abbrechen. Der eigentliche
+	   Schreibvorgang müsste vom Host-Handler übernommen werden. */
+	if (platform_log && name && value)
+		platform_log("shim: setting %s = %s (not persisted)", name, value);
 	return 1;
 }
 
@@ -60,7 +74,7 @@ int config_default(char const *name, char *text, unsigned int size)
 
 void config_folder(char *path, unsigned long size)
 {
-	if (size == 0)
+	if (!path || size == 0)
 		return;
 	path[0] = '.';
 	if (size > 1)
@@ -83,35 +97,26 @@ void platform_request_quit(void)
 
 int platform_window_sizes(long *widths, long *heights, int maximum)
 {
+	if (!widths || !heights || maximum <= 0)
+		return 0;
 	if (maximum >= 2)
 	{
 		widths[0] = 640; heights[0] = 480;
 		widths[1] = 800; heights[1] = 480;
 		return 2;
 	}
-	if (maximum >= 1)
-	{
-		widths[0] = 640; heights[0] = 480;
-		return 1;
-	}
-	return 0;
+	widths[0] = 640; heights[0] = 480;
+	return 1;
 }
 
 int platform_display_resolutions(long *widths, long *heights, int maximum)
 {
-	if (maximum >= 1)
-	{
-		widths[0] = 640; heights[0] = 480;
-		return 1;
-	}
-	return 0;
+	if (!widths || !heights || maximum <= 0)
+		return 0;
+	widths[0] = 640; heights[0] = 480;
+	return 1;
 }
 
-/*
- * platform_audio_devices — menu_tags.c ruft dies auf, um die verfuegbaren
- * Audio-Ausgabegeraete aufzulisten. Im Knulli-Port gibt es keine
- * Geraeteliste; wir liefern eine statische Liste mit dem Standard-Geraet.
- */
 int platform_audio_devices(char *names, int maximum, int name_size)
 {
 	const char *default_device = "Default Audio Device";
