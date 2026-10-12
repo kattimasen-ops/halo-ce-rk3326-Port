@@ -13,6 +13,14 @@ set -euo pipefail
 # libmali wird NICHT gelinkt (sysroot-Datei ist beschaedigt); die
 # EGL/GLES-Symbole bleiben undefiniert und werden zur Laufzeit aus
 # /tmp/halo-mali geladen.
+#
+# NEU (Fix): menu_functions.c und port_settings_shim.c werden NACH dem
+# Knulli-Patch kopiert, damit der Patch die reduzierten Settings-
+# Funktionen nicht ueberschreibt. patch_settings_only.py bekommt
+# zusaetzlich das patches/-Verzeichnis als zweites Argument, damit
+# port_settings_shim.c korrekt kopiert werden kann. Der android_build.py-
+# Patch ersetzt nur das ERSTE Vorkommen von "port/third_party/tomlc17"
+# (die Include-Liste), nicht die os.path.join()-Argumente.
 # ══════════════════════════════════════════════════════════════════════
 PGO_MODE=${PGO_MODE:-use}
 
@@ -374,16 +382,6 @@ if ! tree_is_patched; then
     fetch_opence_files
 
     echo ""
-    echo "== Kopiere die reduzierte menu_functions.c ..."
-    if [ -f "$HERE/patches/settings_only_menu_functions.c" ]; then
-        cp "$HERE/patches/settings_only_menu_functions.c" \
-           "$SRC/port/linux/game/menu_functions.c"
-        echo "   + menu_functions.c (settings-only)"
-    else
-        die "patches/settings_only_menu_functions.c fehlt."
-    fi
-
-    echo ""
     echo "== Pruefe und wende Knulli-Patch an ..."
     if ! git -C "$SRC" apply --check "$PATCH" 2>&1; then
         die "Knulli-Patch kann auf $UPSTREAM_COMMIT NICHT sauber angewendet werden."
@@ -393,9 +391,27 @@ if ! tree_is_patched; then
     echo "== Knulli-Patch angewendet."
 
     echo ""
+    echo "== Kopiere menu_functions.c und port_settings_shim.c (NACH dem Patch) ..."
+    if [ -f "$HERE/patches/settings_only_menu_functions.c" ]; then
+        cp "$HERE/patches/settings_only_menu_functions.c" \
+           "$SRC/port/linux/game/menu_functions.c"
+        echo "   + menu_functions.c (settings-only)"
+    else
+        die "patches/settings_only_menu_functions.c fehlt."
+    fi
+
+    if [ -f "$HERE/patches/port_settings_shim.c" ]; then
+        cp "$HERE/patches/port_settings_shim.c" \
+           "$SRC/port/linux/game/port_settings_shim.c"
+        echo "   + port_settings_shim.c"
+    else
+        die "patches/port_settings_shim.c fehlt."
+    fi
+
+    echo ""
     echo "== Setze Menue-Hooks und Build-Registrierung ..."
     if [ -f "$HERE/patches/patch_settings_only.py" ]; then
-        python3 "$HERE/patches/patch_settings_only.py" "$SRC"
+        python3 "$HERE/patches/patch_settings_only.py" "$SRC" "$HERE/patches"
     else
         die "patches/patch_settings_only.py fehlt."
     fi
@@ -929,12 +945,12 @@ stamp=$({
              patch_credits.py patch_credits_xml.py \
              patch_forward_declarations.py patch_settings_only.py \
              patch_config_changes.py patch_terminal_buffer.py \
-             settings_only_menu_functions.c; do
+             settings_only_menu_functions.c port_settings_shim.c; do
         cat "$HERE/patches/$p" 2>/dev/null || true
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v1"
+    echo "gcc9-host-dynamic=v2"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
