@@ -4,11 +4,15 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════
 # Halo CE Universal — M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
-# Fix v6:
-#  - SDL2 und SDL3 werden mit -mno-outline-atomics gebaut, damit sie
-#    auf ARMv8.0 (Cortex-A35) keine LSE-Atomics enthalten. Die Diagnose
-#    hat gezeigt, dass libSDL2-2.0.so.0 zwei LSE-Instruktionen enthaelt,
-#    die den SIGILL beim Start verursachen.
+# Fix v7:
+#  - -mno-outline-atomics aus den SDL2/SDL3-CMake-Aufrufen entfernt.
+#    GCC 9 kennt diese Flag nicht (sie ist Clang-spezifisch).
+#    Der LSE-Befund in SDL2 war ein Fehlalarm: das Diagnose-Grep hat
+#    "stadd" innerhalb von "SDL_ListAdd" gefunden.
+#  - CMAKE_CXX_COMPILER auf den Cross-C++-Compiler gesetzt, damit
+#    CMake den C++-Testlauf nicht auf dem x86_64-Host durchfuehrt.
+#  - SDL2-Cache-Pruefung nutzt jetzt $SYSROOT_LIB/libSDL2-2.0.so.0,
+#    so wie SDL3, damit SDL2 nicht bei jedem Lauf neu gebaut wird.
 # ══════════════════════════════════════════════════════════════════════
 PGO_MODE=${PGO_MODE:-use}
 
@@ -22,6 +26,7 @@ SDL2_TAG=release-2.30.10
 SDL2_ARCHIVE=https://github.com/libsdl-org/SDL/archive/refs/tags/$SDL2_TAG.tar.gz
 GUEST_CC=${GUEST_CC:-clang-22}
 HOST_CC=${HOST_CC:-aarch64-linux-gnu-gcc}
+HOST_CXX=${HOST_CXX:-aarch64-linux-gnu-g++}
 JOBS=${JOBS:-$(nproc)}
 OPEN_CE_URL=${OPEN_CE_URL:-https://github.com/OpenCommunityEdition/OpenCE.git}
 
@@ -35,6 +40,7 @@ need curl "install curl"
 need tar "install tar"
 need cmake "install cmake"
 need "$HOST_CC" "install gcc-aarch64-linux-gnu, or set HOST_CC"
+need "$HOST_CXX" "install g++-aarch64-linux-gnu, or set HOST_CXX"
 need "$GUEST_CC" "install clang-22 from apt.llvm.org, or set GUEST_CC"
 "$GUEST_CC" -print-targets 2> /dev/null | grep -q aarch64_32 ||
     die "$GUEST_CC has no arm64_32 (aarch64_32) target; use clang 22 from apt.llvm.org"
@@ -192,7 +198,7 @@ print("  XML-Hunk entfernt; Patch ist jetzt %d Bytes kleiner." % (len(text) - le
 PYEOF
 
 # ══════════════════════════════════════════════════════════════════════
-# SDL3 (nur bauen, wenn .so fehlt) — mit GCC, shared, ARMv8.0-kompatibel
+# SDL3 (nur bauen, wenn .so fehlt) — mit GCC, shared
 # ══════════════════════════════════════════════════════════════════════
 if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
     echo "== SDL3 $SDL3_TAG: kompiliere aus dem Quellcode (GCC, shared)"
@@ -209,8 +215,7 @@ if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
     cmake -S "$SDL3_SRC" -B "$SDL3_BUILD" \
         -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_C_COMPILER="$HOST_CC" \
-        -DCMAKE_C_FLAGS="-mno-outline-atomics" \
-        -DCMAKE_CXX_FLAGS="-mno-outline-atomics" \
+        -DCMAKE_CXX_COMPILER="$HOST_CXX" \
         -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -233,13 +238,13 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-# SDL2 (nur shared) — mit GCC, ARMv8.0-kompatibel
+# SDL2 — mit GCC, shared, Cache-Pruefung konsistent zu SDL3
 # ══════════════════════════════════════════════════════════════════════
 SDL2_SRC=$WORK/SDL2-src
 SDL2_BUILD=$WORK/sdl2-build
 SDL2_INSTALL=$WORK/sdl2-install
 
-if [ ! -d "$SDL2_INSTALL/include/SDL2" ]; then
+if [ ! -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
     echo "== SDL2 $SDL2_TAG: Quellcode holen und mit GCC bauen (shared)"
     rm -rf "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
     mkdir -p "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
@@ -303,8 +308,7 @@ PATCH_EOF
     cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
         -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_C_COMPILER="$HOST_CC" \
-        -DCMAKE_C_FLAGS="-mno-outline-atomics" \
-        -DCMAKE_CXX_FLAGS="-mno-outline-atomics" \
+        -DCMAKE_CXX_COMPILER="$HOST_CXX" \
         -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -320,22 +324,37 @@ PATCH_EOF
 
     SDL2_LIB=$(find "$SDL2_INSTALL" -name "libSDL2-2.0.so.0*" -type f | head -n 1)
     [ -n "$SDL2_LIB" ] || die "libSDL2-2.0.so.0 nicht gefunden"
-    if [ ! -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
-        cp -L "$SDL2_LIB" "$SYSROOT_LIB/libSDL2-2.0.so.0"
-        echo "== SDL2 nach sysroot kopiert: $(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0") Bytes"
-    else
-        echo "== libSDL2-2.0.so.0 liegt bereits in sysroot."
-    fi
+    cp -L "$SDL2_LIB" "$SYSROOT_LIB/libSDL2-2.0.so.0"
+    echo "== SDL2 nach sysroot kopiert: $(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0") Bytes"
 else
-    echo "== SDL2-Header bereits in $SDL2_INSTALL"
-    if [ ! -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
-        if [ -f "$SDL2_INSTALL/lib/libSDL2-2.0.so.0" ]; then
-            cp -L "$SDL2_INSTALL/lib/libSDL2-2.0.so.0" "$SYSROOT_LIB/libSDL2-2.0.so.0"
-        else
-            die "SDL2 .so fehlt in sysroot und $SDL2_INSTALL."
-        fi
-    fi
+    echo "== libSDL2-2.0.so.0 bereits in sysroot"
 fi
+
+# SDL2-Include-Verzeichnis fuer den spaeteren Host-Build
+if [ ! -d "$SDL2_INSTALL/include/SDL2" ]; then
+    echo "== SDL2-Header fehlen, SDL2 neu bauen ..."
+    rm -rf "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
+    mkdir -p "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
+    curl -L -o "$WORK/sdl2.tar.gz" "$SDL2_ARCHIVE"
+    tar -xzf "$WORK/sdl2.tar.gz" -C "$SDL2_SRC" --strip-components=1
+    cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
+        -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+        -DCMAKE_C_COMPILER="$HOST_CC" \
+        -DCMAKE_CXX_COMPILER="$HOST_CXX" \
+        -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
+        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+        -DSDL_TESTS=OFF \
+        -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
+        -DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
+        -DCMAKE_INSTALL_PREFIX="$SDL2_INSTALL"
+    cmake --build "$SDL2_BUILD" -j "$JOBS"
+    cmake --install "$SDL2_BUILD"
+fi
+
 export SDL2_INCLUDE="$SDL2_INSTALL/include"
 [ -f "$SDL2_INCLUDE/SDL2/SDL.h" ] || die "SDL2_INCLUDE=$SDL2_INCLUDE enthaelt kein SDL2/SDL.h"
 echo "== SDL2_INCLUDE=$SDL2_INCLUDE"
@@ -909,7 +928,6 @@ check_patch "tools/android_build.py"            '"-DHALO_ANDROID"'              
 check_patch "tools/android_build.py"            '"-DHALO_ARM64_GUEST=1"'        "android_build.py HALO_ARM64_GUEST"
 check_patch "tools/android_build.py"            'EXPAT_DIR = Path'              "android_build.py EXPAT_DIR"
 check_patch "tools/android_build.py"            'ZLIB_DIR = Path'               "android_build.py ZLIB_DIR"
-check_patch "tools/android_build.py"            '"-mno-outline-atomics"'        "android_build.py -mno-outline-atomics"
 check_patch "source/main/main.c"                "St0len-One"                    "main.c Credits"
 check_file  "port/linux/include/halo_menus.h"                                   "halo_menus.h"
 check_file  "port/linux/src/menu_files.c"                                       "menu_files.c"
@@ -1007,7 +1025,7 @@ stamp=$({
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v6-sdl2-no-lse"
+    echo "gcc9-host-dynamic=v7-sdl2-revert"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
@@ -1083,7 +1101,7 @@ else
     cat <<'RELEASE'
 
 ────────────────────────────────────────────────────────────────────────
-RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, Hybrid v6)
+RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, Hybrid v7)
 ────────────────────────────────────────────────────────────────────────
 Installation auf M9 Pro (wenn halo_guest.elf existiert):
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
