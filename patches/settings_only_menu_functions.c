@@ -10,6 +10,11 @@ abbrechen.
 
 Alle Menue-XMLs aus OpenCE (port/assets/menus/ce) verwenden dieselben
 Funktionsnamen wie in der vollstaendigen menu_functions.c.
+
+Fix v4: In der Back-Handler-Sektion wird *widget_deleted nur noch
+geschrieben, wenn der Zeiger nicht NULL ist. Der Aufrufer in
+ui_widget_event_handler_functions.c uebergibt im Guest-Build unter
+Umstaenden NULL, was ohne den Guard zu einem Absturz fuehren kann.
 */
 
 #include "cseries.h"
@@ -684,7 +689,7 @@ boolean pc_menu_event_function_invoke(
 		!strcmp(name, "gamespy dismiss error") || !strcmp(name, "gamespy dismiss filters"))
 	{
 		ui_widget_port_go_back(widget);
-		*widget_deleted = TRUE;
+		if (widget_deleted) *widget_deleted = TRUE;
 		return TRUE;
 	}
 
