@@ -1,175 +1,85 @@
-name: Diagnose Mali LSE Atomics
+name: Diagnose
 
 on:
   workflow_dispatch:
 
 jobs:
   diagnose:
-    name: Mali-Bibliothek auf ARMv8.1-Features pruefen
     runs-on: ubuntu-22.04
-    container: ubuntu:20.04
-    timeout-minutes: 30
-    defaults:
-      run:
-        shell: bash
-
-    env:
-      SYSROOT_LIB: ${{ github.workspace }}/sysroot
-      DIAG: ${{ github.workspace }}/diagnose
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: "System-Pakete installieren"
+      - name: Tools installieren
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            binutils-aarch64-linux-gnu \
-            file
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu file
 
-      - name: "Diagnose-Ordner anlegen"
+      - name: Ordner anlegen
+        run: mkdir -p diagnose
+
+      - name: Sysroot auflisten
         run: |
-          mkdir -p "$DIAG"
-          echo "Sysroot: $SYSROOT_LIB"
-          ls -la "$SYSROOT_LIB" 2>&1 || echo "(Sysroot nicht vorhanden)"
+          ls -la sysroot/ > diagnose/01_sysroot.txt 2>&1 || echo "(kein sysroot)" > diagnose/01_sysroot.txt
+          cat diagnose/01_sysroot.txt
 
-      - name: "Uebersicht der Bibliotheken"
+      - name: Dateitypen bestimmen
         run: |
-          {
-            echo "=== Sysroot-Inhalt ==="
-            ls -la "$SYSROOT_LIB" 2>&1 || echo "(leer)"
-            echo ""
-            echo "=== Alle .so-Dateien ==="
-            find "$SYSROOT_LIB" -name "*.so*" -type f 2>&1 || echo "(keine)"
-          } > "$DIAG/01_sysroot_libs.txt"
-          cat "$DIAG/01_sysroot_libs.txt"
-
-      - name: "LSE-Instruktionen pruefen (mit Wortgrenzen)"
-        run: |
-          # WICHTIG: kein set -e und kein pipefail in diesem Step
-          set +e
-          set +o pipefail
-
-          {
-            echo "=== LSE-Atomics-Pruefung (echte Instruktionen) ==="
-            echo "Es wird nach dem Mnemonic gefolgt von Whitespace gesucht,"
-            echo "damit Symbol-Namen wie SDL_ListAdd nicht als 'stadd' zaehlen."
-            echo ""
-          } > "$DIAG/02_lse_check.txt"
-
-          if [ ! -d "$SYSROOT_LIB" ]; then
-            echo "(Sysroot nicht vorhanden)" >> "$DIAG/02_lse_check.txt"
-            cat "$DIAG/02_lse_check.txt"
-            exit 0
-          fi
-
-          # Objdump in eine temporaere Datei, dann mit Python zaehlen
-          for lib in "$SYSROOT_LIB"/*.so*; do
-            [ -f "$lib" ] || continue
-            aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null > /tmp/objdump.txt
-            count=$(python3 - <<'PYEOF'
-import re, sys
-mnemonics_lse = {
-    'ldadd', 'ldadda', 'ldaddal', 'ldaddl',
-    'ldclr', 'ldclra', 'ldclral', 'ldclrl',
-    'ldeor', 'ldeora', 'ldeoral', 'ldeorl',
-    'ldset', 'ldseta', 'ldsetal', 'ldsetl',
-    'ldsmax', 'ldsmaxa', 'ldsmaxal', 'ldsmaxl',
-    'ldsmin', 'ldsmina', 'ldsminal', 'ldsminl',
-    'ldumax', 'ldumaxa', 'ldumaxal', 'ldumaxl',
-    'ldumin', 'ldumina', 'lduminal', 'lduminl',
-    'stadd', 'stclr', 'steor', 'stset',
-    'stsmax', 'stsmin', 'stumax', 'stumin',
-    'swp', 'swpa', 'swpal', 'swpl',
-    'cas', 'casa', 'casal', 'casl',
-    'casp', 'caspa', 'caspal', 'caspl',
-}
-count = 0
-with open('/tmp/objdump.txt') as f:
-    for line in f:
-        # Instruktionszeile: <hex>: <hex bytes>\t<mnemonic> <operands>
-        m = re.match(r'\s*[0-9a-f]+:\s+[0-9a-f ]+\t([a-z][a-z0-9]*)', line)
-        if m and m.group(1) in mnemonics_lse:
-            count += 1
-print(count)
-PYEOF
-)
-            count=${count:-0}
-            if [ "$count" -gt 0 ]; then
-              echo "WARNUNG: $(basename "$lib") enthaelt $count echte LSE-Instruktionen" >> "$DIAG/02_lse_check.txt"
-              grep -E '^\s*[0-9a-f]+:\s+[0-9a-f ]+\t(ldadd|stadd|ldclr|stclr|ldeor|steor|ldset|stset|ldsmax|stsmax|ldsmin|stsmin|ldumax|stumax|ldumin|stumin|swp|cas|casp)' /tmp/objdump.txt | head -3 >> "$DIAG/02_lse_check.txt"
-            else
-              echo "OK: $(basename "$lib") enthaelt keine echten LSE-Instruktionen" >> "$DIAG/02_lse_check.txt"
+          for f in sysroot/*.so*; do
+            if [ -f "$f" ]; then
+              file "$f" >> diagnose/02_file.txt
             fi
           done
+          cat diagnose/02_file.txt 2>/dev/null || true
 
-          cat "$DIAG/02_lse_check.txt"
-
-      - name: "Andere ARMv8.1+/8.5-Features pruefen"
+      - name: LSE-Instruktionen zaehlen
         run: |
           set +e
-          set +o pipefail
-          {
-            echo "=== Weitere ARMv8.1+/8.5-Features ==="
-            echo "Diese koennen auf Cortex-A35 ebenfalls SIGILL verursachen."
-            echo ""
-            for lib in "$SYSROOT_LIB"/*.so*; do
-              [ -f "$lib" ] || continue
-              aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null > /tmp/objdump.txt
-              python3 - "$lib" <<'PYEOF'
-import re, sys
-lib = sys.argv[1]
-features = {
-    'ARMv8.2-FP16': {'fmla', 'fmlal', 'fmls', 'fmlsl', 'fcvt', 'scvtf', 'ucvtf'},
-    'ARMv8.2-DotProd': {'sdot', 'udot'},
-    'ARMv8.3-RCPC': {'ldapr', 'ldaprb', 'ldaprh', 'stlur', 'stlurb', 'stlurh'},
-    'ARMv8.5-BTI': {'bti'},
-    'ARMv8.5-MTE': {'irg', 'gmi', 'stg', 'ldg', 'stzg', 'st2g'},
-}
-counts = {k: 0 for k in features}
-with open('/tmp/objdump.txt') as f:
-    for line in f:
-        m = re.match(r'\s*[0-9a-f]+:\s+[0-9a-f ]+\t([a-z][a-z0-9]*)', line)
-        if not m:
-            continue
-        mnemonic = m.group(1)
-        for feature, mnemonics in features.items():
-            if mnemonic in mnemonics or mnemonic.startswith(tuple(mnemonics)):
-                counts[feature] += 1
-import os
-name = os.path.basename(lib)
-warnings = [f"{k}={v}" for k, v in counts.items() if v > 0]
-if warnings:
-    print(f"WARNUNG: {name}: {', '.join(warnings)}")
-else:
-    print(f"OK: {name}")
-PYEOF
-            done
-          } > "$DIAG/03_other_features.txt"
-          cat "$DIAG/03_other_features.txt"
+          echo "=== LSE-Pruefung (nur echte Instruktionen) ===" > diagnose/03_lse.txt
+          for f in sysroot/*.so*; do
+            if [ ! -f "$f" ]; then continue; fi
+            aarch64-linux-gnu-objdump -d "$f" 2>/dev/null > /tmp/od.txt
+            COUNT=0
+            while read -r line; do
+              case "$line" in
+                *ldadd*|*ldclr*|*ldeor*|*ldset*|*ldsmax*|*ldsmin*|*ldumax*|*ldumin*|*stadd*|*stclr*|*steor*|*stset*|*stsmax*|*stsmin*|*stumax*|*stumin*|*swp\ *|*cas\ *|*casp\ *)
+                  COUNT=$((COUNT+1))
+                  ;;
+              esac
+            done < /tmp/od.txt
+            echo "$(basename $f): $COUNT" >> diagnose/03_lse.txt
+          done
+          cat diagnose/03_lse.txt
 
-      - name: "Crash-Adresse symbolisieren (falls bekannt)"
+      - name: Detaillierte LSE-Treffer
         run: |
           set +e
-          set +o pipefail
-          {
-            echo "=== Crash-Symbolisierung ==="
-            echo "Bekannte Crash-PCs aus frueheren Laeufen:"
-            echo "  0x7fae2a33d0 (erster Lauf)"
-            echo "  0x7f805953d0 (zweiter Lauf)"
-            echo ""
-            echo "Um diese zu symbolisieren, muss die geladene Bibliothek"
-            echo "zur Verfuegung stehen. Auf dem Geraet koennen die Bibliotheken"
-            echo "mit 'cat /proc/PID/maps' identifiziert werden."
-          } > "$DIAG/04_crash_symbolize.txt"
-          cat "$DIAG/04_crash_symbolize.txt"
+          echo "=== Detaillierte LSE-Treffer ===" > diagnose/04_lse_detail.txt
+          for f in sysroot/*.so*; do
+            if [ ! -f "$f" ]; then continue; fi
+            echo "--- $(basename $f) ---" >> diagnose/04_lse_detail.txt
+            aarch64-linux-gnu-objdump -d "$f" 2>/dev/null | grep -E "^[[:space:]]+[0-9a-f]+:.*\b(ldadd|ldclr|ldeor|ldset|stadd|stclr|steor|stset|swp|cas|casp)\b" >> diagnose/04_lse_detail.txt
+          done
+          cat diagnose/04_lse_detail.txt
 
-      - name: "Diagnose-Artefakte hochladen"
+      - name: Bibliotheksabhaengigkeiten
+        run: |
+          set +e
+          echo "=== NEEDED / SONAME ===" > diagnose/05_needed.txt
+          for f in sysroot/*.so*; do
+            if [ ! -f "$f" ]; then continue; fi
+            echo "--- $(basename $f) ---" >> diagnose/05_needed.txt
+            aarch64-linux-gnu-readelf -d "$f" 2>/dev/null | grep -E "NEEDED|SONAME" >> diagnose/05_needed.txt
+          done
+          cat diagnose/05_needed.txt
+
+      - name: Artefakt hochladen
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mali-lse-diagnose
+          name: diagnose
           path: diagnose/
           if-no-files-found: warn
           retention-days: 30
