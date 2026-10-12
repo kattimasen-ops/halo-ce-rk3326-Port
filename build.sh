@@ -4,7 +4,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════
 # Halo CE Universal — M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
-# Fix v10 (FINAL):
+# Fix v11 (FINAL):
 #  - patch_gl_init_order.py wird NICHT mehr aufgerufen. Der SIGILL lag
 #    nicht in der GL-Init, sondern im Dispatcher-Bereich in
 #    patch_settings_only.py (leerer Bereich: >= 0x8000 UND < 0x8000).
@@ -810,6 +810,12 @@ rm -rf "$SRC/port/knulli/__pycache__"
 chmod +x "$SRC/port/knulli/build.sh" 2>/dev/null || true
 
 # ══════════════════════════════════════════════════════════════════════
+# HINWEIS: patch_gl_init_order.py wird NICHT mehr aufgerufen.
+# Der SIGILL lag nicht in der GL-Init, sondern im Dispatcher-Bereich
+# in patch_settings_only.py. Die alten Blöcke wurden entfernt.
+# ══════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════
 # Restliche Python-Patches
 # ══════════════════════════════════════════════════════════════════════
 echo ""
@@ -1032,7 +1038,7 @@ stamp=$({
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v10-final-dispatch-fix"
+    echo "gcc9-host-dynamic=v11-final-dispatch-fix"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
@@ -1108,7 +1114,7 @@ else
     cat <<'RELEASE'
 
 ────────────────────────────────────────────────────────────────────────
-RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, v10 Final)
+RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, v11 Final)
 ────────────────────────────────────────────────────────────────────────
 Installation auf M9 Pro (wenn halo_guest.elf existiert):
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
