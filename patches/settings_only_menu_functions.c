@@ -1,20 +1,19 @@
 /*
-MENU_FUNCTIONS.C — Settings-Only
+SETTINGS_ONLY_MENU_FUNCTIONS.C — v5
 
-Diese reduzierte Version implementiert nur die Settings-Callbacks der
-Menues (Video, Audio, Gamepad, Mouse, Controls), sowie `pc_menu_profile_
-edit_begin` (vom Xbox-Pause-Screen aus aufgerufen, um das Settings-Menue
-zu oeffnen). Alles andere (Kampagne, Multiplayer, Coop, Server-Browser,
-Lobby) tut nichts und liefert TRUE zurueck, damit die Menues nicht
-abbrechen.
+Änderungen seit v4:
+- NEU: Struktur-Kompatibilitätsschicht. Xbox und OpenCE haben
+  unterschiedliche struct-widget_instance-Layouts. Diese Datei
+  verwendet jetzt das XBOX-Layout (das zur Port-Basis passt) und
+  mappt die OpenCE-Feldnamen auf die tatsächlichen Xbox-Felder
+  via Makros.
+- NEU: Sicherheits-Guards in descendant() gegen NULL-Dereferenz.
+- Der Dispatcher erwartet jetzt einen 0-basierten function_index
+  (die Subtraktion macht der Caller in ui_widget_event_handler_functions.c).
 
-Alle Menue-XMLs aus OpenCE (port/assets/menus/ce) verwenden dieselben
-Funktionsnamen wie in der vollstaendigen menu_functions.c.
-
-Fix v4: In der Back-Handler-Sektion wird *widget_deleted nur noch
-geschrieben, wenn der Zeiger nicht NULL ist. Der Aufrufer in
-ui_widget_event_handler_functions.c uebergibt im Guest-Build unter
-Umstaenden NULL, was ohne den Guard zu einem Absturz fuehren kann.
+WICHTIG: Diese Datei MUSS dieselbe struct-Definition wie die
+Port-Basis verwenden. Sonst greift OpenCE-Code auf falsche Offsets
+zu und zerstört den Speicher (das war die Ursache für den SIGILL).
 */
 
 #include "cseries.h"
@@ -49,59 +48,87 @@ char const *pc_menu_game_data_input_name(long function_index);
 /* ---------- externs (ui_widget.c, per patch) ---------- */
 void ui_widget_port_go_back(struct widget_instance *widget);
 
-/* ---------- das widget_instance (identisch zu ui_widget.c) ---------- */
+/* ══════════════════════════════════════════════════════════════════════
+   WICHTIG: IDENTISCH zur Port-Basis (ui_widget.c / 
+   ui_widget_event_handler_functions.c). NICHT die OpenCE-Version!
+   ══════════════════════════════════════════════════════════════════════ */
+
 struct widget_instance
 {
 	long definition_tag_index;
 	char const *name;
 	short local_player_index;
-	short horizontal_offset;
-	short vertical_offset;
+	byte unknown0A[4];
 	short type;
 	boolean visible;
-	boolean render_regardless_of_controller_index;
+	byte unknown11;
 	boolean disabled;
-	boolean pause_game_time;
-	boolean delete_recursion_lock;
-	boolean widget_is_error_dialog;
-	boolean close_if_local_player_controller_present;
-	byte pad17;
-	long creation_time;
-	unsigned long milliseconds_to_auto_close;
-	unsigned long auto_close_fade_time;
-	real alpha_modifier;
-	struct widget_instance *previous;
+	byte unknown13[9];
+	long unknown1C;
+	byte unknown20[12];
 	struct widget_instance *next;
 	struct widget_instance *parent;
 	struct widget_instance *child;
 	struct widget_instance *focused_child;
 	union
 	{
-		struct
-		{
-			wchar_t *text;
-			short string_list_index;
-		} text_box;
-		struct
-		{
-			short selected_index;
-			short last_list_tab_direction;
-			void *list_items;
-			word number_of_items;
-			struct widget_instance *extended_description;
-			wchar_t *item_text;
-		} list;
-	} parameters;
-	struct
-	{
-		short current_frame_index;
-		short first_frame_index;
-		short last_frame_index;
-		short number_of_sprite_frames;
-	} animation;
+		short selected_index;
+		wchar_t *text;
+		long value;
+	} data3C;
+	void *generated_list;
+	short generated_count;
 };
 
-/* ---------- pc_menu_setting (aus menu_tags.c) ---------- */
+/* ── Kompatibilitäts-Makros: OpenCE-Namen auf Xbox-Felder ── */
+
+#define WIDGET_LIST_SELECTED(w)         ((w)->data3C.selected_index)
+#define WIDGET_LIST_ITEM_COUNT(w)       ((w)->generated_count)
+#define WIDGET_LIST_ITEMS(w)            ((w)->generated_list)
+#define WIDGET_TEXT(w)                  ((w)->data3C.text)
+
+/* extended_description: existiert im Xbox-Layout nicht. Wir
+   speichern sie in einer Side-Table, die von menu_tags.c befüllt
+   werden müsste. Solange sie NULL ist, funktionieren Help-Texte
+   nicht, aber es gibt keinen Crash. */
+struct widget_extra
+{
+	struct widget_instance *list;
+	struct widget_instance *extended_description;
+};
+static struct widget_extra extras[32] = { 0 };
+
+static struct widget_instance *get_extended_description(struct widget_instance *list)
+{
+	int i;
+	for (i = 0; i < 32; i++)
+		if (extras[i].list == list)
+			return extras[i].extended_description;
+	return NULL;
+}
+
+static void set_extended_description(struct widget_instance *list,
+                                     struct widget_instance *desc)
+{
+	int i, slot = -1;
+	for (i = 0; i < 32; i++)
+	{
+		if (extras[i].list == list)
+		{
+			extras[i].extended_description = desc;
+			return;
+		}
+		if (!extras[i].list && slot < 0)
+			slot = i;
+	}
+	if (slot >= 0)
+	{
+		extras[slot].list = list;
+		extras[slot].extended_description = desc;
+	}
+}
+
+/* ---------- pc_menu_setting ---------- */
 #define MAXIMUM_SETTING_VALUES 64
 struct pc_menu_setting
 {
@@ -119,11 +146,13 @@ struct pc_menu_setting *pc_menu_setting_get(long definition_index);
 #define BUTTON_X 2
 #define ROW_TEXT_LENGTH 64
 
-/* ---------- Hilfsfunktionen zum Widget-Baum ---------- */
+/* ---------- Widget-Baum-Traversierung ---------- */
 
-static struct widget_instance *descendant(struct widget_instance *widget, char const *name, long *nth)
+static struct widget_instance *descendant(struct widget_instance *widget,
+                                          char const *name, long *nth)
 {
 	struct widget_instance *child;
+	if (!widget) return NULL;
 	for (child = widget->child; child; child = child->next)
 	{
 		struct widget_instance *found;
@@ -136,24 +165,29 @@ static struct widget_instance *descendant(struct widget_instance *widget, char c
 	return NULL;
 }
 
-static struct widget_instance *named(struct widget_instance *widget, char const *name, long nth)
+static struct widget_instance *named(struct widget_instance *widget,
+                                     char const *name, long nth)
 {
 	return widget ? descendant(widget, name, &nth) : NULL;
 }
 
-static void text_set_length(struct widget_instance *text_box, wchar_t const *text, short length)
+static void text_set_length(struct widget_instance *text_box,
+                            wchar_t const *text, short length)
 {
-	if (!text_box)
+	wchar_t *buf;
+	if (!text_box || length <= 0)
 		return;
-	if (!text_box->parameters.text_box.text)
+	buf = WIDGET_TEXT(text_box);
+	if (!buf)
 	{
-		text_box->parameters.text_box.text = ui_widget_realloc(NULL, length * sizeof(wchar_t),
-			__FILE__, __LINE__);
+		buf = ui_widget_realloc(NULL, length * sizeof(wchar_t),
+		                        __FILE__, __LINE__);
+		WIDGET_TEXT(text_box) = buf;
 	}
-	if (text_box->parameters.text_box.text)
+	if (buf)
 	{
-		ustrncpy(text_box->parameters.text_box.text, text, length - 1);
-		text_box->parameters.text_box.text[length - 1] = 0;
+		ustrncpy(buf, text, length - 1);
+		buf[length - 1] = 0;
 	}
 }
 
@@ -170,12 +204,12 @@ static void visible_set(struct widget_instance *widget, boolean visible)
 
 static struct widget_instance *screen_of(struct widget_instance *widget)
 {
-	while (widget->parent)
+	while (widget && widget->parent)
 		widget = widget->parent;
 	return widget;
 }
 
-/* ---------- Wert-Helfer fuer Settings ---------- */
+/* ---------- Wert-Helfer ---------- */
 
 static boolean text_is_number(char const *text, double *number)
 {
@@ -186,10 +220,12 @@ static boolean text_is_number(char const *text, double *number)
 
 static boolean spinner_item(struct widget_instance const *widget)
 {
-	return widget->parent && widget->parent->definition_tag_index == widget->definition_tag_index;
+	return widget->parent &&
+	       widget->parent->definition_tag_index == widget->definition_tag_index;
 }
 
-static short setting_value_index(struct pc_menu_setting const *setting, char const *current)
+static short setting_value_index(struct pc_menu_setting const *setting,
+                                 char const *current)
 {
 	double current_number, value_number, distance = 0.0;
 	short index, nearest = 0;
@@ -205,7 +241,8 @@ static short setting_value_index(struct pc_menu_setting const *setting, char con
 	{
 		if (text_is_number(setting->values[index], &value_number))
 		{
-			double gap = value_number > current_number ? value_number - current_number :
+			double gap = value_number > current_number ?
+				value_number - current_number :
 				current_number - value_number;
 			if (index == 0 || gap < distance)
 			{
@@ -258,17 +295,20 @@ static boolean profile_setting_boolean(short field)
 	return field != 0 && field != 4 && field != 5;
 }
 
-static boolean setting_text(char const *name, char *text, unsigned int size, boolean default_value)
+static boolean setting_text(char const *name, char *text, unsigned int size,
+                            boolean default_value)
 {
 	short index;
 
 	if (strncmp(name, "profile.", 8))
 	{
-		if (!(default_value ? config_default(name, text, size) : config_text(name, text, size)))
+		if (!(default_value ? config_default(name, text, size)
+		                    : config_text(name, text, size)))
 			return FALSE;
 		if (!strcmp(name, "display.mode") && !text[0])
 			snprintf(text, size, "%s",
-				default_value || config_boolean("display.fullscreen") ? "borderless" : "windowed");
+				default_value || config_boolean("display.fullscreen") ?
+				"borderless" : "windowed");
 		if (!strcmp(name, "display.window_size") && !text[0])
 			snprintf(text, size, "1280x960");
 		return TRUE;
@@ -315,7 +355,8 @@ static boolean setting_write(char const *name, char const *value)
 			continue;
 		if (!profile || !(place = profile_setting_field(profile, field)))
 			return FALSE;
-		number = profile_setting_boolean(field) ? !strcmp(value, "true") : atol(value);
+		number = profile_setting_boolean(field) ?
+			!strcmp(value, "true") : atol(value);
 		if (field == 6 || field == 7)
 			number = !number;
 		*place = (byte)number;
@@ -326,46 +367,52 @@ static boolean setting_write(char const *name, char const *value)
 
 static boolean setting_load(struct widget_instance *widget)
 {
-	struct pc_menu_setting *setting = pc_menu_setting_get(widget->definition_tag_index);
+	struct pc_menu_setting *setting;
 	char current[300];
 
-	if (spinner_item(widget))
-		return TRUE;
-	if (!setting || !setting_text(setting->setting, current, sizeof(current), FALSE))
+	if (!widget) return FALSE;
+	if (spinner_item(widget)) return TRUE;
+	setting = pc_menu_setting_get(widget->definition_tag_index);
+	if (!setting ||
+	    !setting_text(setting->setting, current, sizeof(current), FALSE))
 		return FALSE;
 	setting->loaded_index = setting_value_index(setting, current);
-	if (setting->loaded_index < (short)widget->parameters.list.number_of_items)
-		widget->parameters.list.selected_index = setting->loaded_index;
+	if (setting->loaded_index < (short)WIDGET_LIST_ITEM_COUNT(widget))
+		WIDGET_LIST_SELECTED(widget) = setting->loaded_index;
 	return TRUE;
 }
 
 static boolean setting_save(struct widget_instance *widget)
 {
-	struct pc_menu_setting *setting = pc_menu_setting_get(widget->definition_tag_index);
-	if (spinner_item(widget))
-		return TRUE;
+	struct pc_menu_setting *setting;
+	if (!widget) return FALSE;
+	if (spinner_item(widget)) return TRUE;
+	setting = pc_menu_setting_get(widget->definition_tag_index);
 	if (!setting || setting->loaded_index == NONE ||
-		widget->parameters.list.selected_index < 0 ||
-		widget->parameters.list.selected_index >= setting->value_count)
+	    WIDGET_LIST_SELECTED(widget) < 0 ||
+	    WIDGET_LIST_SELECTED(widget) >= setting->value_count)
 		return FALSE;
-	if (widget->parameters.list.selected_index == setting->loaded_index)
+	if (WIDGET_LIST_SELECTED(widget) == setting->loaded_index)
 		return TRUE;
 	if (!config_write(setting->setting,
-		setting->values[widget->parameters.list.selected_index]))
+	                  setting->values[WIDGET_LIST_SELECTED(widget)]))
 		return FALSE;
-	setting->loaded_index = widget->parameters.list.selected_index;
+	setting->loaded_index = WIDGET_LIST_SELECTED(widget);
 	return TRUE;
 }
 
 /* ---------- Settings-Screen-Helfer ---------- */
 
 static void settings_each(struct widget_instance *widget,
-	boolean (*visit)(struct widget_instance *spinner, struct pc_menu_setting *setting))
+	boolean (*visit)(struct widget_instance *spinner,
+	                 struct pc_menu_setting *setting))
 {
 	struct widget_instance *child;
+	if (!widget) return;
 	for (child = widget->child; child; child = child->next)
 	{
-		struct pc_menu_setting *setting = child->type == 2 && !spinner_item(child) ?
+		struct pc_menu_setting *setting =
+			child->type == 2 && !spinner_item(child) ?
 			pc_menu_setting_get(child->definition_tag_index) : NULL;
 		if (setting)
 			visit(child, setting);
@@ -374,10 +421,12 @@ static void settings_each(struct widget_instance *widget,
 	}
 }
 
-static boolean setting_changed_save(struct widget_instance *spinner, struct pc_menu_setting *setting)
+static boolean setting_changed_save(struct widget_instance *spinner,
+                                    struct pc_menu_setting *setting)
 {
-	short index = spinner->parameters.list.selected_index;
-	if (index < 0 || index >= setting->value_count || index == setting->loaded_index)
+	short index = WIDGET_LIST_SELECTED(spinner);
+	if (index < 0 || index >= setting->value_count ||
+	    index == setting->loaded_index)
 		return TRUE;
 	if (!setting_write(setting->setting, setting->values[index]))
 		return FALSE;
@@ -385,60 +434,67 @@ static boolean setting_changed_save(struct widget_instance *spinner, struct pc_m
 	return TRUE;
 }
 
-static boolean setting_default_show(struct widget_instance *spinner, struct pc_menu_setting *setting)
+static boolean setting_default_show(struct widget_instance *spinner,
+                                    struct pc_menu_setting *setting)
 {
 	char text[300];
 	if (setting_text(setting->setting, text, sizeof(text), TRUE))
-		spinner->parameters.list.selected_index = setting_value_index(setting, text);
+		WIDGET_LIST_SELECTED(spinner) =
+			setting_value_index(setting, text);
 	return TRUE;
 }
 
 static void settings_help(struct widget_instance *list)
 {
-	struct widget_instance *help = list->parameters.list.extended_description;
-	struct widget_instance *row = list->focused_child;
+	struct widget_instance *help = get_extended_description(list);
+	struct widget_instance *row = list ? list->focused_child : NULL;
 	short index = 0;
 
-	if (!help)
-		return;
-	if (row && row->child && row->child->type == 1 && strncmp(row->name, "button", 6))
+	if (!help) return;
+	if (row && row->child && row->child->type == 1 &&
+	    strncmp(row->name, "button", 6))
 	{
 		short label = pc_menu_string_index(row->child->definition_tag_index);
 		if (label != NONE)
 			index = label + 1;
 	}
-	help->parameters.text_box.string_list_index = index;
+	help->data3C.value = index;
 }
 
 static void video_rows_show(struct widget_instance *list)
 {
-	struct widget_instance *mode = named(list, "mode_spinner", 0);
-	struct widget_instance *resolution = named(list, "op_resolution", 0);
-	struct widget_instance *window_size = named(list, "op_window_size", 0);
-	struct pc_menu_setting *setting = mode ? pc_menu_setting_get(mode->definition_tag_index) : NULL;
-	struct widget_instance *shown, *child;
+	struct widget_instance *mode, *resolution, *window_size, *shown, *child;
+	struct pc_menu_setting *setting;
 	short index;
 
-	if (!setting || !resolution || !window_size)
+	if (!list) return;
+	mode = named(list, "mode_spinner", 0);
+	resolution = named(list, "op_resolution", 0);
+	window_size = named(list, "op_window_size", 0);
+	if (!mode || !resolution || !window_size)
 		return;
-	index = mode->parameters.list.selected_index;
-	shown = index >= 0 && index < setting->value_count &&
-		!strcmp(setting->values[index], "windowed") ? window_size : resolution;
-	resolution->visible = shown == resolution;
-	window_size->visible = shown == window_size;
-	if (list->focused_child == (shown == resolution ? window_size : resolution))
+	setting = pc_menu_setting_get(mode->definition_tag_index);
+	if (!setting) return;
+	index = WIDGET_LIST_SELECTED(mode);
+	shown = (index >= 0 && index < setting->value_count &&
+	         !strcmp(setting->values[index], "windowed")) ?
+	        window_size : resolution;
+	resolution->visible = (shown == resolution);
+	window_size->visible = (shown == window_size);
+	if (list->focused_child == (shown == resolution ?
+	                            window_size : resolution))
 	{
-		for (index = 0, child = list->child; child && child != shown; child = child->next)
+		for (index = 0, child = list->child;
+		     child && child != shown; child = child->next)
 			index++;
 		list->focused_child = shown;
-		list->parameters.list.selected_index = index;
+		list->data3C.selected_index = index;
 	}
 }
 
-/* ---------- Controls Setup (reduziert: Capture aus) ---------- */
+/* ---------- Controls Setup ---------- */
 
 #define CONTROL_BINDINGS 2
-#define CONTROL_ROWS 7
 #define CONTROL_NAME_LENGTH 32
 
 static struct
@@ -500,7 +556,8 @@ static void control_bindings_text(short control, char *text, unsigned int size)
 	char const *first = controls_screen.bindings[control][0];
 	char const *second = controls_screen.bindings[control][1];
 	snprintf(text, size, "%s%s%s", *first ? first : second,
-		*first && *second ? ", " : "", *first ? second : "");
+	         *first && *second ? ", " : "",
+	         *first ? second : "");
 }
 
 static boolean controls_load(boolean defaults)
@@ -512,7 +569,8 @@ static boolean controls_load(boolean defaults)
 		if (defaults)
 			config_default(controls[control].setting, text, sizeof(text));
 		else
-			snprintf(text, sizeof(text), "%s", config_string(controls[control].setting));
+			snprintf(text, sizeof(text), "%s",
+			         config_string(controls[control].setting));
 		control_bindings_read(control, text);
 	}
 	controls_screen.capturing_control = NONE;
@@ -561,14 +619,17 @@ static short control_of_row(struct widget_instance *row, short group)
 static short controls_group(struct widget_instance *screen)
 {
 	struct widget_instance *spinner = named(screen, "group_spinner", 0);
-	return spinner ? spinner->parameters.list.selected_index : 0;
+	return spinner ? WIDGET_LIST_SELECTED(spinner) : 0;
 }
 
 static void controls_update(struct widget_instance *list)
 {
-	short group = controls_group(list);
-	struct widget_instance *row;
-	struct widget_instance *focused_row = control_row(list->focused_child);
+	short group;
+	struct widget_instance *row, *focused_row;
+
+	if (!list) return;
+	group = controls_group(list);
+	focused_row = control_row(list->focused_child);
 
 	for (row = list->child; row; row = row->next)
 	{
@@ -576,7 +637,7 @@ static void controls_update(struct widget_instance *list)
 		short slot;
 		if (strncmp(row->name, "op_command_", 11))
 			continue;
-		row->visible = control != NONE;
+		row->visible = (control != NONE);
 		if (control == NONE)
 			continue;
 		text_set(named(row, "command_label", 0), controls[control].label);
@@ -586,25 +647,28 @@ static void controls_update(struct widget_instance *list)
 			wchar_t text[ROW_TEXT_LENGTH];
 			char shown[64];
 			short index;
-
 			if (row == focused_row && controls_screen.slot == slot)
-				snprintf(shown, sizeof(shown), "> %s <", *binding ? binding : "-");
+				snprintf(shown, sizeof(shown), "> %s <",
+				         *binding ? binding : "-");
 			else
-				snprintf(shown, sizeof(shown), "%s", *binding ? binding : "-");
-			for (index = 0; shown[index] && index < ROW_TEXT_LENGTH - 1; index++)
+				snprintf(shown, sizeof(shown), "%s",
+				         *binding ? binding : "-");
+			for (index = 0;
+			     shown[index] && index < ROW_TEXT_LENGTH - 1;
+			     index++)
 				text[index] = (wchar_t)(unsigned char)shown[index];
 			text[index] = 0;
 			text_set(named(row, "command_binding", slot), text);
 		}
 	}
-	if (list->parameters.list.extended_description)
 	{
-		list->parameters.list.extended_description->parameters.text_box.string_list_index =
-			focused_row ? 1 : 0;
+		struct widget_instance *desc = get_extended_description(list);
+		if (desc)
+			desc->data3C.value = focused_row ? 1 : 0;
 	}
 }
 
-/* ---------- pc_menu_profile_edit_begin (vom Pause-Screen) ---------- */
+/* ---------- pc_menu_profile_edit_begin ---------- */
 
 boolean pc_menu_profile_edit_begin(void)
 {
@@ -615,8 +679,10 @@ boolean pc_menu_profile_edit_begin(void)
 	{
 		word count = 1;
 		profile_index = NONE;
-		player_profiles_enumerate_available_to_local_player_index(NONE, &count, &profile_index, FALSE);
-		if ((short)count <= 0 || profile_index == NONE || !player_profile_get(profile_index, &profile))
+		player_profiles_enumerate_available_to_local_player_index(
+			NONE, &count, &profile_index, FALSE);
+		if ((short)count <= 0 || profile_index == NONE ||
+		    !player_profile_get(profile_index, &profile))
 			return FALSE;
 	}
 	player_ui_set_active_player_profile(0, profile_index, &profile);
@@ -632,11 +698,12 @@ boolean pc_menu_event_function_invoke(
 	long function_index,
 	boolean *widget_deleted)
 {
-	char const *name = pc_menu_function_name(function_index);
+	char const *name;
 	(void)event;
 
-	if (!name)
-		return FALSE;
+	if (!widget) return FALSE;
+	name = pc_menu_function_name(function_index);
+	if (!name) return FALSE;
 
 	/* --- Quit --- */
 	if (!strcmp(name, "port quit game") || !strcmp(name, "main menu quit game"))
@@ -674,10 +741,7 @@ boolean pc_menu_event_function_invoke(
 	if (!strcmp(name, "controls screen change set"))
 		return controls_save();
 	if (!strcmp(name, "controls begin binding"))
-	{
-		/* (auf diesem Build deaktiviert) */
 		return TRUE;
-	}
 	if (!strcmp(name, "controls binding slot"))
 	{
 		controls_screen.slot = (short)!controls_screen.slot;
@@ -685,8 +749,10 @@ boolean pc_menu_event_function_invoke(
 	}
 
 	/* --- Back-Handler --- */
-	if (!strcmp(name, "controls back handler") || !strcmp(name, "gamespy back handler") ||
-		!strcmp(name, "gamespy dismiss error") || !strcmp(name, "gamespy dismiss filters"))
+	if (!strcmp(name, "controls back handler") ||
+	    !strcmp(name, "gamespy back handler") ||
+	    !strcmp(name, "gamespy dismiss error") ||
+	    !strcmp(name, "gamespy dismiss filters"))
 	{
 		ui_widget_port_go_back(widget);
 		if (widget_deleted) *widget_deleted = TRUE;
@@ -710,7 +776,7 @@ boolean pc_menu_event_function_invoke(
 		return TRUE;
 	}
 
-	/* --- Alles andere: stillschweigend OK, damit die Menues nicht abbrechen --- */
+	/* --- Fallback --- */
 	return TRUE;
 }
 
@@ -718,9 +784,10 @@ void pc_menu_game_data_function_invoke(
 	struct widget_instance *widget,
 	long function)
 {
-	char const *name = pc_menu_game_data_input_name(function);
-	if (!name)
-		return;
+	char const *name;
+	if (!widget) return;
+	name = pc_menu_game_data_input_name(function);
+	if (!name) return;
 
 	if (!strcmp(name, "port settings help"))
 	{
@@ -731,5 +798,4 @@ void pc_menu_game_data_function_invoke(
 	{
 		controls_update(widget);
 	}
-	/* sonst: keine Aktion */
 }
