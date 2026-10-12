@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-patch_settings_only.py  (v5)
+patch_settings_only.py  (v5 - FINALE)
 
-Änderungen seit v4:
-- Bugfix: Der Hook übergibt jetzt `function_index - PC_MENU_FUNCTION_BASE`
-  an pc_menu_event_function_invoke, weil die OpenCE-Dispatcher-Funktion
-  einen 0-basierten Index erwartet (sonst Out-of-bounds in
-  pc_menu_function_name).
-- Bugfix: Obergrenze 0x9000 im Dispatcher (nur Settings-Bereich).
-- Bugfix: Return-Typ der externen Deklaration von 'void' auf 'int'
-  geändert (die Funktion liefert boolean zurück, was in x0 landet).
-- Bugfix: Statt bare `return;` jetzt `return TRUE;` — sauber für
-  den Caller, der boolean erwartet.
+BUGFIX: Der Dispatcher-Bereich war leer (>= 0x8000 UND < 0x8000 ist
+immer falsch). Der OpenCE-Menue-Event-Handler wurde dadurch NIE
+aufgerufen; der Guest-Code fiel in den Xbox-Pfad mit einem Index
+ausserhalb des Xbox-Bereichs, was error() -> abort() -> SIGILL auslöste.
+
+Fix: Obergrenze ist jetzt PC_MENU_FUNCTION_TOP = 0x9000.
+Ausserdem: function_index - PC_MENU_FUNCTION_BASE (OpenCE erwartet
+0-basierten Index).
 """
 
 import os
@@ -22,26 +19,24 @@ import shutil
 import sys
 
 
-def create_backup(file_path: str) -> None:
+def create_backup(file_path):
     if os.path.exists(file_path) and not os.path.exists(file_path + ".bak"):
         shutil.copy2(file_path, file_path + ".bak")
         print(f"[BACKUP] Kopie erstellt: {file_path}.bak")
 
 
-def read_file_content(path: str) -> str:
+def read_file_content(path):
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
 
-def write_file_content(path: str, content: str) -> None:
+def write_file_content(path, content):
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
 
 
-def _split_top_level(text: str, sep: str = ",") -> list:
-    parts = []
-    depth = 0
-    current = ""
+def _split_top_level(text, sep=","):
+    parts, depth, current = [], 0, ""
     for ch in text:
         if ch in "([":
             depth += 1
@@ -57,7 +52,7 @@ def _split_top_level(text: str, sep: str = ",") -> list:
     return parts
 
 
-def _extract_param_names(signature: str) -> list:
+def _extract_param_names(signature):
     names = []
     for p in _split_top_level(signature, ","):
         p = p.strip()
@@ -70,24 +65,21 @@ def _extract_param_names(signature: str) -> list:
     return names
 
 
-def patch_ui_widget(base_dir: str) -> None:
+def patch_ui_widget(base_dir):
     file_path = os.path.join(base_dir, "source", "interface", "ui_widget.c")
     if not os.path.exists(file_path):
         file_path = os.path.join(base_dir, "ui_widget.c")
     if not os.path.exists(file_path):
         print("[WARN] ui_widget.c nicht gefunden.")
         return
-
     create_backup(file_path)
     content = read_file_content(file_path)
-
     hook_decl = (
         "\n/* PC Settings Menu Hooks - Typensicher */\n"
         "#include <stdint.h>\n"
         "#include <stdbool.h>\n"
         "extern bool pc_menu_tag(int32_t tag_index);\n"
     )
-
     if "pc_menu_tag" not in content:
         last_include = content.rfind("#include")
         if last_include != -1:
@@ -95,12 +87,11 @@ def patch_ui_widget(base_dir: str) -> None:
             content = content[:end_line] + hook_decl + content[end_line:]
         else:
             content = hook_decl + content
-
         write_file_content(file_path, content)
         print("[OK] ui_widget.c gepatcht.")
 
 
-def patch_event_dispatcher(base_dir: str) -> None:
+def patch_event_dispatcher(base_dir):
     file_path = os.path.join(base_dir, "source", "interface",
                               "ui_widget_event_handler_functions.c")
     if not os.path.exists(file_path):
@@ -109,24 +100,82 @@ def patch_event_dispatcher(base_dir: str) -> None:
         print("[WARN] ui_widget_event_handler_functions.c nicht gefunden.")
         return
 
-    create_backup(file_path)
     content = read_file_content(file_path)
 
-    if "PC_MENU_FUNCTION_BASE" in content:
-        print("[INFO] ui_widget_event_handler_functions.c bereits gepatcht.")
+    # Falls die Datei schon eine falsche Version hat: den leeren Bereich
+    # "< 0x8000" entfernen und durch korrekte v5-Version ersetzen.
+    # Wir pruefen auf "< 0x8000" und ersetzen die gesamte if-Bedingung.
+    bad_pattern = re.compile(
+        r"if\s*\(\s*function_index\s*>=\s*PC_MENU_FUNCTION_BASE\s*&&\s*function_index\s*<\s*0x8000\s*\)\s*\{"
+        r"(.*?)\}"
+        r"\s*(?:/\*.*?\*/\s*)?",
+        re.DOTALL,
+    )
+    good_block = (
+        "if (function_index >= PC_MENU_FUNCTION_BASE && "
+        "function_index < PC_MENU_FUNCTION_TOP) {"
+        "\\1}"
+    )
+
+    if bad_pattern.search(content):
+        # Nur die Bedingung ersetzen, nicht den Block darin
+        def repl(m):
+            inner = m.group(1)
+            return (
+                "if (function_index >= PC_MENU_FUNCTION_BASE && "
+                "function_index < PC_MENU_FUNCTION_TOP) {" + inner + "}"
+            )
+        content = bad_pattern.sub(repl, content, count=1)
+        if "PC_MENU_FUNCTION_TOP" not in content:
+            # Definition oben einfügen
+            top_def = (
+                "#ifndef PC_MENU_FUNCTION_TOP\n"
+                "#define PC_MENU_FUNCTION_TOP 0x9000\n"
+                "#endif\n"
+            )
+            # Vor "if (function_index >= PC_MENU_FUNCTION_BASE"
+            content = content.replace(
+                "if (function_index >= PC_MENU_FUNCTION_BASE",
+                top_def + "if (function_index >= PC_MENU_FUNCTION_BASE",
+                1,
+            )
+        write_file_content(file_path, content)
+        print("[OK] ui_widget_event_handler_functions.c: Bereich auf 0x9000 korrigiert.")
         return
 
+    if "PC_MENU_FUNCTION_TOP" in content or \
+       "function_index < 0x9000" in content or \
+       "function_index < 0x8FFF" in content:
+        print("[INFO] ui_widget_event_handler_functions.c bereits korrekt.")
+        return
+
+    if "PC_MENU_FUNCTION_BASE" in content:
+        # Einmaliger Patch: Bedingung auf PC_MENU_FUNCTION_TOP aendern
+        content = content.replace(
+            "if (function_index >= PC_MENU_FUNCTION_BASE)",
+            "if (function_index >= PC_MENU_FUNCTION_BASE && "
+            "function_index < PC_MENU_FUNCTION_TOP)",
+            1,
+        )
+        if "PC_MENU_FUNCTION_TOP" not in content:
+            content = content.replace(
+                "#define PC_MENU_FUNCTION_BASE 0x8000",
+                "#define PC_MENU_FUNCTION_BASE 0x8000\n"
+                "#define PC_MENU_FUNCTION_TOP 0x9000",
+                1,
+            )
+        write_file_content(file_path, content)
+        print("[OK] ui_widget_event_handler_functions.c gepatcht.")
+        return
+
+    # Erster Patch (Datei noch nicht gepatcht): mit korrekter v5-Logik
+    create_backup(file_path)
     func_name = "ui_widget_event_handler_function_invoke"
     idx = content.find(func_name)
     if idx == -1:
         print(f"[WARN] {func_name} nicht gefunden.")
         return
-
     paren_open = content.find("(", idx)
-    if paren_open == -1:
-        print("[WARN] keine Parameterliste gefunden.")
-        return
-
     depth = 0
     paren_close = -1
     for i in range(paren_open, len(content)):
@@ -137,68 +186,41 @@ def patch_event_dispatcher(base_dir: str) -> None:
             if depth == 0:
                 paren_close = i
                 break
-    if paren_close == -1:
-        print("[WARN] keine schliessende Klammer gefunden.")
-        return
-
     brace_open = content.find("{", paren_close)
-    if brace_open == -1:
-        print("[WARN] keine oeffnende Klammer gefunden.")
-        return
-
     signature = content[paren_open + 1:paren_close]
     names = _extract_param_names(signature)
-    print(f"[INFO] Erkannte Parameter: {names}")
-
-    if len(names) < 3:
-        print(f"[WARN] zu wenige Parameter: {names}")
-        return
-
     fi_idx = -1
     for i, n in enumerate(names):
         if n == "function_index":
             fi_idx = i
             break
-    if fi_idx == -1:
-        print(f"[WARN] 'function_index' nicht in {names}")
+    if fi_idx == -1 or len(names) < 3:
+        print(f"[WARN] Parameter nicht erkannt: {names}")
         return
-
     others = [(i, n) for i, n in enumerate(names) if i != fi_idx]
     widget_name = others[0][1]
     event_name = others[1][1]
     fi_name = names[fi_idx]
     wd_name = others[2][1] if len(others) > 2 else None
 
-    print(f"[INFO] widget={widget_name} event={event_name} "
-          f"fi={fi_name} wd={wd_name}")
-
-    # v5: Korrekte Deklaration mit int-Rückgabetyp (boolean in C ist int).
-    # Wichtig: Zeiger-Typen als void*, damit beliebige struct-Zeiger
-    # übergeben werden können.
     hook_header = (
-        "\n/* PC Settings Menu Hooks - v5 (dynamische Parametererkennung) */\n"
+        "\n/* PC Settings Menu Hooks - v5 */\n"
         "#include <stdint.h>\n"
         "#ifndef PC_MENU_FUNCTION_BASE\n"
         "#define PC_MENU_FUNCTION_BASE 0x8000\n"
         "#endif\n"
         "#ifndef PC_MENU_FUNCTION_TOP\n"
-        "#define PC_MENU_FUNCTION_TOP  0x9000\n"
+        "#define PC_MENU_FUNCTION_TOP 0x9000\n"
         "#endif\n"
         "extern int pc_menu_event_function_invoke(void *widget, void *event,\n"
-        "                                         long function_index,\n"
-        "                                         void *widget_deleted);\n"
+        "                                          long function_index,\n"
+        "                                          void *widget_deleted);\n"
     )
     content = content[:idx] + hook_header + content[idx:]
     offset = len(hook_header)
     new_brace_open = brace_open + offset
-
     wd_arg = wd_name if wd_name else "0"
 
-    # v5 FIXES:
-    #   1) Obergrenze PC_MENU_FUNCTION_TOP (0x9000)
-    #   2) function_index - PC_MENU_FUNCTION_BASE  (OpenCE erwartet 0-basiert)
-    #   3) return TRUE statt bare return
-    #   4) wd_arg als void* cast, falls Zeiger NULL ist
     insertion = (
         f"\n    if ({fi_name} >= PC_MENU_FUNCTION_BASE && "
         f"{fi_name} < PC_MENU_FUNCTION_TOP) {{\n"
@@ -209,12 +231,11 @@ def patch_event_dispatcher(base_dir: str) -> None:
         f"    }}"
     )
     content = content[:new_brace_open + 1] + insertion + content[new_brace_open + 1:]
-
     write_file_content(file_path, content)
     print("[OK] ui_widget_event_handler_functions.c gepatcht (v5).")
 
 
-def patch_game_data_dispatcher(base_dir: str) -> None:
+def patch_game_data_dispatcher(base_dir):
     file_path = os.path.join(base_dir, "source", "interface",
                               "ui_widget_game_data_input_functions.c")
     if not os.path.exists(file_path):
@@ -223,25 +244,17 @@ def patch_game_data_dispatcher(base_dir: str) -> None:
     if not os.path.exists(file_path):
         print("[WARN] ui_widget_game_data_input_functions.c nicht gefunden.")
         return
-
     create_backup(file_path)
     content = read_file_content(file_path)
-
     if "pc_menu_game_data_function_invoke" in content:
         print("[INFO] ui_widget_game_data_input_functions.c bereits gepatcht.")
         return
-
     func_name = "ui_widget_game_data_input_function_invoke"
     idx = content.find(func_name)
     if idx == -1:
         print(f"[WARN] {func_name} nicht gefunden.")
         return
-
     paren_open = content.find("(", idx)
-    if paren_open == -1:
-        print("[WARN] keine Parameterliste gefunden.")
-        return
-
     depth = 0
     paren_close = -1
     for i in range(paren_open, len(content)):
@@ -252,105 +265,77 @@ def patch_game_data_dispatcher(base_dir: str) -> None:
             if depth == 0:
                 paren_close = i
                 break
-    if paren_close == -1:
-        print("[WARN] keine schliessende Klammer gefunden.")
-        return
-
     brace_open = content.find("{", paren_close)
-    if brace_open == -1:
-        print("[WARN] keine oeffnende Klammer gefunden.")
-        return
-
     signature = content[paren_open + 1:paren_close]
     names = _extract_param_names(signature)
-    print(f"[INFO] Erkannte Parameter (game data): {names}")
-
-    if len(names) < 2:
-        print(f"[WARN] zu wenige Parameter: {names}")
-        return
-
     fi_idx = -1
     for i, n in enumerate(names):
         if n == "function_index":
             fi_idx = i
             break
-    if fi_idx == -1:
-        print(f"[WARN] 'function_index' nicht in {names}")
+    if fi_idx == -1 or len(names) < 2:
+        print(f"[WARN] Parameter nicht erkannt: {names}")
         return
-
     others = [(i, n) for i, n in enumerate(names) if i != fi_idx]
     widget_name = others[0][1]
     fi_name = names[fi_idx]
-
     hook_header = (
         "\n/* PC Settings Menu Hooks - game data (v5) */\n"
         "#include <stdint.h>\n"
+        "#ifndef PC_MENU_GAME_DATA_BASE\n"
+        "#define PC_MENU_GAME_DATA_BASE 0x8000\n"
+        "#endif\n"
+        "#ifndef PC_MENU_GAME_DATA_TOP\n"
+        "#define PC_MENU_GAME_DATA_TOP 0x9000\n"
+        "#endif\n"
         "extern void pc_menu_game_data_function_invoke(void *widget,\n"
         "                                              long function_index);\n"
     )
     content = content[:idx] + hook_header + content[idx:]
     offset = len(hook_header)
     new_brace_open = brace_open + offset
-
     insertion = (
-        f"\n    if ({fi_name} >= 0x8000 && {fi_name} < 0x9000) {{\n"
+        f"\n    if ({fi_name} >= PC_MENU_GAME_DATA_BASE && "
+        f"{fi_name} < PC_MENU_GAME_DATA_TOP) {{\n"
         f"        pc_menu_game_data_function_invoke({widget_name}, "
-        f"{fi_name} - 0x8000);\n"
+        f"{fi_name} - PC_MENU_GAME_DATA_BASE);\n"
         f"        return;\n"
         f"    }}"
     )
     content = content[:new_brace_open + 1] + insertion + content[new_brace_open + 1:]
-
     write_file_content(file_path, content)
     print("[OK] ui_widget_game_data_input_functions.c gepatcht (v5).")
 
 
-def patch_cache_files(base_dir: str) -> None:
+def patch_cache_files(base_dir):
     file_path = os.path.join(base_dir, "source", "cache", "cache_files.c")
     if not os.path.exists(file_path):
         file_path = os.path.join(base_dir, "cache_files.c")
     if not os.path.exists(file_path):
         print("[WARN] cache_files.c nicht gefunden.")
         return
-
     create_backup(file_path)
     content = read_file_content(file_path)
-
     if "menu_tags_loaded" not in content:
         decl = ("\nextern void menu_tags_loaded(void);\n"
                 "extern void menu_tags_unloaded(void);\n")
         content = decl + content
-
         content = re.sub(
             r"(cache_file_load\s*\([^)]*\)\s*\{)",
-            r"\1\n    menu_tags_loaded();",
-            content,
-            count=1,
-        )
+            r"\1\n    menu_tags_loaded();", content, count=1)
         content = re.sub(
             r"(cache_file_unload\s*\([^)]*\)\s*\{)",
-            r"\1\n    menu_tags_unloaded();",
-            content,
-            count=1,
-        )
-
+            r"\1\n    menu_tags_unloaded();", content, count=1)
         write_file_content(file_path, content)
         print("[OK] cache_files.c gepatcht.")
 
 
-def patch_buildsystem_and_shim(root_dir: str, patches_dir: str) -> None:
+def patch_buildsystem_and_shim(root_dir, patches_dir):
     shim_src = os.path.join(patches_dir, "port_settings_shim.c")
     target_dir = os.path.join(root_dir, "port", "linux", "game")
-
     if os.path.exists(shim_src) and os.path.exists(target_dir):
         shutil.copy2(shim_src, os.path.join(target_dir, "port_settings_shim.c"))
         print(f"[OK] port_settings_shim.c nach {target_dir} kopiert.")
-    else:
-        if not os.path.exists(shim_src):
-            print(f"[WARN] {shim_src} nicht gefunden.")
-        if not os.path.exists(target_dir):
-            print(f"[WARN] Zielordner {target_dir} nicht gefunden.")
-
     json_path = os.path.join(root_dir, "port.json")
     if os.path.exists(json_path):
         create_backup(json_path)
@@ -358,7 +343,6 @@ def patch_buildsystem_and_shim(root_dir: str, patches_dir: str) -> None:
         if '"dl"' not in content:
             content = content.replace('"libs": [', '"libs": [\n    "dl",')
             write_file_content(json_path, content)
-            print("[OK] port.json aktualisiert (libdl hinzugefügt).")
 
 
 def main():
@@ -368,17 +352,13 @@ def main():
         root_dir = sys.argv[1]
     if len(sys.argv) > 2:
         patches_dir = sys.argv[2]
-
-    print(f"=== Starte Patch-Vorgang in: {root_dir} ===")
-    print(f"=== Patches-Verzeichnis: {patches_dir} ===")
-
+    print(f"=== patch_settings_only.py v5 ===")
     patch_ui_widget(root_dir)
     patch_event_dispatcher(root_dir)
     patch_game_data_dispatcher(root_dir)
     patch_cache_files(root_dir)
     patch_buildsystem_and_shim(root_dir, patches_dir)
-
-    print("=== Patch-Vorgang abgeschlossen! ===")
+    print("=== fertig ===")
 
 
 if __name__ == "__main__":
