@@ -13,6 +13,12 @@ set -euo pipefail
 #    CMake den C++-Testlauf nicht auf dem x86_64-Host durchfuehrt.
 #  - SDL2-Cache-Pruefung nutzt jetzt $SYSROOT_LIB/libSDL2-2.0.so.0,
 #    so wie SDL3, damit SDL2 nicht bei jedem Lauf neu gebaut wird.
+#
+# v8 (DEBUG, TEMPORÄR):
+#  - Ruft patches/patch_debug_gl.py auf, um host_glthread.c und
+#    host_sdl2.c mit Log-Zeilen zu versehen (SIGILL-Diagnose).
+#  - Nach der Diagnose: den entsprechenden Block in "PORT/KNULLI KOPIEREN"
+#    entfernen und patches/patch_debug_gl.py löschen.
 # ══════════════════════════════════════════════════════════════════════
 PGO_MODE=${PGO_MODE:-use}
 
@@ -804,6 +810,30 @@ rm -rf "$SRC/port/knulli/__pycache__"
 chmod +x "$SRC/port/knulli/build.sh" 2>/dev/null || true
 
 # ══════════════════════════════════════════════════════════════════════
+# TEMPORÄRE GL-DEBUG-PATCHES (nur für die SIGILL-Diagnose)
+# ══════════════════════════════════════════════════════════════════════
+# Fügt host_logf-Aufrufe in host_glthread.c und host_sdl2.c ein, damit
+# im halo-stderr.txt sichtbar wird, welcher Host-Aufruf zuletzt betreten
+# wurde, bevor der Prozess mit SIGILL stirbt.
+#
+# NACH DER DIAGNOSE: diesen Block entfernen oder auf "0" setzen,
+# und patches/patch_debug_gl.py löschen.
+HALO_DEBUG_GL=${HALO_DEBUG_GL:-1}
+if [ "$HALO_DEBUG_GL" = "1" ]; then
+    echo ""
+    echo "== TEMPORÄR: GL-Debug-Logging in host_glthread.c und host_sdl2.c ..."
+    if [ -f "$HERE/patches/patch_debug_gl.py" ]; then
+        python3 "$HERE/patches/patch_debug_gl.py" "$SRC" || \
+            echo "WARNUNG: patch_debug_gl.py fehlgeschlagen - Debug-Logging unvollstaendig."
+    else
+        echo "WARNUNG: patches/patch_debug_gl.py fehlt - Debug-Logging uebersprungen."
+    fi
+else
+    echo ""
+    echo "== GL-Debug-Logging uebersprungen (HALO_DEBUG_GL=$HALO_DEBUG_GL)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════
 # Restliche Python-Patches
 # ══════════════════════════════════════════════════════════════════════
 echo ""
@@ -946,6 +976,12 @@ check_patch "source/cache/cache_files.c"        "cache_files_tag_instances"     
 check_patch "source/cache/cache_files.c"        "menu_tags_loaded"              "cache_files.c Menue-Hooks"
 check_patch "port/linux/src/menu_files.c"       "MENU_FILES_HOST_FUNCS_DECLARED" "menu_files.c Forward-Deklarationen"
 
+# Debug-Patch-Verifikation (nur wenn aktiviert)
+if [ "$HALO_DEBUG_GL" = "1" ]; then
+    check_patch "port/knulli/host/host_glthread.c" "DIAG-GL" "host_glthread.c Debug-Logging"
+    check_patch "port/knulli/host/host_sdl2.c"     "DIAG-GL" "host_sdl2.c Debug-Logging"
+fi
+
 if grep -q "settings_only: game data dispatcher" \
     "$SRC/source/interface/ui_widget_game_data_input_functions.c" 2>/dev/null; then
     echo "   OK: ui_widget_game_data_input_functions.c Dispatcher"
@@ -1019,13 +1055,14 @@ stamp=$({
              patch_forward_declarations.py patch_settings_only.py \
              patch_android_build_hybrid.py patch_missing_functions.py \
              patch_config_changes.py patch_terminal_buffer.py \
+             patch_debug_gl.py \
              settings_only_menu_functions.c port_settings_shim.c \
              guest_host_stubs.c; do
         cat "$HERE/patches/$p" 2>/dev/null || true
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v7-sdl2-revert"
+    echo "gcc9-host-dynamic=v8-debug-gl"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
@@ -1101,13 +1138,17 @@ else
     cat <<'RELEASE'
 
 ────────────────────────────────────────────────────────────────────────
-RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, Hybrid v7)
+RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, Hybrid v8 mit GL-Debug)
 ────────────────────────────────────────────────────────────────────────
 Installation auf M9 Pro (wenn halo_guest.elf existiert):
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
 2. dist/halo_guest.elf    nach /roms/ports/halo-ce/halo_guest.elf
 3. dist/halo              nach /roms/ports/halo-ce/halo
 4. dist/libs.aarch64/     nach /roms/ports/halo-ce/libs.aarch64/
+
+WICHTIG: Dieser Build enthält Debug-Logging für die SIGILL-Diagnose.
+Nach dem Test den Block "TEMPORÄRE GL-DEBUG-PATCHES" in build.sh
+entfernen oder HALO_DEBUG_GL=0 setzen, und patches/patch_debug_gl.py löschen.
 
 FERTIG.
 ────────────────────────────────────────────────────────────────────────
