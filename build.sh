@@ -4,6 +4,19 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════
 # Halo CE Universal — M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
+# Fix v9 (BUGFIX):
+#  - patch_gl_init_order.py verschiebt die GL-Initialisierung in
+#    host_glthread.c von run_create_context nach run_make_current.
+#    Ursache: refill() (glGenTextures etc.) lief ohne current context
+#    und loeste SIGILL aus (x16 = 0xFFFFFFFFFFFFFFFF = Mali's
+#    uninitialisierter Dispatch-Slot).
+#
+# Fix v8 (DEBUG, TEMPORÄR):
+#  - Ruft patches/patch_debug_gl.py auf, um host_glthread.c und
+#    host_sdl2.c mit Log-Zeilen zu versehen (SIGILL-Diagnose).
+#  - Nach der Diagnose: den entsprechenden Block in "PORT/KNULLI KOPIEREN"
+#    entfernen und patches/patch_debug_gl.py löschen.
+#
 # Fix v7:
 #  - -mno-outline-atomics aus den SDL2/SDL3-CMake-Aufrufen entfernt.
 #    GCC 9 kennt diese Flag nicht (sie ist Clang-spezifisch).
@@ -13,12 +26,6 @@ set -euo pipefail
 #    CMake den C++-Testlauf nicht auf dem x86_64-Host durchfuehrt.
 #  - SDL2-Cache-Pruefung nutzt jetzt $SYSROOT_LIB/libSDL2-2.0.so.0,
 #    so wie SDL3, damit SDL2 nicht bei jedem Lauf neu gebaut wird.
-#
-# v8 (DEBUG, TEMPORÄR):
-#  - Ruft patches/patch_debug_gl.py auf, um host_glthread.c und
-#    host_sdl2.c mit Log-Zeilen zu versehen (SIGILL-Diagnose).
-#  - Nach der Diagnose: den entsprechenden Block in "PORT/KNULLI KOPIEREN"
-#    entfernen und patches/patch_debug_gl.py löschen.
 # ══════════════════════════════════════════════════════════════════════
 PGO_MODE=${PGO_MODE:-use}
 
@@ -810,6 +817,26 @@ rm -rf "$SRC/port/knulli/__pycache__"
 chmod +x "$SRC/port/knulli/build.sh" 2>/dev/null || true
 
 # ══════════════════════════════════════════════════════════════════════
+# BUGFIX: GL-Init-Reihenfolge korrigieren (v9)
+# ══════════════════════════════════════════════════════════════════════
+# Die GL-Initialisierung (refill, share_initialize, scanout_open,
+# builders_start) lief in host_glthread.c innerhalb von run_create_context
+# - also BEVOR SDL_GL_MakeCurrent aufgerufen wurde. refill() ruft
+# glGenTextures etc. auf; ein GL-Befehl ohne current context loest auf
+# ARMv8.0 + Mali-G31 einen SIGILL aus (x16 = 0xFFFFFFFFFFFFFFFF).
+#
+# Dieser Patch verschiebt die Init in run_make_current.
+if [ -f "$HERE/patches/patch_gl_init_order.py" ]; then
+    echo ""
+    echo "== BUGFIX: GL-Init nach SDL_GL_MakeCurrent verschieben ..."
+    python3 "$HERE/patches/patch_gl_init_order.py" "$SRC" || \
+        echo "WARNUNG: patch_gl_init_order.py fehlgeschlagen."
+else
+    echo ""
+    echo "WARNUNG: patches/patch_gl_init_order.py fehlt - GL-Init-Fix uebersprungen."
+fi
+
+# ══════════════════════════════════════════════════════════════════════
 # TEMPORÄRE GL-DEBUG-PATCHES (nur für die SIGILL-Diagnose)
 # ══════════════════════════════════════════════════════════════════════
 # Fügt host_logf-Aufrufe in host_glthread.c und host_sdl2.c ein, damit
@@ -982,6 +1009,9 @@ if [ "$HALO_DEBUG_GL" = "1" ]; then
     check_patch "port/knulli/host/host_sdl2.c"     "DIAG-GL" "host_sdl2.c Debug-Logging"
 fi
 
+# GL-Init-Fix-Verifikation
+check_patch "port/knulli/host/host_glthread.c" "FIX: Der GL-Kontext wird erst hier current" "host_glthread.c GL-Init-Reihenfolge"
+
 if grep -q "settings_only: game data dispatcher" \
     "$SRC/source/interface/ui_widget_game_data_input_functions.c" 2>/dev/null; then
     echo "   OK: ui_widget_game_data_input_functions.c Dispatcher"
@@ -1055,14 +1085,14 @@ stamp=$({
              patch_forward_declarations.py patch_settings_only.py \
              patch_android_build_hybrid.py patch_missing_functions.py \
              patch_config_changes.py patch_terminal_buffer.py \
-             patch_debug_gl.py \
+             patch_debug_gl.py patch_gl_init_order.py \
              settings_only_menu_functions.c port_settings_shim.c \
              guest_host_stubs.c; do
         cat "$HERE/patches/$p" 2>/dev/null || true
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v8-debug-gl"
+    echo "gcc9-host-dynamic=v9-gl-init-fix"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
@@ -1138,7 +1168,7 @@ else
     cat <<'RELEASE'
 
 ────────────────────────────────────────────────────────────────────────
-RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, Hybrid v8 mit GL-Debug)
+RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, v9 mit GL-Init-Fix)
 ────────────────────────────────────────────────────────────────────────
 Installation auf M9 Pro (wenn halo_guest.elf existiert):
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
@@ -1146,9 +1176,11 @@ Installation auf M9 Pro (wenn halo_guest.elf existiert):
 3. dist/halo              nach /roms/ports/halo-ce/halo
 4. dist/libs.aarch64/     nach /roms/ports/halo-ce/libs.aarch64/
 
-WICHTIG: Dieser Build enthält Debug-Logging für die SIGILL-Diagnose.
-Nach dem Test den Block "TEMPORÄRE GL-DEBUG-PATCHES" in build.sh
-entfernen oder HALO_DEBUG_GL=0 setzen, und patches/patch_debug_gl.py löschen.
+WICHTIG:
+- Dieser Build enthält den GL-Init-Fix (v9), der den SIGILL beheben soll.
+- Zusätzlich ist noch Debug-Logging (v8) aktiv, um im Fehlerfall weitere
+  Diagnose zu ermöglichen. Nach erfolgreicher Verifikation kann der Block
+  "TEMPORÄRE GL-DEBUG-PATCHES" in build.sh entfernt werden.
 
 FERTIG.
 ────────────────────────────────────────────────────────────────────────
