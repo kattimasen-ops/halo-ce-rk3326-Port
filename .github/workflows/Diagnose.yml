@@ -5,7 +5,7 @@ on:
 
 jobs:
   diagnose:
-    name: Mali-Bibliothek auf LSE-Instruktionen pruefen
+    name: Mali-Bibliothek auf ARMv8.1-Features pruefen
     runs-on: ubuntu-22.04
     container: ubuntu:20.04
     timeout-minutes: 30
@@ -45,16 +45,16 @@ jobs:
           } > "$DIAG/01_sysroot_libs.txt"
           cat "$DIAG/01_sysroot_libs.txt"
 
-      - name: "LSE-Instruktionen pruefen (robust)"
+      - name: "LSE-Instruktionen pruefen (mit Wortgrenzen)"
         run: |
-          # WICHTIG: kein 'set -e' und kein pipefail in diesem Step
+          # WICHTIG: kein set -e und kein pipefail in diesem Step
           set +e
           set +o pipefail
 
           {
-            echo "=== LSE-Atomics-Pruefung ==="
-            echo "Eine Zahl > 0 bedeutet: ARMv8.1-LSE-Instruktionen vorhanden."
-            echo "Auf Cortex-A35 (ARMv8.0) fuehrt das zu SIGILL."
+            echo "=== LSE-Atomics-Pruefung (echte Instruktionen) ==="
+            echo "Es wird nach dem Mnemonic gefolgt von Whitespace gesucht,"
+            echo "damit Symbol-Namen wie SDL_ListAdd nicht als 'stadd' zaehlen."
             echo ""
           } > "$DIAG/02_lse_check.txt"
 
@@ -64,69 +64,106 @@ jobs:
             exit 0
           fi
 
+          # Objdump in eine temporaere Datei, dann mit Python zaehlen
           for lib in "$SYSROOT_LIB"/*.so*; do
             [ -f "$lib" ] || continue
-            count=$(aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null | \
-              grep -iE 'ldadd|stadd|ldclr|stclr|ldeor|steor|ldset|stset|ldsmax|stsmax|ldsmin|stsmin|ldumax|stumax|ldumin|stumin|\bswp\b|\bcas\b' | \
-              wc -l)
+            aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null > /tmp/objdump.txt
+            count=$(python3 - <<'PYEOF'
+import re, sys
+mnemonics_lse = {
+    'ldadd', 'ldadda', 'ldaddal', 'ldaddl',
+    'ldclr', 'ldclra', 'ldclral', 'ldclrl',
+    'ldeor', 'ldeora', 'ldeoral', 'ldeorl',
+    'ldset', 'ldseta', 'ldsetal', 'ldsetl',
+    'ldsmax', 'ldsmaxa', 'ldsmaxal', 'ldsmaxl',
+    'ldsmin', 'ldsmina', 'ldsminal', 'ldsminl',
+    'ldumax', 'ldumaxa', 'ldumaxal', 'ldumaxl',
+    'ldumin', 'ldumina', 'lduminal', 'lduminl',
+    'stadd', 'stclr', 'steor', 'stset',
+    'stsmax', 'stsmin', 'stumax', 'stumin',
+    'swp', 'swpa', 'swpal', 'swpl',
+    'cas', 'casa', 'casal', 'casl',
+    'casp', 'caspa', 'caspal', 'caspl',
+}
+count = 0
+with open('/tmp/objdump.txt') as f:
+    for line in f:
+        # Instruktionszeile: <hex>: <hex bytes>\t<mnemonic> <operands>
+        m = re.match(r'\s*[0-9a-f]+:\s+[0-9a-f ]+\t([a-z][a-z0-9]*)', line)
+        if m and m.group(1) in mnemonics_lse:
+            count += 1
+print(count)
+PYEOF
+)
             count=${count:-0}
             if [ "$count" -gt 0 ]; then
-              echo "WARNUNG: $(basename "$lib") enthaelt $count LSE-Instruktionen" >> "$DIAG/02_lse_check.txt"
-              aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null | \
-                grep -iE 'ldadd|stadd|ldclr|stclr|ldeor|steor|ldset|stset|ldsmax|stsmax|ldsmin|stsmin|ldumax|stumax|ldumin|stumin|\bswp\b|\bcas\b' | \
-                head -3 >> "$DIAG/02_lse_check.txt"
+              echo "WARNUNG: $(basename "$lib") enthaelt $count echte LSE-Instruktionen" >> "$DIAG/02_lse_check.txt"
+              grep -E '^\s*[0-9a-f]+:\s+[0-9a-f ]+\t(ldadd|stadd|ldclr|stclr|ldeor|steor|ldset|stset|ldsmax|stsmax|ldsmin|stsmin|ldumax|stumax|ldumin|stumin|swp|cas|casp)' /tmp/objdump.txt | head -3 >> "$DIAG/02_lse_check.txt"
             else
-              echo "OK: $(basename "$lib") enthaelt keine LSE-Instruktionen" >> "$DIAG/02_lse_check.txt"
+              echo "OK: $(basename "$lib") enthaelt keine echten LSE-Instruktionen" >> "$DIAG/02_lse_check.txt"
             fi
           done
 
           cat "$DIAG/02_lse_check.txt"
 
-      - name: "System-glibc pruefen"
+      - name: "Andere ARMv8.1+/8.5-Features pruefen"
         run: |
           set +e
           set +o pipefail
           {
-            echo "=== System-glibc ==="
-            for lib in /lib/aarch64-linux-gnu/libc.so.6 \
-                       /lib/aarch64-linux-gnu/libpthread.so.0 \
-                       /lib/aarch64-linux-gnu/libm.so.6; do
-              if [ -f "$lib" ]; then
-                count=$(aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null | \
-                  grep -iE 'ldadd|stadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|\bswp\b|\bcas\b' | \
-                  wc -l)
-                echo "$(basename "$lib"): ${count:-0} LSE-Instruktionen"
-              fi
+            echo "=== Weitere ARMv8.1+/8.5-Features ==="
+            echo "Diese koennen auf Cortex-A35 ebenfalls SIGILL verursachen."
+            echo ""
+            for lib in "$SYSROOT_LIB"/*.so*; do
+              [ -f "$lib" ] || continue
+              aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null > /tmp/objdump.txt
+              python3 - "$lib" <<'PYEOF'
+import re, sys
+lib = sys.argv[1]
+features = {
+    'ARMv8.2-FP16': {'fmla', 'fmlal', 'fmls', 'fmlsl', 'fcvt', 'scvtf', 'ucvtf'},
+    'ARMv8.2-DotProd': {'sdot', 'udot'},
+    'ARMv8.3-RCPC': {'ldapr', 'ldaprb', 'ldaprh', 'stlur', 'stlurb', 'stlurh'},
+    'ARMv8.5-BTI': {'bti'},
+    'ARMv8.5-MTE': {'irg', 'gmi', 'stg', 'ldg', 'stzg', 'st2g'},
+}
+counts = {k: 0 for k in features}
+with open('/tmp/objdump.txt') as f:
+    for line in f:
+        m = re.match(r'\s*[0-9a-f]+:\s+[0-9a-f ]+\t([a-z][a-z0-9]*)', line)
+        if not m:
+            continue
+        mnemonic = m.group(1)
+        for feature, mnemonics in features.items():
+            if mnemonic in mnemonics or mnemonic.startswith(tuple(mnemonics)):
+                counts[feature] += 1
+import os
+name = os.path.basename(lib)
+warnings = [f"{k}={v}" for k, v in counts.items() if v > 0]
+if warnings:
+    print(f"WARNUNG: {name}: {', '.join(warnings)}")
+else:
+    print(f"OK: {name}")
+PYEOF
             done
-            echo ""
-            echo "=== Architecture der System-glibc ==="
-            file /lib/aarch64-linux-gnu/libc.so.6 2>&1
-          } > "$DIAG/03_glibc_lse.txt"
-          cat "$DIAG/03_glibc_lse.txt"
+          } > "$DIAG/03_other_features.txt"
+          cat "$DIAG/03_other_features.txt"
 
-      - name: "Build-Log Flags pruefen"
+      - name: "Crash-Adresse symbolisieren (falls bekannt)"
         run: |
           set +e
           set +o pipefail
           {
-            echo "=== Suche nach -mno-outline-atomics im Build-Log ==="
-            if [ -f "build.log" ]; then
-              grep -c "mno-outline-atomics" build.log
-            else
-              echo "build.log nicht gefunden"
-            fi
+            echo "=== Crash-Symbolisierung ==="
+            echo "Bekannte Crash-PCs aus frueheren Laeufen:"
+            echo "  0x7fae2a33d0 (erster Lauf)"
+            echo "  0x7f805953d0 (zweiter Lauf)"
             echo ""
-            echo "=== Suche nach -moutline-atomics ==="
-            if [ -f "build.log" ]; then
-              grep -c "moutline-atomics" build.log
-            fi
-            echo ""
-            echo "=== Erste clang-Zeile mit Flags ==="
-            if [ -f "build.log" ]; then
-              grep -m1 "clang-22.*guest_object" build.log | head -1
-            fi
-          } > "$DIAG/04_build_flags.txt"
-          cat "$DIAG/04_build_flags.txt"
+            echo "Um diese zu symbolisieren, muss die geladene Bibliothek"
+            echo "zur Verfuegung stehen. Auf dem Geraet koennen die Bibliotheken"
+            echo "mit 'cat /proc/PID/maps' identifiziert werden."
+          } > "$DIAG/04_crash_symbolize.txt"
+          cat "$DIAG/04_crash_symbolize.txt"
 
       - name: "Diagnose-Artefakte hochladen"
         if: always()
