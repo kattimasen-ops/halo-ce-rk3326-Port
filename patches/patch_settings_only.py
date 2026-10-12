@@ -133,22 +133,25 @@ def patch_android_build_includes(root_dir: str) -> None:
             create_backup(build_py_path)
             content = read_file_content(build_py_path)
 
-            if "port/third_party/expat" not in content:
-                old_str = '"port/third_party/tomlc17"'
-                new_str = (
-                    '"port/third_party/tomlc17",\n'
-                    '    "port/third_party/expat/lib",\n'
-                    '    "port/third_party/expat",\n'
-                    '    "port/third_party/zlib"'
-                )
+            # Nur die Zeile mit dem Include-Pfad ändern, nicht die Pfadkonstruktion
+            old_str = 'f"-I{TOML_DIR}",'
+            new_str = (
+                'f"-I{TOML_DIR}",\n'
+                '    f"-I{EXPAT_DIR}/lib",\n'
+                '    f"-I{EXPAT_DIR}",\n'
+                '    f"-I{ZLIB_DIR}",'
+            )
 
+            if 'f"-I{EXPAT_DIR}/lib"' not in content:
                 if old_str in content:
-                    content = content.replace(old_str, new_str)
+                    content = content.replace(old_str, new_str, 1)
                     write_file_content(build_py_path, content)
                     print(f"[OK] {os.path.basename(build_py_path)} erfolgreich mit Expat/Zlib Pfaden erweitert.")
                     patched = True
                 else:
                     print(f"[WARN] Anker {old_str} in {build_py_path} nicht gefunden.")
+            else:
+                print(f"[INFO] {os.path.basename(build_py_path)} enthält bereits Expat/Zlib Pfade.")
 
     if not patched:
         print("[WARN] Keine android_build.py Datei zur Anpassung gefunden.")
