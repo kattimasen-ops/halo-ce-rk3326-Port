@@ -5,13 +5,18 @@ Stubs fuer Host-Funktionen, die im Guest-Build (HALO_ARM64_GUEST)
 nicht verfuegbar sind. Sie werden in die Bibliothek aufgenommen und
 verhindern Linker-Fehler.
 
+Fix v6: cseries.h wird NICHT mehr eingebunden. Die Deklaration
+`long strnlen(const char *, long)` in cseries.h kollidiert mit der
+musl-Deklaration `size_t strnlen(const char *, size_t)`, die im
+Guest-Build ueber <string.h> sichtbar ist. Da diese Datei strnlen
+nicht verwendet, wird cseries.h nicht benoetigt.
+
 Diese Datei wird von build.sh nach port/linux/src/ kopiert und dort
 automatisch kompiliert.
 */
 
 #ifdef HALO_ARM64_GUEST
 
-#include "cseries.h"
 #include <stddef.h>
 
 /* config_folder: im Host-Build liefert diese Funktion den Pfad zum
