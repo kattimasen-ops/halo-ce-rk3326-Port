@@ -4,11 +4,15 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════
 # Halo CE Universal — M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
-# Fix v4:
-#  - Expat/Zlib-Includes via CPATH (nicht mehr via Build-Datei-Patch)
-#  - menu_files.c bekommt Forward-Deklarationen fuer zwei Host-Funktionen
-#    (config_folder, xgpu_gl_texture_deleted), deren Header im Guest-
-#    Build nicht eingebunden wird.
+# Fix v5 (Hybrid):
+#  - Expat und Zlib in android_build.py aufgenommen (fuer menu_files.c
+#    und hud_hires.c, die aus OpenCE stammen).
+#  - HALO_ARM64_GUEST=1 in den Guest-Flags definiert.
+#  - Fehlende C-Funktionen in den Upstream eingefuegt:
+#    cache_files_tag_instances, cache_files_set_tag_instances,
+#    ui_widget_event_handler_function_name, xgpu_gl_texture_deleted.
+#  - guest_host_stubs.c fuer config_folder und SDL_LoadFile.
+#  - Expat/Zlib-Includes ueber CPATH (nicht mehr via Build-Datei-Patch).
 # ══════════════════════════════════════════════════════════════════════
 PGO_MODE=${PGO_MODE:-use}
 
@@ -405,15 +409,13 @@ if not os.path.exists(path):
     sys.exit(0)
 with open(path) as f:
     text = f.read()
-
 if "extern void config_folder" in text and "extern void xgpu_gl_texture_deleted" in text:
     print("   + menu_files.c: Forward-Deklarationen bereits vorhanden.")
     sys.exit(0)
-
 decl = (
-    "/* Fix v4: Forward-Deklarationen fuer Host-Funktionen, die menu_files.c\n"
+    "/* Fix v5: Forward-Deklarationen fuer Host-Funktionen, die menu_files.c\n"
     "   aufruft, deren Header im Guest-Build aber nicht eingebunden wird. */\n"
-    "#ifdef HALO_ANDROID\n"
+    "#ifdef HALO_ARM64_GUEST\n"
     "#ifndef MENU_FILES_HOST_FUNCS_DECLARED\n"
     "#define MENU_FILES_HOST_FUNCS_DECLARED\n"
     "extern void config_folder(char *folder, unsigned int size);\n"
@@ -433,6 +435,31 @@ PYEOF
         python3 "$HERE/patches/patch_settings_only.py" "$SRC" "$HERE/patches"
     else
         die "patches/patch_settings_only.py fehlt."
+    fi
+
+    echo ""
+    echo "== Patch android_build.py (Expat/Zlib/HALO_ARM64_GUEST) ..."
+    if [ -f "$HERE/patches/patch_android_build_hybrid.py" ]; then
+        python3 "$HERE/patches/patch_android_build_hybrid.py" "$SRC"
+    else
+        die "patches/patch_android_build_hybrid.py fehlt."
+    fi
+
+    echo ""
+    echo "== Fuege fehlende C-Funktionen hinzu ..."
+    if [ -f "$HERE/patches/patch_missing_functions.py" ]; then
+        python3 "$HERE/patches/patch_missing_functions.py" "$SRC"
+    else
+        die "patches/patch_missing_functions.py fehlt."
+    fi
+
+    echo ""
+    echo "== Kopiere guest_host_stubs.c nach port/linux/src/ ..."
+    if [ -f "$HERE/patches/guest_host_stubs.c" ]; then
+        cp "$HERE/patches/guest_host_stubs.c" "$SRC/port/linux/src/guest_host_stubs.c"
+        echo "   + guest_host_stubs.c"
+    else
+        die "patches/guest_host_stubs.c fehlt."
     fi
 fi
 
@@ -567,7 +594,7 @@ print("xbox_kernel.c geprueft")
 PYEOF
 
 # ══════════════════════════════════════════════════════════════════════
-# Fix 2: android_build.py — Compiler-Flags, KEINE Include-Pfade
+# Fix 2: android_build.py — Compiler-Flags (KEINE Include-Pfade hier)
 # ══════════════════════════════════════════════════════════════════════
 python3 - "$SRC/tools/android_build.py" <<'PYEOF'
 import sys
@@ -875,20 +902,28 @@ check_patch "port/linux/src/d3d8_gl.c"          "mali_subdata_guard"            
 check_patch "port/linux/src/d3d8_gl.c"          "shader_prewarm_guard"          "d3d8_gl.c Shader-Prewarm"
 check_patch "port/linux/src/d3d8_gl.c"          "state_batching_guard"          "d3d8_gl.c State-Batching"
 check_patch "port/linux/src/d3d8_gl.c"          "shader_prewarm_fwd_decl"       "d3d8_gl.c Fwd-Decl"
+check_patch "port/linux/src/d3d8_gl.c"          "xgpu_gl_texture_deleted"       "d3d8_gl.c xgpu_gl_texture_deleted"
+check_patch "port/linux/src/xgpu.h"             "xgpu_gl_texture_deleted"       "xgpu.h xgpu_gl_texture_deleted decl"
 check_patch "port/linux/src/xbox_textures.c"    "texture_prewarm_guard"         "xbox_textures.c Prewarm"
 check_patch "tools/android_build.py"            '"-DHALO_ANDROID"'              "android_build.py HALO_ANDROID"
+check_patch "tools/android_build.py"            '"-DHALO_ARM64_GUEST=1"'        "android_build.py HALO_ARM64_GUEST"
+check_patch "tools/android_build.py"            'EXPAT_DIR = Path'              "android_build.py EXPAT_DIR"
+check_patch "tools/android_build.py"            'ZLIB_DIR = Path'               "android_build.py ZLIB_DIR"
 check_patch "source/main/main.c"                "St0len-One"                    "main.c Credits"
 check_file  "port/linux/include/halo_menus.h"                                   "halo_menus.h"
 check_file  "port/linux/src/menu_files.c"                                       "menu_files.c"
 check_file  "port/linux/game/menu_tags.c"                                       "menu_tags.c"
 check_file  "port/linux/game/menu_functions.c"                                  "menu_functions.c"
 check_file  "port/linux/game/port_settings_shim.c"                              "port_settings_shim.c"
+check_file  "port/linux/src/guest_host_stubs.c"                                 "guest_host_stubs.c"
 check_file  "port/third_party/expat/expat.h"                                    "expat.h"
 check_file  "port/third_party/zlib/zlib_prefixed.h"                             "zlib_prefixed.h (OpenCE)"
 check_file  "port/linux/src/hud_hires.c"                                        "hud_hires.c (OpenCE)"
 check_file  "port/linux/src/hud_hires.h"                                        "hud_hires.h (OpenCE)"
 check_patch "source/interface/ui_widget.c"      "pc_menu_tag"                   "ui_widget.c pc_menu_tag extern"
 check_patch "source/interface/ui_widget_event_handler_functions.c" "PC_MENU_FUNCTION_BASE" "ui_widget_event_handler_functions.c Dispatcher"
+check_patch "source/interface/ui_widget_event_handler_functions.c" "ui_widget_event_handler_function_name" "ui_widget_event_handler_functions.c function_name"
+check_patch "source/cache/cache_files.c"        "cache_files_tag_instances"     "cache_files.c cache_files_tag_instances"
 check_patch "source/cache/cache_files.c"        "menu_tags_loaded"              "cache_files.c Menue-Hooks"
 check_patch "port/linux/src/menu_files.c"       "MENU_FILES_HOST_FUNCS_DECLARED" "menu_files.c Forward-Deklarationen"
 
@@ -943,7 +978,7 @@ CEOF
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-# CPATH: Expat- und Zlib-Include-Pfade
+# CPATH
 # ══════════════════════════════════════════════════════════════════════
 CPATH_GUEST="$SRC/port/third_party/expat/lib:$SRC/port/third_party/expat:$SRC/port/third_party/zlib"
 export CPATH="$CPATH_GUEST${CPATH:+:$CPATH}"
@@ -963,13 +998,15 @@ stamp=$({
              patch_settings_menu.py patch_config_defaults.py \
              patch_credits.py patch_credits_xml.py \
              patch_forward_declarations.py patch_settings_only.py \
+             patch_android_build_hybrid.py patch_missing_functions.py \
              patch_config_changes.py patch_terminal_buffer.py \
-             settings_only_menu_functions.c port_settings_shim.c; do
+             settings_only_menu_functions.c port_settings_shim.c \
+             guest_host_stubs.c; do
         cat "$HERE/patches/$p" 2>/dev/null || true
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v4-cpath-menu-fwd"
+    echo "gcc9-host-dynamic=v5-hybrid-expat-zlib"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
@@ -1045,7 +1082,7 @@ else
     cat <<'RELEASE'
 
 ────────────────────────────────────────────────────────────────────────
-RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host)
+RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, Hybrid v5)
 ────────────────────────────────────────────────────────────────────────
 Installation auf M9 Pro (wenn halo_guest.elf existiert):
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
