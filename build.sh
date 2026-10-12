@@ -9,18 +9,16 @@ set -euo pipefail
 # sie enthalten, nicht auf — dadurch tritt der SIGILL auf ARMv8.0 nicht
 # auf. (Clang 22 ruft diese Pfade auf und loeste den SIGILL aus.)
 #
-# Ausgangslage: DYNAMISCHER Host, DYNAMISCHE SDL2 (aus libs.aarch64).
-# libmali wird NICHT gelinkt (sysroot-Datei ist beschaedigt); die
-# EGL/GLES-Symbole bleiben undefiniert und werden zur Laufzeit aus
-# /tmp/halo-mali geladen.
-#
-# NEU (Fix): menu_functions.c und port_settings_shim.c werden NACH dem
-# Knulli-Patch kopiert, damit der Patch die reduzierten Settings-
-# Funktionen nicht ueberschreibt. patch_settings_only.py bekommt
-# zusaetzlich das patches/-Verzeichnis als zweites Argument, damit
-# port_settings_shim.c korrekt kopiert werden kann. Der android_build.py-
-# Patch ersetzt nur das ERSTE Vorkommen von "port/third_party/tomlc17"
-# (die Include-Liste), nicht die os.path.join()-Argumente.
+# NEU (Fix v3): Expat/Zlib-Include-Pfade werden NICHT mehr in
+# tools/android_build.py bzw. tools/linux_build.py injiziert. Das hat
+# den Ninja-Build gebrochen, weil "port/third_party/tomlc17" im
+# Upstream AUCH zur Konstruktion des tomlc17.c-Quellpfades dient
+# (Path(*GUEST_DIRS) / "tomlc17.c"). Sobald die Liste mehr als einen
+# Eintrag hat, entsteht ein verketteter Pfad wie
+#   port/third_party/tomlc17/port/third_party/expat/lib/.../tomlc17.c
+# Stattdessen wird die Umgebungsvariable CPATH gesetzt: sowohl clang
+# als auch gcc suchen Header in den dort eingetragenen Verzeichnissen,
+# ohne dass die Build-Dateien angefasst werden müssen.
 # ══════════════════════════════════════════════════════════════════════
 PGO_MODE=${PGO_MODE:-use}
 
@@ -548,7 +546,7 @@ print("xbox_kernel.c geprueft")
 PYEOF
 
 # ══════════════════════════════════════════════════════════════════════
-# Fix 2: android_build.py
+# Fix 2: android_build.py — nur Compiler-Flags, KEINE Include-Pfade
 # ══════════════════════════════════════════════════════════════════════
 python3 - "$SRC/tools/android_build.py" <<'PYEOF'
 import sys
@@ -701,7 +699,7 @@ PYEOF
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-# Fix 3: linux_build.py
+# Fix 3: linux_build.py — nur Compiler-Flags, KEINE Include-Pfade
 # ══════════════════════════════════════════════════════════════════════
 python3 - "$SRC/tools/linux_build.py" <<'PYEOF'
 import sys
@@ -739,7 +737,7 @@ rm -rf "$SRC/port/knulli/__pycache__"
 chmod +x "$SRC/port/knulli/build.sh" 2>/dev/null || true
 
 # ══════════════════════════════════════════════════════════════════════
-# Restliche Python-Patches (inkl. patch_terminal_buffer.py)
+# Restliche Python-Patches
 # ══════════════════════════════════════════════════════════════════════
 echo ""
 echo "== Wende restliche Patch-Skripte an ..."
@@ -842,7 +840,6 @@ check_patch "source/sound/game_sound.c"         "obstruction_interval_value"    
 check_patch "source/render/render_objects.c"    "HALO_MIN_OBJECT_PIXELS"        "render_objects.c Distant"
 check_patch "source/render/render_objects.c"    "HALO_LIGHTING_REFRESH_DIVISOR" "render_objects.c Lighting"
 check_patch "source/render/render_objects.c"    "aggressive_culling_guard"      "render_objects.c Culling"
-check_patch "source/interface/terminal.c"       "terminal_buffer_patch"         "terminal.c Buffer-Patch"
 check_patch "port/linux/src/port_config.c"      "HALO_SOUND_OBSTRUCTION_TICKS"  "port_config.c Sound"
 check_patch "port/linux/src/port_config.c"      "HALO_MIN_OBJECT_PIXELS"        "port_config.c Distant"
 check_patch "port/linux/src/port_config.c"      "HALO_LIGHTING_REFRESH_DIVISOR" "port_config.c Lighting"
@@ -871,14 +868,7 @@ check_file  "port/linux/src/hud_hires.c"                                        
 check_file  "port/linux/src/hud_hires.h"                                        "hud_hires.h (OpenCE)"
 check_patch "source/interface/ui_widget.c"      "pc_menu_tag"                   "ui_widget.c pc_menu_tag extern"
 check_patch "source/interface/ui_widget_event_handler_functions.c" "PC_MENU_FUNCTION_BASE" "ui_widget_event_handler_functions.c Dispatcher"
-check_patch "source/interface/ui_widget_event_handler_functions.c" "ui_widget_event_handler_function_name" "ui_widget_event_handler_functions.c Name-Lookup"
-check_patch "source/cache/cache_files.c"        "cache_files_tag_instances"     "cache_files.c Accessors"
 check_patch "source/cache/cache_files.c"        "menu_tags_loaded"              "cache_files.c Menue-Hooks"
-check_patch "port/linux/src/menu_files.c"       "settings_only: externals"      "menu_files.c externals"
-check_patch "tools/linux_build.py"              "EXPAT_DIR"                     "linux_build.py Expat"
-check_patch "tools/linux_build.py"              "ZLIB_DIR"                      "linux_build.py zlib"
-check_patch "tools/android_build.py"            "EXPAT_DIR"                     "android_build.py Expat"
-check_patch "tools/android_build.py"            "ZLIB_DIR"                      "android_build.py zlib"
 
 if grep -q "settings_only: game data dispatcher" \
     "$SRC/source/interface/ui_widget_game_data_input_functions.c" 2>/dev/null; then
@@ -931,6 +921,17 @@ CEOF
 fi
 
 # ══════════════════════════════════════════════════════════════════════
+# CPATH: Expat- und Zlib-Include-Pfade für den Gast- und Host-Build.
+# Statt die Build-Dateien zu patchen (was den tomlc17-Quellpfad gebrochen
+# hat) werden die Include-Verzeichnisse über die Umgebungsvariable CPATH
+# bekanntgegeben. Clang und GCC suchen dort nach Headern, ohne dass
+# tools/android_build.py oder tools/linux_build.py angefasst werden.
+# ══════════════════════════════════════════════════════════════════════
+CPATH_GUEST="$SRC/port/third_party/expat/lib:$SRC/port/third_party/expat:$SRC/port/third_party/zlib"
+export CPATH="$CPATH_GUEST${CPATH:+:$CPATH}"
+echo "== CPATH=$CPATH"
+
+# ══════════════════════════════════════════════════════════════════════
 # Stamp
 # ══════════════════════════════════════════════════════════════════════
 stamp=$({
@@ -950,7 +951,7 @@ stamp=$({
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v2"
+    echo "gcc9-host-dynamic=v3-cpath"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
