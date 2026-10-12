@@ -154,13 +154,6 @@ jobs:
       - name: "rej/-Ordner vorbereiten"
         run: mkdir -p rej
 
-      - name: "Settings & Includes Patchen (patch_settings_only.py)"
-        run: |
-          set -e
-          if [ -f "patch_settings_only.py" ]; then
-            python3 patch_settings_only.py
-          fi
-
       - name: "Build ausfuehren (build.sh)"
         id: build
         run: |
