@@ -3,8 +3,21 @@
 
 """
 patch_settings_only.py
-Automatisches Skript zur sauberen Injektion des PC-Einstellungsmenüs
-und Behebung fehlender Expat/zlib-Include-Pfade.
+Automatisches Skript zur sauberen Injektion des PC-Einstellungsmenüs.
+
+NICHT MEHR dabei: die Expat/Zlib-Include-Pfad-Injektion in
+tools/android_build.py bzw. tools/linux_build.py. Diese hat den
+Ninja-Build gebrochen, weil die Zeichenkette "port/third_party/tomlc17"
+im Upstream AUCH zur Konstruktion des Quellpfades verwendet wird
+(Path(*GUEST_DIRS) / "tomlc17.c"). Sobald die Liste mehr als einen
+Eintrag hat, entsteht ein verketteter Pfad wie
+  port/third_party/tomlc17/port/third_party/expat/lib/.../tomlc17.c
+und ninja findet die Datei nicht.
+
+Die Include-Pfade werden jetzt stattdessen über die Umgebungsvariable
+CPATH in build.sh gesetzt. Sowohl clang als auch gcc suchen Header in
+den dort eingetragenen Verzeichnissen, ohne dass die Build-Dateien
+angefasst werden müssen.
 """
 
 import os
@@ -138,86 +151,6 @@ def patch_game_data_dispatcher(base_dir: str) -> None:
             print("[OK] ui_widget_game_data_input_functions.c gepatcht.")
 
 
-def patch_android_build_includes(root_dir: str) -> None:
-    """Ersetzt NUR das erste Vorkommen von "port/third_party/tomlc17" in
-    android_build.py. Das erste Vorkommen ist die Include-Liste; weitere
-    Vorkommen sind Argumente von os.path.join() und dürfen NICHT ersetzt
-    werden, sonst entsteht ein verketteter Pfad (siehe Build-Fehler
-    'port/third_party/tomlc17/port/third_party/expat/lib/.../tomlc17.c')."""
-    candidates = [
-        os.path.join(root_dir, "android_build.py"),
-        os.path.join(root_dir, "tools", "android_build.py"),
-    ]
-
-    patched = False
-    for build_py_path in candidates:
-        if os.path.exists(build_py_path):
-            create_backup(build_py_path)
-            content = read_file_content(build_py_path)
-
-            if "port/third_party/expat/lib" in content:
-                print(f"[INFO] {os.path.basename(build_py_path)} hat die "
-                      f"Expat/Zlib-Pfade bereits.")
-                patched = True
-                continue
-
-            old_str = '"port/third_party/tomlc17"'
-            if old_str not in content:
-                print(f"[WARN] Anker {old_str} in {build_py_path} nicht "
-                      f"gefunden.")
-                continue
-
-            new_str = (
-                '"port/third_party/tomlc17",\n'
-                '    "port/third_party/expat/lib",\n'
-                '    "port/third_party/expat",\n'
-                '    "port/third_party/zlib"'
-            )
-
-            # count=1: NUR das erste Vorkommen (die Include-Liste).
-            # Alle weiteren Vorkommen sind os.path.join()-Argumente.
-            content = content.replace(old_str, new_str, 1)
-            write_file_content(build_py_path, content)
-            print(f"[OK] {os.path.basename(build_py_path)} mit Expat/Zlib-"
-                  f"Pfaden erweitert (nur erstes Vorkommen).")
-            patched = True
-
-    if not patched:
-        print("[WARN] Keine android_build.py Datei zur Anpassung gefunden.")
-
-
-def patch_linux_build_includes(root_dir: str) -> None:
-    """Fügt Expat/Zlib-Include-Pfade auch für den Linux-Build hinzu."""
-    candidates = [
-        os.path.join(root_dir, "linux_build.py"),
-        os.path.join(root_dir, "tools", "linux_build.py"),
-    ]
-    for build_py_path in candidates:
-        if not os.path.exists(build_py_path):
-            continue
-        create_backup(build_py_path)
-        content = read_file_content(build_py_path)
-        if "port/third_party/expat/lib" in content:
-            print(f"[INFO] {os.path.basename(build_py_path)} hat die "
-                  f"Expat/Zlib-Pfade bereits.")
-            continue
-        # In linux_build.py heißt die Quelle typischerweise anders;
-        # wir hängen die Pfade an eine existierende Include-Liste an,
-        # die den String "tomlc17" enthält.
-        if '"port/third_party/tomlc17"' in content:
-            content = content.replace(
-                '"port/third_party/tomlc17"',
-                '"port/third_party/tomlc17",\n'
-                '    "port/third_party/expat/lib",\n'
-                '    "port/third_party/expat",\n'
-                '    "port/third_party/zlib"',
-                1,
-            )
-            write_file_content(build_py_path, content)
-            print(f"[OK] {os.path.basename(build_py_path)} mit Expat/Zlib-"
-                  f"Pfaden erweitert.")
-
-
 def patch_cache_files(base_dir: str) -> None:
     file_path = os.path.join(base_dir, "source", "cache", "cache_files.c")
     if not os.path.exists(file_path):
@@ -290,8 +223,6 @@ def main():
     patch_ui_widget(root_dir)
     patch_event_dispatcher(root_dir)
     patch_game_data_dispatcher(root_dir)
-    patch_android_build_includes(root_dir)
-    patch_linux_build_includes(root_dir)
     patch_cache_files(root_dir)
     patch_buildsystem_and_shim(root_dir, patches_dir)
 
