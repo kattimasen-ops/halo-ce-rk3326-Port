@@ -4,21 +4,13 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════
 # Halo CE Universal — M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
-# Fix v11 (FINAL):
-#  - patch_gl_init_order.py wird NICHT mehr aufgerufen. Der SIGILL lag
-#    nicht in der GL-Init, sondern im Dispatcher-Bereich in
-#    patch_settings_only.py (leerer Bereich: >= 0x8000 UND < 0x8000).
-#  - Debug-Logging (patch_debug_gl.py) wird NICHT mehr aufgerufen.
+# Fix v12 (DIAGNOSE):
+#  - patch_gl_init_order.py v7 wird VOR dem Build aufgerufen und fuegt
+#    Log-Zeilen in host_glthread.c ein. Damit sehen wir, ob der SIGILL
+#    auf dem Hauptthread oder dem GL-Thread sitzt.
 #
-# Fix v7:
-#  - -mno-outline-atomics aus den SDL2/SDL3-CMake-Aufrufen entfernt.
-#    GCC 9 kennt diese Flag nicht (sie ist Clang-spezifisch).
-#    Der LSE-Befund in SDL2 war ein Fehlalarm: das Diagnose-Grep hat
-#    "stadd" innerhalb von "SDL_ListAdd" gefunden.
-#  - CMAKE_CXX_COMPILER auf den Cross-C++-Compiler gesetzt, damit
-#    CMake den C++-Testlauf nicht auf dem x86_64-Host durchfuehrt.
-#  - SDL2-Cache-Pruefung nutzt jetzt $SYSROOT_LIB/libSDL2-2.0.so.0,
-#    so wie SDL3, damit SDL2 nicht bei jedem Lauf neu gebaut wird.
+# Fix v11: Dispatcher-Bereich in patch_settings_only.py korrigiert.
+# Fix v7:  -mno-outline-atomics entfernt, CMAKE_CXX_COMPILER gesetzt.
 # ══════════════════════════════════════════════════════════════════════
 PGO_MODE=${PGO_MODE:-use}
 
@@ -73,7 +65,6 @@ esac
 
 echo "== Upstream: $UPSTREAM_URL @ $UPSTREAM_COMMIT"
 echo "== PGO-Modus: $PGO_MODE"
-echo "== glibc-Version des Build-Containers:"
 ( ldd --version 2>/dev/null || true ) | head -1 || true
 echo "== Host-Compiler: $HOST_CC"
 "$HOST_CC" --version 2>&1 | head -2 || true
@@ -100,7 +91,6 @@ fetch_opence_files() {
     if git clone --depth 1 "$OPEN_CE_URL" "$opence_dir" > /dev/null 2>&1; then
         echo "   + Git-Clone erfolgreich."
     else
-        echo "   Git-Clone fehlgeschlagen, versuche Tarball ..."
         rm -f "$opence_tarball"
         if ! curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 30 \
             -o "$opence_tarball" \
@@ -204,7 +194,7 @@ print("  XML-Hunk entfernt; Patch ist jetzt %d Bytes kleiner." % (len(text) - le
 PYEOF
 
 # ══════════════════════════════════════════════════════════════════════
-# SDL3 (nur bauen, wenn .so fehlt) — mit GCC, shared
+# SDL3 (nur bauen, wenn .so fehlt)
 # ══════════════════════════════════════════════════════════════════════
 if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
     echo "== SDL3 $SDL3_TAG: kompiliere aus dem Quellcode (GCC, shared)"
@@ -244,7 +234,7 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-# SDL2 — mit GCC, shared, Cache-Pruefung konsistent zu SDL3
+# SDL2
 # ══════════════════════════════════════════════════════════════════════
 SDL2_SRC=$WORK/SDL2-src
 SDL2_BUILD=$WORK/sdl2-build
@@ -272,8 +262,6 @@ old = '''    ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_
     }'''
 new = '''    ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_id,
                                   fb_info->fb_id, flip_flags, &windata->waiting_for_flip);
-    /* Mali-G31 (RK3326) meldet DRM_CAP_ASYNC_PAGE_FLIP, lehnt den Aufruf
-       aber mit -EINVAL ab. SDL2 hat keinen Fallback. */
     if (ret != 0 && (flip_flags & DRM_MODE_PAGE_FLIP_ASYNC)) {
         viddata->async_pageflip_support = SDL_FALSE;
         flip_flags &= ~DRM_MODE_PAGE_FLIP_ASYNC;
@@ -336,7 +324,6 @@ else
     echo "== libSDL2-2.0.so.0 bereits in sysroot"
 fi
 
-# SDL2-Include-Verzeichnis fuer den spaeteren Host-Build
 if [ ! -d "$SDL2_INSTALL/include/SDL2" ]; then
     echo "== SDL2-Header fehlen, SDL2 neu bauen ..."
     rm -rf "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
@@ -810,10 +797,18 @@ rm -rf "$SRC/port/knulli/__pycache__"
 chmod +x "$SRC/port/knulli/build.sh" 2>/dev/null || true
 
 # ══════════════════════════════════════════════════════════════════════
-# HINWEIS: patch_gl_init_order.py wird NICHT mehr aufgerufen.
-# Der SIGILL lag nicht in der GL-Init, sondern im Dispatcher-Bereich
-# in patch_settings_only.py. Die alten Blöcke wurden entfernt.
+# DIAGNOSE (v7): Logging in host_glthread.c einfuegen
 # ══════════════════════════════════════════════════════════════════════
+# Diesen Block nach dem Test wieder entfernen.
+if [ -f "$HERE/patches/patch_gl_init_order.py" ]; then
+    echo ""
+    echo "== DIAGNOSE: Logging in host_glthread.c einfuegen ..."
+    python3 "$HERE/patches/patch_gl_init_order.py" "$SRC" || \
+        echo "WARNUNG: patch_gl_init_order.py fehlgeschlagen."
+else
+    echo ""
+    echo "WARNUNG: patches/patch_gl_init_order.py fehlt - Diagnose uebersprungen!"
+fi
 
 # ══════════════════════════════════════════════════════════════════════
 # Restliche Python-Patches
@@ -959,6 +954,11 @@ check_patch "source/cache/cache_files.c"        "cache_files_tag_instances"     
 check_patch "source/cache/cache_files.c"        "menu_tags_loaded"              "cache_files.c Menue-Hooks"
 check_patch "port/linux/src/menu_files.c"       "MENU_FILES_HOST_FUNCS_DECLARED" "menu_files.c Forward-Deklarationen"
 
+# Diagnose-Verifikation: prueft, dass die DIAG-Logs im host_glthread.c sitzen
+if [ -f "$HERE/patches/patch_gl_init_order.py" ]; then
+    check_patch "port/knulli/host/host_glthread.c" "DIAG: sync-create ENTER" "host_glthread.c DIAG-Logs eingefuegt"
+fi
+
 if grep -q "settings_only: game data dispatcher" \
     "$SRC/source/interface/ui_widget_game_data_input_functions.c" 2>/dev/null; then
     echo "   OK: ui_widget_game_data_input_functions.c Dispatcher"
@@ -971,43 +971,9 @@ if [ -f "$SRC/tools/port_settings.py" ]; then
 fi
 if [ "$verification_failed" -ne 0 ]; then
     echo ""
-    echo "== Verifikation meldete Fehler, fahre trotzdem fort (Debug-Modus)."
+    echo "== Verifikation meldete Fehler, fahre trotzdem fort."
 fi
 echo "== Verifikation abgeschlossen."
-
-# ══════════════════════════════════════════════════════════════════════
-# Fix 5: PGO-Shim (nur train)
-# ══════════════════════════════════════════════════════════════════════
-if [ "$PGO_MODE" = "train" ]; then
-    SHIM="$SRC/port/android/guest/runtime/guest_pgo_shim.c"
-    cat > "$SHIM" <<'CEOF'
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-static int pgo_errno_value;
-int *__errno(void) { return &pgo_errno_value; }
-char __sF[3 * 256];
-int prctl(int o, unsigned long a, unsigned long b, unsigned long c, unsigned long d)
-{ (void)o;(void)a;(void)b;(void)c;(void)d; return 0; }
-int getpagesize(void) { return 4096; }
-extern int __llvm_profile_write_file(void);
-static void pgo_write_and_die(int sig)
-{ __llvm_profile_write_file(); signal(sig, SIG_DFL); raise(sig); }
-__attribute__((constructor)) static void pgo_install_handlers(void)
-{
-    struct sigaction sa;
-    sa.sa_handler = pgo_write_and_die;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGHUP,  &sa, NULL);
-    atexit((void (*)(void))__llvm_profile_write_file);
-}
-CEOF
-    echo "== Fix 5: guest_pgo_shim.c erzeugt"
-fi
 
 # ══════════════════════════════════════════════════════════════════════
 # CPATH
@@ -1032,13 +998,14 @@ stamp=$({
              patch_forward_declarations.py patch_settings_only.py \
              patch_android_build_hybrid.py patch_missing_functions.py \
              patch_config_changes.py patch_terminal_buffer.py \
+             patch_gl_init_order.py \
              settings_only_menu_functions.c port_settings_shim.c \
              guest_host_stubs.c; do
         cat "$HERE/patches/$p" 2>/dev/null || true
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v11-final-dispatch-fix"
+    echo "gcc9-host-dynamic=v12-diag"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
@@ -1053,7 +1020,7 @@ echo "== Konfiguriere mit $LTO_FLAG $PGO_FLAG $PGO_EXTRA_ARGS ..."
 python3 configure.py --release "$LTO_FLAG" "$PGO_FLAG" $PGO_EXTRA_ARGS \
     --android-ndk "$ANDROID_NDK" --android-guest-cc "$GUEST_CC"
 
-echo "== Baue Guest-ELF (halo_guest.elf) — mit -k 0 (alle Fehler sammeln) ..."
+echo "== Baue Guest-ELF (halo_guest.elf) ..."
 ninja -j "$JOBS" -k 0 build/android/halo_guest.elf || true
 
 echo "== Baue Host-Binary (halo, dynamisch, GCC 9) ueber port/knulli/build.sh ..."
@@ -1098,31 +1065,28 @@ fi
 if [ -f "$DIST/halo" ]; then
     HOST_SIZE=$(stat -c%s "$DIST/halo")
     echo "== halo: $HOST_SIZE Bytes"
-    if command -v file > /dev/null 2>&1; then
-        file "$DIST/halo" || true
-    fi
+    command -v file > /dev/null 2>&1 && file "$DIST/halo" || true
+    echo "== halo BuildID:"
+    readelf -n "$DIST/halo" 2>/dev/null | grep -A2 "Build ID" | tail -1 || true
 fi
 
-if [ "$PGO_MODE" = "train" ]; then
-    cat <<'TRAINING'
+cat <<'RELEASE'
 
 ────────────────────────────────────────────────────────────────────────
-TRAININGS-BUILD FERTIG (soweit ninja durchkam)
+DIAGNOSE-BUILD v12 — Logging in host_glthread.c
 ────────────────────────────────────────────────────────────────────────
-TRAINING
-else
-    cat <<'RELEASE'
-
-────────────────────────────────────────────────────────────────────────
-RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, v11 Final)
-────────────────────────────────────────────────────────────────────────
-Installation auf M9 Pro (wenn halo_guest.elf existiert):
+Installation auf M9 Pro:
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
 2. dist/halo_guest.elf    nach /roms/ports/halo-ce/halo_guest.elf
 3. dist/halo              nach /roms/ports/halo-ce/halo
 4. dist/libs.aarch64/     nach /roms/ports/halo-ce/libs.aarch64/
 
+WICHTIG: Der neue Build hat eine ANDERE BuildID als der vorherige!
+Vor dem Start pruefen:
+  readelf -n /roms/ports/halo-ce/halo | grep -i build
+Die BuildID muss sich von der vorherigen (760f40be...) unterscheiden.
+Falls nicht: der neue Build wurde nicht deployt.
+
 FERTIG.
 ────────────────────────────────────────────────────────────────────────
 RELEASE
-fi
