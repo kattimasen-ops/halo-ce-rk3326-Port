@@ -2,16 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-patch_android_build_hybrid.py
+patch_android_build_hybrid.py  (v6)
 
 Erweitert tools/android_build.py im Upstream um:
-1. Expat-Definitionen und -Quellen (port/third_party/expat)
-2. Zlib-Definitionen und -Quellen (port/third_party/zlib)
-3. HALO_ARM64_GUEST=1 in den Guest-Flags
-4. Include-Pfade -I{EXPAT_DIR} und -I{ZLIB_DIR}
-
-Diese Aenderungen sind notwendig, weil menu_files.c (aus OpenCE) und
-hud_hires.c diese Bibliotheken und Macros erwarten.
+1. Expat- und Zlib-Definitionen und -Quellen.
+2. HALO_ARM64_GUEST=1 in den Guest-Flags.
+3. Include-Pfade -I{EXPAT_DIR} und -I{ZLIB_DIR}.
+4. -mno-outline-atomics in GUEST_ABI_FLAGS, damit Clang 22 auf dem
+   Cortex-A35 (ARMv8.0) keine LSE-Atomics generiert (SIGILL-Fix).
 """
 
 import os
@@ -54,20 +52,24 @@ def patch_android_build(path):
     else:
         print("[INFO] EXPAT_DIR bereits vorhanden.")
 
-    # 2. HALO_ARM64_GUEST in GUEST_ABI_FLAGS
-    if "-DHALO_ARM64_GUEST=1" not in text:
+    # 2. HALO_ARM64_GUEST und -mno-outline-atomics in GUEST_ABI_FLAGS
+    if "-mno-outline-atomics" not in text:
         anchor = '"-DHALO_ANDROID=1",'
         if anchor in text:
-            text = text.replace(anchor, '"-DHALO_ARM64_GUEST=1",\n    ' + anchor, 1)
+            text = text.replace(
+                anchor,
+                '"' + '-DHALO_ARM64_GUEST=1",\n    '
+                '"-mno-outline-atomics",\n    ' + anchor,
+                1)
             changed = True
-            print("[OK] HALO_ARM64_GUEST in GUEST_ABI_FLAGS.")
+            print("[OK] -mno-outline-atomics in GUEST_ABI_FLAGS.")
         else:
             print("[WARN] -DHALO_ANDROID=1-Anker nicht gefunden.")
     else:
-        print("[INFO] HALO_ARM64_GUEST bereits vorhanden.")
+        print("[INFO] -mno-outline-atomics bereits vorhanden.")
 
     # 3. -I{EXPAT_DIR}, -I{ZLIB_DIR} in platform_cflags
-    if "f\"-I{EXPAT_DIR}\"" not in text and "-I{EXPAT_DIR}" not in text:
+    if 'f"-I{EXPAT_DIR}"' not in text and "-I{EXPAT_DIR}" not in text:
         anchor = 'f"-I{TOML_DIR}", f"-I{KCP_DIR}", "-Isource -Isource/cseries",'
         replacement = ('f"-I{TOML_DIR}", f"-I{EXPAT_DIR}", f"-I{KCP_DIR}", '
                        'f"-I{ZLIB_DIR}", "-Isource -Isource/cseries",')
@@ -104,7 +106,7 @@ def patch_android_build(path):
         if anchor in text:
             addition = (
                 anchor + "\n"
-                "    # the port's zlib (port/third_party/zlib; hud_hires.c and other)\n"
+                "    # the port's zlib (port/third_party/zlib)\n"
                 "    for name in ZLIB_SOURCES:\n"
                 "        objects.append(guest_object(ZLIB_DIR / name, "
                 '" ".join([platform_cflags, *ZLIB_DEFINES,\n'
