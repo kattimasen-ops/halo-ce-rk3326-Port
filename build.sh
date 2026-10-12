@@ -4,21 +4,11 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════
 # Halo CE Universal — M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
-# Host wird mit aarch64-linux-gnu-gcc (GCC 9.4 aus Ubuntu 20.04)
-# gebaut. GCC 9 kennt keine LSE-Atomics und ruft die glibc-Pfade, die
-# sie enthalten, nicht auf — dadurch tritt der SIGILL auf ARMv8.0 nicht
-# auf. (Clang 22 ruft diese Pfade auf und loeste den SIGILL aus.)
-#
-# NEU (Fix v3): Expat/Zlib-Include-Pfade werden NICHT mehr in
-# tools/android_build.py bzw. tools/linux_build.py injiziert. Das hat
-# den Ninja-Build gebrochen, weil "port/third_party/tomlc17" im
-# Upstream AUCH zur Konstruktion des tomlc17.c-Quellpfades dient
-# (Path(*GUEST_DIRS) / "tomlc17.c"). Sobald die Liste mehr als einen
-# Eintrag hat, entsteht ein verketteter Pfad wie
-#   port/third_party/tomlc17/port/third_party/expat/lib/.../tomlc17.c
-# Stattdessen wird die Umgebungsvariable CPATH gesetzt: sowohl clang
-# als auch gcc suchen Header in den dort eingetragenen Verzeichnissen,
-# ohne dass die Build-Dateien angefasst werden müssen.
+# Fix v4:
+#  - Expat/Zlib-Includes via CPATH (nicht mehr via Build-Datei-Patch)
+#  - menu_files.c bekommt Forward-Deklarationen fuer zwei Host-Funktionen
+#    (config_folder, xgpu_gl_texture_deleted), deren Header im Guest-
+#    Build nicht eingebunden wird.
 # ══════════════════════════════════════════════════════════════════════
 PGO_MODE=${PGO_MODE:-use}
 
@@ -202,7 +192,7 @@ print("  XML-Hunk entfernt; Patch ist jetzt %d Bytes kleiner." % (len(text) - le
 PYEOF
 
 # ══════════════════════════════════════════════════════════════════════
-# SDL3 (nur bauen, wenn .so fehlt) — mit GCC, shared
+# SDL3
 # ══════════════════════════════════════════════════════════════════════
 if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
     echo "== SDL3 $SDL3_TAG: kompiliere aus dem Quellcode (GCC, shared)"
@@ -241,7 +231,7 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-# SDL2 (nur shared) — mit GCC
+# SDL2
 # ══════════════════════════════════════════════════════════════════════
 SDL2_SRC=$WORK/SDL2-src
 SDL2_BUILD=$WORK/sdl2-build
@@ -270,8 +260,7 @@ old = '''    ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_
 new = '''    ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_id,
                                   fb_info->fb_id, flip_flags, &windata->waiting_for_flip);
     /* Mali-G31 (RK3326) meldet DRM_CAP_ASYNC_PAGE_FLIP, lehnt den Aufruf
-       aber mit -EINVAL ab. SDL2 hat keinen Fallback. Ohne Async-Flag
-       wiederholen und Async dauerhaft deaktivieren. */
+       aber mit -EINVAL ab. SDL2 hat keinen Fallback. */
     if (ret != 0 && (flip_flags & DRM_MODE_PAGE_FLIP_ASYNC)) {
         viddata->async_pageflip_support = SDL_FALSE;
         flip_flags &= ~DRM_MODE_PAGE_FLIP_ASYNC;
@@ -405,6 +394,38 @@ if ! tree_is_patched; then
     else
         die "patches/port_settings_shim.c fehlt."
     fi
+
+    echo ""
+    echo "== Fuege menu_files.c Forward-Deklarationen hinzu ..."
+    python3 - "$SRC/port/linux/src/menu_files.c" <<'PYEOF'
+import sys, os
+path = sys.argv[1]
+if not os.path.exists(path):
+    print(f"   [WARN] {path} nicht gefunden.")
+    sys.exit(0)
+with open(path) as f:
+    text = f.read()
+
+if "extern void config_folder" in text and "extern void xgpu_gl_texture_deleted" in text:
+    print("   + menu_files.c: Forward-Deklarationen bereits vorhanden.")
+    sys.exit(0)
+
+decl = (
+    "/* Fix v4: Forward-Deklarationen fuer Host-Funktionen, die menu_files.c\n"
+    "   aufruft, deren Header im Guest-Build aber nicht eingebunden wird. */\n"
+    "#ifdef HALO_ANDROID\n"
+    "#ifndef MENU_FILES_HOST_FUNCS_DECLARED\n"
+    "#define MENU_FILES_HOST_FUNCS_DECLARED\n"
+    "extern void config_folder(char *folder, unsigned int size);\n"
+    "extern void xgpu_gl_texture_deleted(unsigned int texture);\n"
+    "#endif\n"
+    "#endif\n"
+)
+text = decl + "\n" + text
+with open(path, "w") as f:
+    f.write(text)
+print("   + menu_files.c: Forward-Deklarationen eingefuegt.")
+PYEOF
 
     echo ""
     echo "== Setze Menue-Hooks und Build-Registrierung ..."
@@ -546,7 +567,7 @@ print("xbox_kernel.c geprueft")
 PYEOF
 
 # ══════════════════════════════════════════════════════════════════════
-# Fix 2: android_build.py — nur Compiler-Flags, KEINE Include-Pfade
+# Fix 2: android_build.py — Compiler-Flags, KEINE Include-Pfade
 # ══════════════════════════════════════════════════════════════════════
 python3 - "$SRC/tools/android_build.py" <<'PYEOF'
 import sys
@@ -699,7 +720,7 @@ PYEOF
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-# Fix 3: linux_build.py — nur Compiler-Flags, KEINE Include-Pfade
+# Fix 3: linux_build.py — nur Compiler-Flags
 # ══════════════════════════════════════════════════════════════════════
 python3 - "$SRC/tools/linux_build.py" <<'PYEOF'
 import sys
@@ -869,6 +890,7 @@ check_file  "port/linux/src/hud_hires.h"                                        
 check_patch "source/interface/ui_widget.c"      "pc_menu_tag"                   "ui_widget.c pc_menu_tag extern"
 check_patch "source/interface/ui_widget_event_handler_functions.c" "PC_MENU_FUNCTION_BASE" "ui_widget_event_handler_functions.c Dispatcher"
 check_patch "source/cache/cache_files.c"        "menu_tags_loaded"              "cache_files.c Menue-Hooks"
+check_patch "port/linux/src/menu_files.c"       "MENU_FILES_HOST_FUNCS_DECLARED" "menu_files.c Forward-Deklarationen"
 
 if grep -q "settings_only: game data dispatcher" \
     "$SRC/source/interface/ui_widget_game_data_input_functions.c" 2>/dev/null; then
@@ -921,11 +943,7 @@ CEOF
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-# CPATH: Expat- und Zlib-Include-Pfade für den Gast- und Host-Build.
-# Statt die Build-Dateien zu patchen (was den tomlc17-Quellpfad gebrochen
-# hat) werden die Include-Verzeichnisse über die Umgebungsvariable CPATH
-# bekanntgegeben. Clang und GCC suchen dort nach Headern, ohne dass
-# tools/android_build.py oder tools/linux_build.py angefasst werden.
+# CPATH: Expat- und Zlib-Include-Pfade
 # ══════════════════════════════════════════════════════════════════════
 CPATH_GUEST="$SRC/port/third_party/expat/lib:$SRC/port/third_party/expat:$SRC/port/third_party/zlib"
 export CPATH="$CPATH_GUEST${CPATH:+:$CPATH}"
@@ -951,7 +969,7 @@ stamp=$({
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v3-cpath"
+    echo "gcc9-host-dynamic=v4-cpath-menu-fwd"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
