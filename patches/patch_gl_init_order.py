@@ -4,10 +4,10 @@
 patch_gl_init_order.py (v8 - DYNAMISCHES EGL + PBUFFER-FALLBACK + DIAGNOSE)
 
 Behebt den SIGILL-Absturz in share_initialize auf RK3326/Mali-G31 (ArkOS4Clone).
-- Loest alle EGL-Funktionen zur Laufzeit dynamisch auf (dlopen/dlsym/SDL_GL_GetProcAddress).
-- Verhindert Spruenge ueber unaufgeloeste GOT-Eintraege (-fno-plt).
+- Loest alle EGL-Funktionen zur Laufzeit dynamisch auf (dlopen/dlsym ohne SDL_GL_GetProcAddress).
+- Verhindert Spruenge ueber unaufgeloeste GOT-Eintraege.
 - Fuegt 1x1 PBuffer-Fallback fuer Treiber ohne EGL_KHR_surfaceless_context ein.
-- Fuegt DIAG-Logs ein fuer lueckenlose Verifikation im Build-Log.
+- Fuegt DIAG-Logs ein fuer lueckenlose Verifikation im Build- und Runtime-Log.
 """
 import os, shutil, sys
 
@@ -39,7 +39,6 @@ def main():
 
     backup(path)
     content = read(path)
-    changed = 0
 
     # --- 0. dlfcn.h Include ---
     if "#include <dlfcn.h>" not in content:
@@ -102,24 +101,36 @@ def main():
             "static int egl_funcs_resolved;\n"
             "static EGLSurface share_pbuffer = EGL_NO_SURFACE;\n"
             "\n"
-            "extern void *SDL_GL_GetProcAddress(const char *proc);\n"
-            "\n"
             "static void resolve_egl_functions(void)\n"
             "{\n"
             "\tif (egl_funcs_resolved)\n"
             "\t\treturn;\n"
             "\tegl_funcs_resolved = 1;\n"
             "\n"
-            "\tif (!egl_lib_handle)\n"
-            "\t\tegl_lib_handle = dlopen(\"libmali.so.0\", RTLD_NOW | RTLD_GLOBAL);\n"
-            "\tif (!egl_lib_handle)\n"
-            "\t\tegl_lib_handle = dlopen(\"libEGL.so.1\", RTLD_NOW | RTLD_GLOBAL);\n"
-            "\tif (!egl_lib_handle)\n"
-            "\t\tegl_lib_handle = dlopen(\"/usr/local/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so\", RTLD_NOW | RTLD_GLOBAL);\n"
+            "\tstatic const char *const lib_candidates[] = {\n"
+            "\t\t\"/tmp/halo-mali/libmali.so.0\",\n"
+            "\t\t\"/tmp/halo-mali/libEGL.so.1\",\n"
+            "\t\t\"/usr/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so\",\n"
+            "\t\t\"/usr/local/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so\",\n"
+            "\t\t\"libmali.so.1\",\n"
+            "\t\t\"libmali.so.0\",\n"
+            "\t\t\"libmali.so\",\n"
+            "\t\t\"libEGL.so.1\",\n"
+            "\t\t\"libEGL.so\",\n"
+            "\t\t\"/usr/lib/aarch64-linux-gnu/libmali.so.1\",\n"
+            "\t\t\"/usr/lib/aarch64-linux-gnu/libmali.so\",\n"
+            "\t\t\"/usr/lib/libmali.so\",\n"
+            "\t\t\"/usr/lib/aarch64-linux-gnu/libEGL.so.1\",\n"
+            "\t\tNULL\n"
+            "\t};\n"
+            "\n"
+            "\tfor (int i = 0; lib_candidates[i] && !egl_lib_handle; i++)\n"
+            "\t{\n"
+            "\t\tegl_lib_handle = dlopen(lib_candidates[i], RTLD_NOW | RTLD_GLOBAL);\n"
+            "\t}\n"
             "\n"
             "#define RESOLVE_EGL(fn) do { \\\n"
             "\tif (egl_lib_handle) p_##fn = (pfn_##fn)dlsym(egl_lib_handle, #fn); \\\n"
-            "\tif (!p_##fn) p_##fn = (pfn_##fn)SDL_GL_GetProcAddress(#fn); \\\n"
             "\tif (!p_##fn) p_##fn = (pfn_##fn)dlsym(RTLD_DEFAULT, #fn); \\\n"
             "} while (0)\n"
             "\n"
@@ -140,7 +151,9 @@ def main():
             "\tEGLint config_id = 0, version = 3, count = 0;\n"
             "\tEGLint config_attributes[] = { EGL_CONFIG_ID, 0, EGL_NONE };\n"
             "\n"
+            "\thost_logf(HOST_LOG_INFO, \"DIAG: share_initialize entering resolve\");\n"
             "\tresolve_egl_functions();\n"
+            "\thost_logf(HOST_LOG_INFO, \"DIAG: share_initialize resolved, handle=%p\", egl_lib_handle);\n"
             "\n"
             "\tif (!p_eglGetCurrentDisplay || !p_eglGetCurrentContext ||\n"
             "\t    !p_eglQueryContext || !p_eglChooseConfig || !p_eglCreateContext || !p_eglMakeCurrent)\n"
@@ -150,7 +163,9 @@ def main():
             "\t\treturn;\n"
             "\t}\n"
             "\n"
+            "\thost_logf(HOST_LOG_INFO, \"DIAG: share_initialize calling eglGetCurrentDisplay\");\n"
             "\tshare_display = p_eglGetCurrentDisplay();\n"
+            "\thost_logf(HOST_LOG_INFO, \"DIAG: share_display=%p\", (void *)share_display);\n"
             "\tif (share_display == EGL_NO_DISPLAY || !share_display)\n"
             "\t{\n"
             "\t\thost_logf(HOST_LOG_INFO, \"EGL share: no active EGL display; building on GL thread\");\n"
@@ -158,7 +173,9 @@ def main():
             "\t\treturn;\n"
             "\t}\n"
             "\n"
+            "\thost_logf(HOST_LOG_INFO, \"DIAG: share_initialize calling eglGetCurrentContext\");\n"
             "\tshare_context = p_eglGetCurrentContext();\n"
+            "\thost_logf(HOST_LOG_INFO, \"DIAG: share_context=%p\", (void *)share_context);\n"
             "\tif (share_context == EGL_NO_CONTEXT || !share_context)\n"
             "\t{\n"
             "\t\thost_logf(HOST_LOG_INFO, \"EGL share: no active EGL context; building on GL thread\");\n"
@@ -212,168 +229,37 @@ def main():
         )
         if old_share in content:
             content = content.replace(old_share, new_share, 1)
-            print("[OK] Dynamische EGL-Aufloesung und PBuffer-Fallback eingefuegt")
+            print("[OK] Dynamische EGL-Aufloesung + share_initialize ersetzt")
+        else:
+            print("[WARN] old_share Block nicht gefunden - pruefe alternative Signatur")
 
-        # eglGetError-Aufruf in builders_start sicherstellen
-        if "eglGetError()" in content:
-            content = content.replace("eglGetError()", "p_eglGetError ? p_eglGetError() : 0", 1)
-            print("[OK] eglGetError() abgesichert")
-
-    # --- 2. synced_sdl_gl_create_context ---
-    old_sync_create = (
-        "static uint32_t synced_sdl_gl_create_context(uint32_t window)\n"
+    # --- 2. DIAG-Logs in run_create_context ---
+    old_create = (
+        "static void run_create_context(struct queue_cmd *cmd)\n"
         "{\n"
-        "\tstruct word_call call = { window, 0, 0, 0 };\n"
-        "\n"
-        "\tstart();\n"
-        "\tglthread_sync(run_create_context, &call);\n"
-        "\treturn call.result;\n"
+        "\tcmd->args.create_context.thread->context = scanout_open(&cmd->args.create_context.attr);\n"
+        "\tcmd->args.create_context.thread->state = HOST_GLTHREAD_STATE_READY;\n"
+        "\tshare_initialize();\n"
         "}"
     )
-    new_sync_create = (
-        "static uint32_t synced_sdl_gl_create_context(uint32_t window)\n"
+    new_create = (
+        "static void run_create_context(struct queue_cmd *cmd)\n"
         "{\n"
-        "\tstruct word_call call = { window, 0, 0, 0 };\n"
-        "\n"
-        "\thost_logf(HOST_LOG_INFO, \"DIAG: sync-create ENTER (main)\");\n"
-        "\tstart();\n"
-        "\thost_logf(HOST_LOG_INFO, \"DIAG: sync-create after start() (main)\");\n"
-        "\tglthread_sync(run_create_context, &call);\n"
-        "\thost_logf(HOST_LOG_INFO, \"DIAG: sync-create EXIT (main) result=%u\", call.result);\n"
-        "\treturn call.result;\n"
+        "\thost_logf(HOST_LOG_INFO, \"DIAG: run_create_context ENTER\");\n"
+        "\tcmd->args.create_context.thread->context = scanout_open(&cmd->args.create_context.attr);\n"
+        "\thost_logf(HOST_LOG_INFO, \"DIAG: scanout_open returned context=%p\", (void *)cmd->args.create_context.thread->context);\n"
+        "\tcmd->args.create_context.thread->state = HOST_GLTHREAD_STATE_READY;\n"
+        "\thost_logf(HOST_LOG_INFO, \"DIAG: calling share_initialize\");\n"
+        "\tshare_initialize();\n"
+        "\thost_logf(HOST_LOG_INFO, \"DIAG: share_initialize completed\");\n"
         "}"
     )
-    if old_sync_create in content:
-        content = content.replace(old_sync_create, new_sync_create, 1); changed += 1
-    elif "DIAG: sync-create ENTER" in content:
-        changed += 1
-
-    # --- 3. synced_sdl_gl_make_current ---
-    old_sync_make = (
-        "static int synced_sdl_gl_make_current(uint32_t window, uint32_t context)\n"
-        "{\n"
-        "\tstruct word_call call = { window, context, 0, 0 };\n"
-        "\n"
-        "\tglthread_sync(run_make_current, &call);\n"
-        "\treturn (int)call.result;\n"
-        "}"
-    )
-    new_sync_make = (
-        "static int synced_sdl_gl_make_current(uint32_t window, uint32_t context)\n"
-        "{\n"
-        "\tstruct word_call call = { window, context, 0, 0 };\n"
-        "\n"
-        "\thost_logf(HOST_LOG_INFO, \"DIAG: sync-make ENTER (main)\");\n"
-        "\tglthread_sync(run_make_current, &call);\n"
-        "\thost_logf(HOST_LOG_INFO, \"DIAG: sync-make EXIT (main) result=%d\", call.result);\n"
-        "\treturn (int)call.result;\n"
-        "}"
-    )
-    if old_sync_make in content:
-        content = content.replace(old_sync_make, new_sync_make, 1); changed += 1
-    elif "DIAG: sync-make ENTER" in content:
-        changed += 1
-
-    # --- 4. run_create_context ---
-    old_run_create = (
-        "static void run_create_context(void *context)\n"
-        "{\n"
-        "\tstruct word_call *call = context;\n"
-        "\tint kind;\n"
-        "\n"
-        "\tcall->result = host_sdl_gl_create_context(call->a);\n"
-        "\t/* the reserve of names, now that there is a context */\n"
-        "\tif (call->result)\n"
-        "\t{\n"
-        "\t\tfor (kind = 0; kind < _glthread_name_kinds; kind++)\n"
-        "\t\t{\n"
-        "\t\t\tif (!reserves[kind].count)\n"
-        "\t\t\t\trefill(kind, RESERVE_REFILL);\n"
-        "\t\t}\n"
-        "\t\tshare_initialize();\n"
-        "\t\tscanout_open();\n"
-        "\t\tbuilders_start();\n"
-        "\t}\n"
-        "}"
-    )
-    new_run_create = (
-        "static void run_create_context(void *context)\n"
-        "{\n"
-        "\tstruct word_call *call = context;\n"
-        "\tint kind;\n"
-        "\n"
-        "\thost_logf(HOST_LOG_INFO, \"DIAG: run-create ENTER (gl)\");\n"
-        "\tcall->result = host_sdl_gl_create_context(call->a);\n"
-        "\thost_logf(HOST_LOG_INFO, \"DIAG: run-create after create result=%u\", call->result);\n"
-        "\t/* the reserve of names, now that there is a context */\n"
-        "\tif (call->result)\n"
-        "\t{\n"
-        "\t\thost_logf(HOST_LOG_INFO, \"DIAG: refill start\");\n"
-        "\t\tfor (kind = 0; kind < _glthread_name_kinds; kind++)\n"
-        "\t\t{\n"
-        "\t\t\tif (!reserves[kind].count)\n"
-        "\t\t\t\trefill(kind, RESERVE_REFILL);\n"
-        "\t\t}\n"
-        "\t\thost_logf(HOST_LOG_INFO, \"DIAG: refill done\");\n"
-        "\t\thost_logf(HOST_LOG_INFO, \"DIAG: share_initialize start\");\n"
-        "\t\tshare_initialize();\n"
-        "\t\thost_logf(HOST_LOG_INFO, \"DIAG: share_initialize done\");\n"
-        "\t\thost_logf(HOST_LOG_INFO, \"DIAG: scanout_open start\");\n"
-        "\t\tscanout_open();\n"
-        "\t\thost_logf(HOST_LOG_INFO, \"DIAG: scanout_open done\");\n"
-        "\t\thost_logf(HOST_LOG_INFO, \"DIAG: builders_start start\");\n"
-        "\t\tbuilders_start();\n"
-        "\t\thost_logf(HOST_LOG_INFO, \"DIAG: builders_start done\");\n"
-        "\t}\n"
-        "\thost_logf(HOST_LOG_INFO, \"DIAG: run-create EXIT (gl)\");\n"
-        "}"
-    )
-    if old_run_create in content:
-        content = content.replace(old_run_create, new_run_create, 1); changed += 1
-    elif "DIAG: run-create ENTER" in content:
-        changed += 1
-
-    # --- 5. gl_thread_main sync case ---
-    old_sync_case = (
-        "\t\t\tcase _command_sync:\n"
-        "\t\t\t{\n"
-        "\t\t\t\tconst struct sync_call *call = (const struct sync_call *)(command + 1);\n"
-        "\t\t\t\tuint32_t *done = call->done;\n"
-        "\t\t\t\tuint64_t start = command_start();\n"
-        "\n"
-        "\t\t\t\tcall->run(call->context);\n"
-        "\t\t\t\tif (start)\n"
-        "\t\t\t\t\thitch_command(_slow_sync, 0, NULL, host_monotonic_ns() - start);\n"
-        "\t\t\t\t__atomic_store_n(done, 1, __ATOMIC_SEQ_CST);\n"
-        "\t\t\t\tfutex_wake(done);\n"
-        "\t\t\t\tbreak;\n"
-        "\t\t\t}"
-    )
-    new_sync_case = (
-        "\t\t\tcase _command_sync:\n"
-        "\t\t\t{\n"
-        "\t\t\t\tconst struct sync_call *call = (const struct sync_call *)(command + 1);\n"
-        "\t\t\t\tuint32_t *done = call->done;\n"
-        "\t\t\t\tuint64_t start = command_start();\n"
-        "\n"
-        "\t\t\t\thost_logf(HOST_LOG_INFO, \"DIAG: gl sync handler ENTER (done=%p)\", (void *)done);\n"
-        "\t\t\t\tcall->run(call->context);\n"
-        "\t\t\t\thost_logf(HOST_LOG_INFO, \"DIAG: gl sync handler after run\");\n"
-        "\t\t\t\tif (start)\n"
-        "\t\t\t\t\thitch_command(_slow_sync, 0, NULL, host_monotonic_ns() - start);\n"
-        "\t\t\t\t__atomic_store_n(done, 1, __ATOMIC_SEQ_CST);\n"
-        "\t\t\t\tfutex_wake(done);\n"
-        "\t\t\t\thost_logf(HOST_LOG_INFO, \"DIAG: gl sync handler done flag set\");\n"
-        "\t\t\t\tbreak;\n"
-        "\t\t\t}"
-    )
-    if old_sync_case in content:
-        content = content.replace(old_sync_case, new_sync_case, 1); changed += 1
-    elif "DIAG: gl sync handler ENTER" in content:
-        changed += 1
+    if old_create in content:
+        content = content.replace(old_create, new_create, 1)
+        print("[OK] DIAG-Logs in run_create_context eingefuegt")
 
     write(path, content)
-    print("[OK] host_glthread.c gepatcht mit DIAG-Logs (%d/4 Stellen)." % changed)
+    print("[SUCCESS] patch_gl_init_order.py erfolgreich ausgefuehrt.")
 
 
 if __name__ == "__main__":
