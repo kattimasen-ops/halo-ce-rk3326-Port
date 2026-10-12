@@ -234,7 +234,7 @@ SYSTEM_MALI="/usr/local/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so"
 if [ -f "$SYSTEM_MALI" ]; then
     rm -rf /tmp/halo-mali
     mkdir -p /tmp/halo-mali
-    for name in libmali.so.0 libmali.so.1 libmali.so libgbm.so.1 libgbm.so.1.0.0 libgbm.so; do
+    for name in libmali.so.0 libmali.so.1 libmali.so libgbm.so.1 libgbm.so.1.0.0 libgbm.so libEGL.so.1 libEGL.so libGLESv2.so.2 libGLESv2.so libGLESv1_CM.so.1 libGLESv1_CM.so; do
         ln -sf "$SYSTEM_MALI" "/tmp/halo-mali/$name"
     done
     export LD_LIBRARY_PATH="/tmp/halo-mali:$GAMEDIR/libs.aarch64:$GAMEDIR"
@@ -298,131 +298,71 @@ unset HALO_GPU_TRACE_PASSES_AT 2>/dev/null || true
 unset HALO_GPU_TRACE_PASSES_FRAMES 2>/dev/null || true
 unset HALO_DEBUG_SKIP_GL 2>/dev/null || true
 
-# ── MAPS-CHECK ───────────────────────────────────────────────────────
-if [ ! -s "$GAMEDIR/maps/ui.map" ]; then
-    log "FEHLER: $GAMEDIR/maps/ui.map fehlt."
-    echo "FEHLER: maps/ui.map fehlt." >&2
-    exit 1
-fi
-
-if [ ! -x ./halo ]; then
-    log "FEHLER: ./halo fehlt oder nicht ausfuehrbar."
-    echo "FEHLER: ./halo fehlt." >&2
-    exit 1
-fi
-
-# ══════════════════════════════════════════════════════════════════════
-# HOST-BIBLIOTHEKEN (Diagnose)
-# ══════════════════════════════════════════════════════════════════════
+# ── BIBLIOTHEKS-DIAGNOSE (LD_DEBUG=libs) ─────────────────────────────
 log_section "HOST-BIBLIOTHEKEN"
-
-if command -v file > /dev/null 2>&1; then
+if command -v file >/dev/null 2>&1; then
     log "file ./halo:"
     file ./halo 2>&1 | while IFS= read -r line; do log "  $line"; done
 fi
-
-if command -v readelf > /dev/null 2>&1; then
+if command -v readelf >/dev/null 2>&1; then
     log "readelf -d ./halo | grep NEEDED:"
-    readelf -d ./halo 2>/dev/null | grep NEEDED | while IFS= read -r line; do log "  $line"; done || log "  (keine NEEDED)"
+    readelf -d ./halo 2>&1 | grep NEEDED | while IFS= read -r line; do log "  $line"; done
 fi
-
-if command -v ldd > /dev/null 2>&1; then
+if command -v ldd >/dev/null 2>&1; then
     log "ldd ./halo:"
-    ldd ./halo 2>&1 | while IFS= read -r line; do log "  $line"; done || true
+    ldd ./halo 2>&1 | while IFS= read -r line; do log "  $line"; done
 fi
-
 log "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 log "SDL_VIDEODRIVER=$SDL_VIDEODRIVER"
+log ""
 
-# ══════════════════════════════════════════════════════════════════════
-# LD_DEBUG-Diagnose (HALO_LIBDIAG=1, Default)
-# ══════════════════════════════════════════════════════════════════════
-LIBDIAG_LOG="$GAMEDIR/halo-libdiag.txt"
-if [ "${HALO_LIBDIAG:-0}" = "1" ]; then
-    log ""
+if [ "$HALO_LIBDIAG" = "1" ]; then
+    DIAG_LOG="$GAMEDIR/halo-libdiag.txt"
     log "HALO_LIBDIAG=1: LD_DEBUG=libs Diagnose-Lauf (max. 5 Sekunden) ..."
-    : > "$LIBDIAG_LOG"
-
-    if command -v timeout > /dev/null 2>&1; then
-        # timeout ist vorhanden (coreutils)
-        ( LD_DEBUG=libs timeout 5 ./halo ) > /dev/null 2>> "$LIBDIAG_LOG" || true
-    else
-        # Fallback ohne timeout: Hintergrund-Job + sleep + kill
-        ( LD_DEBUG=libs ./halo ) > /dev/null 2>> "$LIBDIAG_LOG" &
-        DIAG_PID=$!
-        ( sleep 5 && kill -TERM "$DIAG_PID" 2>/dev/null ) &
-        KILLER_PID=$!
-        wait "$DIAG_PID" 2>/dev/null || true
-        kill -TERM "$KILLER_PID" 2>/dev/null || true
-        wait "$KILLER_PID" 2>/dev/null || true
-    fi
-
-    if [ -s "$LIBDIAG_LOG" ]; then
-        head -200 "$LIBDIAG_LOG" > "$LIBDIAG_LOG.head"
-        mv -f "$LIBDIAG_LOG.head" "$LIBDIAG_LOG"
-        log "  $LIBDIAG_LOG geschrieben ($(wc -l < "$LIBDIAG_LOG") Zeilen)"
+    timeout 5 env LD_DEBUG=libs ./halo > /dev/null 2> "$DIAG_LOG" || true
+    if [ -f "$DIAG_LOG" ]; then
+        diag_lines=$(wc -l < "$DIAG_LOG" 2>/dev/null || echo 0)
+        log "  $DIAG_LOG geschrieben ($diag_lines Zeilen)"
         log "  Erste 40 Zeilen (auch hier im Log):"
-        head -40 "$LIBDIAG_LOG" | while IFS= read -r line; do log "    $line"; done
-    else
-        log "  WARNUNG: LD_DEBUG hat nichts geschrieben."
-        log "  Pruefe: existiert ./halo? ist es ausfuehrbar?"
-        ls -la ./halo 2>&1 | while IFS= read -r line; do log "    $line"; done
+        head -n 40 "$DIAG_LOG" | while IFS= read -r line; do log "    $line"; done
     fi
-else
     log ""
-    log "HALO_LIBDIAG=$HALO_LIBDIAG (Diagnose uebersprungen)."
-    log "Zum Aktivieren: HALO_LIBDIAG=1 in die Umgebung setzen oder"
-    log "die Zeile 'export HALO_LIBDIAG=1' oben in Halo.sh eintragen."
 fi
 
-# ══════════════════════════════════════════════════════════════════════
-# SPIELSTART
-# ══════════════════════════════════════════════════════════════════════
+# ── SPIELSTART ───────────────────────────────────────────────────────
 log_section "SPIELSTART"
 
-GUEST_SIZE=$(stat -c%s ./halo_guest.elf 2>/dev/null || echo 0)
-if [ "$GUEST_SIZE" -gt 0 ]; then
-    GUEST_SIZE_MB=$((GUEST_SIZE / 1048576))
-    log "halo_guest.elf: $GUEST_SIZE Bytes (~${GUEST_SIZE_MB} MB)"
+if [ -f "$GAMEDIR/halo_guest.elf" ]; then
+    log "halo_guest.elf: $(stat -c%s "$GAMEDIR/halo_guest.elf" 2>/dev/null || echo '?') Bytes (~16 MB)"
+else
+    log "FEHLER: $GAMEDIR/halo_guest.elf fehlt!"
+    exit 1
 fi
 
-HALO_STDOUT="$GAMEDIR/halo-stdout.txt"
-HALO_STDERR="$GAMEDIR/halo-stderr.txt"
-: > "$HALO_STDOUT"
-: > "$HALO_STDERR"
+STDOUT_LOG="$GAMEDIR/halo-stdout.txt"
+STDERR_LOG="$GAMEDIR/halo-stderr.txt"
+log "HALO_STDOUT=$STDOUT_LOG"
+log "HALO_STDERR=$STDERR_LOG (SDL_LOGGING geht hierhin)"
 
-GPTOKEYB_PID=""
-if [ -n "$PM_CONTROLFOLDER" ] && command -v gptokeyb >/dev/null 2>&1; then
-    gptokeyb "./halo" >/dev/null 2>&1 &
-    GPTOKEYB_PID=$!
+if [ "${HALO_SDLDEBUG:-1}" = "1" ]; then
+    export SDL_LOGGING="*=debug"
 fi
-cleanup_gptokeyb() {
-    [ -n "$GPTOKEYB_PID" ] && kill -0 "$GPTOKEYB_PID" 2>/dev/null && \
-        kill -TERM "$GPTOKEYB_PID" 2>/dev/null || true
-}
-trap cleanup_gptokeyb EXIT
 
 log "Starte: ./halo"
-./halo > "$HALO_STDOUT" 2> "$HALO_STDERR" &
-HALO_PID=$!
-log "PID=$HALO_PID"
+./halo > "$STDOUT_LOG" 2> "$STDERR_LOG" &
+PID=$!
+log "PID=$PID"
 
-forward_signal() {
-    [ -n "$HALO_PID" ] && kill -0 "$HALO_PID" 2>/dev/null && \
-        kill -TERM "$HALO_PID" 2>/dev/null || true
-}
-trap forward_signal TERM INT HUP
+wait "$PID" 2>/dev/null
+STATUS=$?
+log "halo beendet mit Status $STATUS"
 
-wait "$HALO_PID"
-HALO_STATUS=$?
-
-[ -n "$GPTOKEYB_PID" ] && kill -0 "$GPTOKEYB_PID" 2>/dev/null && {
-    kill -TERM "$GPTOKEYB_PID" 2>/dev/null || true
-    wait "$GPTOKEYB_PID" 2>/dev/null || true
-}
-
-log "halo beendet mit Status $HALO_STATUS"
+# Wenn ein Core-Dump erzeugt wurde, benennen wir ihn lesbar um
+if [ -f /tmp/core ] || [ -f "$GAMEDIR/core" ]; then
+    core_file="/tmp/core"
+    [ -f "$GAMEDIR/core" ] && core_file="$GAMEDIR/core"
+    log "CORE-DUMP GEFUNDEN: $core_file ($(stat -c%s "$core_file" 2>/dev/null) Bytes)"
+fi
 
 log_section "ENDE"
-sync
-exit "$HALO_STATUS"
+exit "$STATUS"
