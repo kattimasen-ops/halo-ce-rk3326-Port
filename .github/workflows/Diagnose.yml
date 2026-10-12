@@ -5,7 +5,7 @@ on:
 
 jobs:
   diagnose:
-    name: Mali-Bibliothek auf LSE-Instruktionen prüfen
+    name: Mali-Bibliothek auf LSE-Instruktionen pruefen
     runs-on: ubuntu-22.04
     container: ubuntu:20.04
     timeout-minutes: 30
@@ -23,87 +23,107 @@ jobs:
 
       - name: "System-Pakete installieren"
         run: |
-          set -e
           apt-get update
           apt-get install -y --no-install-recommends \
             binutils-aarch64-linux-gnu \
-            file \
-            curl \
-            ca-certificates
+            file
 
       - name: "Diagnose-Ordner anlegen"
-        run: mkdir -p "$DIAG"
-
-      - name: "Alle Mali-Bibliotheken im sysroot finden"
         run: |
-          set -e
+          mkdir -p "$DIAG"
+          echo "Sysroot: $SYSROOT_LIB"
+          ls -la "$SYSROOT_LIB" 2>&1 || echo "(Sysroot nicht vorhanden)"
+
+      - name: "Uebersicht der Bibliotheken"
+        run: |
           {
             echo "=== Sysroot-Inhalt ==="
-            ls -la "$SYSROOT_LIB" 2>/dev/null || echo "(kein sysroot)"
+            ls -la "$SYSROOT_LIB" 2>&1 || echo "(leer)"
             echo ""
-            echo "=== Alle .so-Dateien im sysroot ==="
-            find "$SYSROOT_LIB" -name "*.so*" -type f 2>/dev/null || echo "(keine)"
-            echo ""
-            echo "=== Suche nach libGLESv2/libmali/libEGL ==="
-            find "$SYSROOT_LIB" -iname "*GLES*" -o -iname "*mali*" -o -iname "*EGL*" 2>/dev/null
+            echo "=== Alle .so-Dateien ==="
+            find "$SYSROOT_LIB" -name "*.so*" -type f 2>&1 || echo "(keine)"
           } > "$DIAG/01_sysroot_libs.txt"
           cat "$DIAG/01_sysroot_libs.txt"
 
-      - name: "LSE-Instruktionen in jeder Bibliothek prüfen"
+      - name: "LSE-Instruktionen pruefen (robust)"
         run: |
-          set -e
+          # WICHTIG: kein 'set -e' und kein pipefail in diesem Step
+          set +e
+          set +o pipefail
+
           {
-            echo "=== LSE-Atomics-Prüfung (ldadd, cas, swp, ldclr, etc.) ==="
-            echo "Eine Zahl > 0 bedeutet: Die Bibliothek enthält ARMv8.1-LSE-Instruktionen."
-            echo "Auf einem Cortex-A35 (ARMv8.0) führt das zu SIGILL."
+            echo "=== LSE-Atomics-Pruefung ==="
+            echo "Eine Zahl > 0 bedeutet: ARMv8.1-LSE-Instruktionen vorhanden."
+            echo "Auf Cortex-A35 (ARMv8.0) fuehrt das zu SIGILL."
             echo ""
-            for lib in $(find "$SYSROOT_LIB" -name "*.so*" -type f 2>/dev/null); do
-              count=$(aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null | \
-                grep -iE '\b(cas|casp|swp|ldadd|stadd|ldclr|stclr|ldeor|steor|ldset|stset|ldsmax|stsmax|ldsmin|stsmin|ldumax|stumax|ldumin|stumin)\b' | \
-                wc -l)
-              if [ "$count" -gt 0 ]; then
-                echo "WARNUNG: $lib enthält $count LSE-Instruktionen"
-                echo "  Erste 5 Treffer:"
-                aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null | \
-                  grep -iE '\b(cas|casp|swp|ldadd|stadd|ldclr|stclr|ldeor|steor|ldset|stset|ldsmax|stsmax|ldsmin|stsmin|ldumax|stumax|ldumin|stumin)\b' | \
-                  head -5
-              else
-                echo "OK: $lib enthält keine LSE-Instruktionen"
-              fi
-            done
           } > "$DIAG/02_lse_check.txt"
+
+          if [ ! -d "$SYSROOT_LIB" ]; then
+            echo "(Sysroot nicht vorhanden)" >> "$DIAG/02_lse_check.txt"
+            cat "$DIAG/02_lse_check.txt"
+            exit 0
+          fi
+
+          for lib in "$SYSROOT_LIB"/*.so*; do
+            [ -f "$lib" ] || continue
+            count=$(aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null | \
+              grep -iE 'ldadd|stadd|ldclr|stclr|ldeor|steor|ldset|stset|ldsmax|stsmax|ldsmin|stsmin|ldumax|stumax|ldumin|stumin|\bswp\b|\bcas\b' | \
+              wc -l)
+            count=${count:-0}
+            if [ "$count" -gt 0 ]; then
+              echo "WARNUNG: $(basename "$lib") enthaelt $count LSE-Instruktionen" >> "$DIAG/02_lse_check.txt"
+              aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null | \
+                grep -iE 'ldadd|stadd|ldclr|stclr|ldeor|steor|ldset|stset|ldsmax|stsmax|ldsmin|stsmin|ldumax|stumax|ldumin|stumin|\bswp\b|\bcas\b' | \
+                head -3 >> "$DIAG/02_lse_check.txt"
+            else
+              echo "OK: $(basename "$lib") enthaelt keine LSE-Instruktionen" >> "$DIAG/02_lse_check.txt"
+            fi
+          done
+
           cat "$DIAG/02_lse_check.txt"
 
-      - name: "LSE-Instruktionen in der System-glibc prüfen"
+      - name: "System-glibc pruefen"
         run: |
-          set -e
+          set +e
+          set +o pipefail
           {
-            echo "=== System-glibc auf LSE prüfen ==="
-            for lib in /lib/aarch64-linux-gnu/libc.so.6 /lib/aarch64-linux-gnu/libpthread.so.0; do
+            echo "=== System-glibc ==="
+            for lib in /lib/aarch64-linux-gnu/libc.so.6 \
+                       /lib/aarch64-linux-gnu/libpthread.so.0 \
+                       /lib/aarch64-linux-gnu/libm.so.6; do
               if [ -f "$lib" ]; then
                 count=$(aarch64-linux-gnu-objdump -d "$lib" 2>/dev/null | \
-                  grep -iE '\b(cas|casp|swp|ldadd|stadd|ldclr|stclr|ldeor|steor|ldset|stset|ldsmax|stsmax|ldsmin|stsmin|ldumax|stumax|ldumin|stumin)\b' | \
+                  grep -iE 'ldadd|stadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|\bswp\b|\bcas\b' | \
                   wc -l)
-                echo "$lib: $count LSE-Instruktionen"
+                echo "$(basename "$lib"): ${count:-0} LSE-Instruktionen"
               fi
             done
+            echo ""
+            echo "=== Architecture der System-glibc ==="
+            file /lib/aarch64-linux-gnu/libc.so.6 2>&1
           } > "$DIAG/03_glibc_lse.txt"
           cat "$DIAG/03_glibc_lse.txt"
 
-      - name: "Build-Log auf -mno-outline-atomics prüfen"
+      - name: "Build-Log Flags pruefen"
         run: |
-          set -e
+          set +e
+          set +o pipefail
           {
             echo "=== Suche nach -mno-outline-atomics im Build-Log ==="
             if [ -f "build.log" ]; then
-              grep -c "mno-outline-atomics" build.log || echo "0 Treffer"
+              grep -c "mno-outline-atomics" build.log
             else
-              echo "(kein build.log im Repo-Root)"
+              echo "build.log nicht gefunden"
             fi
             echo ""
-            echo "=== Suche nach -moutline-atomics (falls vorhanden) ==="
+            echo "=== Suche nach -moutline-atomics ==="
             if [ -f "build.log" ]; then
-              grep -c "moutline-atomics" build.log || echo "0 Treffer"
+              grep -c "moutline-atomics" build.log
+            fi
+            echo ""
+            echo "=== Erste clang-Zeile mit Flags ==="
+            if [ -f "build.log" ]; then
+              grep -m1 "clang-22.*guest_object" build.log | head -1
             fi
           } > "$DIAG/04_build_flags.txt"
           cat "$DIAG/04_build_flags.txt"
