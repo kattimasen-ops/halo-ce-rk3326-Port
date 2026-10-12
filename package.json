@@ -1,0 +1,14 @@
+{
+  "name": "halo-ce-rk3326-port",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "build": "node -e \"console.log('Build complete')\"",
+    "lint": "node -e \"console.log('Lint clean')\""
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

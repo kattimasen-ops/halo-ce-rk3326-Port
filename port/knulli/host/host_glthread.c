@@ -29,6 +29,7 @@ HALO_GL_THREAD=0 makes the calls on the game's thread, as before.
 #include "host_knulli.h"
 
 #include <EGL/egl.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
@@ -964,11 +965,14 @@ static void *gl_thread_main(void *unused)
 				uint32_t *done = call->done;
 				uint64_t start = command_start();
 
+				host_logf(HOST_LOG_INFO, "DIAG: gl sync handler ENTER (done=%p)", (void *)done);
 				call->run(call->context);
+				host_logf(HOST_LOG_INFO, "DIAG: gl sync handler after run");
 				if (start)
 					hitch_command(_slow_sync, 0, NULL, host_monotonic_ns() - start);
 				__atomic_store_n(done, 1, __ATOMIC_SEQ_CST);
 				futex_wake(done);
+				host_logf(HOST_LOG_INFO, "DIAG: gl sync handler done flag set");
 				break;
 			}
 			case _command_host:
@@ -1472,34 +1476,151 @@ static struct program_job *builder_pop(struct builder *builder)
 	return job;
 }
 
+typedef EGLDisplay (*pfn_eglGetCurrentDisplay)(void);
+typedef EGLContext (*pfn_eglGetCurrentContext)(void);
+typedef EGLBoolean (*pfn_eglQueryContext)(EGLDisplay, EGLContext, EGLint, EGLint *);
+typedef EGLBoolean (*pfn_eglChooseConfig)(EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLint *);
+typedef EGLContext (*pfn_eglCreateContext)(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
+typedef EGLSurface (*pfn_eglCreatePbufferSurface)(EGLDisplay, EGLConfig, const EGLint *);
+typedef EGLBoolean (*pfn_eglMakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
+typedef EGLint     (*pfn_eglGetError)(void);
+
+static pfn_eglGetCurrentDisplay    p_eglGetCurrentDisplay;
+static pfn_eglGetCurrentContext    p_eglGetCurrentContext;
+static pfn_eglQueryContext        p_eglQueryContext;
+static pfn_eglChooseConfig        p_eglChooseConfig;
+static pfn_eglCreateContext       p_eglCreateContext;
+static pfn_eglCreatePbufferSurface p_eglCreatePbufferSurface;
+static pfn_eglMakeCurrent         p_eglMakeCurrent;
+static pfn_eglGetError            p_eglGetError;
+static void *egl_lib_handle;
+static int egl_funcs_resolved;
+static EGLSurface share_pbuffer = EGL_NO_SURFACE;
+
+static void resolve_egl_functions(void)
+{
+	if (egl_funcs_resolved)
+		return;
+	egl_funcs_resolved = 1;
+
+	static const char *const lib_candidates[] = {
+		"/tmp/halo-mali/libmali.so.0",
+		"/tmp/halo-mali/libEGL.so.1",
+		"/usr/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so",
+		"/usr/local/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so",
+		"libmali.so.1",
+		"libmali.so.0",
+		"libmali.so",
+		"libEGL.so.1",
+		"libEGL.so",
+		"/usr/lib/aarch64-linux-gnu/libmali.so.1",
+		"/usr/lib/aarch64-linux-gnu/libmali.so",
+		"/usr/lib/libmali.so",
+		"/usr/lib/aarch64-linux-gnu/libEGL.so.1",
+		NULL
+	};
+
+	for (int i = 0; lib_candidates[i] && !egl_lib_handle; i++)
+	{
+		egl_lib_handle = dlopen(lib_candidates[i], RTLD_NOW | RTLD_GLOBAL);
+	}
+
+#define RESOLVE_EGL(fn) do { \
+	if (egl_lib_handle) p_##fn = (pfn_##fn)dlsym(egl_lib_handle, #fn); \
+	if (!p_##fn) p_##fn = (pfn_##fn)dlsym(RTLD_DEFAULT, #fn); \
+} while (0)
+
+	RESOLVE_EGL(eglGetCurrentDisplay);
+	RESOLVE_EGL(eglGetCurrentContext);
+	RESOLVE_EGL(eglQueryContext);
+	RESOLVE_EGL(eglChooseConfig);
+	RESOLVE_EGL(eglCreateContext);
+	RESOLVE_EGL(eglCreatePbufferSurface);
+	RESOLVE_EGL(eglMakeCurrent);
+	RESOLVE_EGL(eglGetError);
+#undef RESOLVE_EGL
+}
+
 /* on the GL thread, once its context is made */
 static void share_initialize(void)
 {
 	EGLint config_id = 0, version = 3, count = 0;
 	EGLint config_attributes[] = { EGL_CONFIG_ID, 0, EGL_NONE };
 
-	share_display = eglGetCurrentDisplay();
-	share_context = eglGetCurrentContext();
-	eglQueryContext(share_display, share_context, EGL_CONFIG_ID, &config_id);
-	eglQueryContext(share_display, share_context, EGL_CONTEXT_CLIENT_VERSION, &version);
+	host_logf(HOST_LOG_INFO, "DIAG: share_initialize entering resolve");
+	resolve_egl_functions();
+	host_logf(HOST_LOG_INFO, "DIAG: share_initialize resolved, handle=%p", egl_lib_handle);
+
+	if (!p_eglGetCurrentDisplay || !p_eglGetCurrentContext ||
+	    !p_eglQueryContext || !p_eglChooseConfig || !p_eglCreateContext || !p_eglMakeCurrent)
+	{
+		host_logf(HOST_LOG_INFO, "EGL share: dynamic EGL symbols unavailable; building on GL thread");
+		share_context = EGL_NO_CONTEXT;
+		return;
+	}
+
+	host_logf(HOST_LOG_INFO, "DIAG: share_initialize calling eglGetCurrentDisplay");
+	share_display = p_eglGetCurrentDisplay();
+	host_logf(HOST_LOG_INFO, "DIAG: share_display=%p", (void *)share_display);
+	if (share_display == EGL_NO_DISPLAY || !share_display)
+	{
+		host_logf(HOST_LOG_INFO, "EGL share: no active EGL display; building on GL thread");
+		share_context = EGL_NO_CONTEXT;
+		return;
+	}
+
+	host_logf(HOST_LOG_INFO, "DIAG: share_initialize calling eglGetCurrentContext");
+	share_context = p_eglGetCurrentContext();
+	host_logf(HOST_LOG_INFO, "DIAG: share_context=%p", (void *)share_context);
+	if (share_context == EGL_NO_CONTEXT || !share_context)
+	{
+		host_logf(HOST_LOG_INFO, "EGL share: no active EGL context; building on GL thread");
+		share_context = EGL_NO_CONTEXT;
+		return;
+	}
+
+	if (!p_eglQueryContext(share_display, share_context, EGL_CONFIG_ID, &config_id) ||
+	    !p_eglQueryContext(share_display, share_context, EGL_CONTEXT_CLIENT_VERSION, &version))
+	{
+		host_logf(HOST_LOG_INFO, "EGL share: eglQueryContext failed; building on GL thread");
+		share_context = EGL_NO_CONTEXT;
+		return;
+	}
+
 	config_attributes[1] = config_id;
 	share_attributes[1] = version;
-	if (!eglChooseConfig(share_display, config_attributes, &share_config, 1, &count) || count != 1)
+	if (!p_eglChooseConfig(share_display, config_attributes, &share_config, 1, &count) || count != 1)
+	{
+		host_logf(HOST_LOG_INFO, "EGL share: eglChooseConfig failed; building on GL thread");
 		share_context = EGL_NO_CONTEXT;
+		return;
+	}
+	host_logf(HOST_LOG_INFO, "EGL share: initialized successfully (config %d, version %d)", config_id, version);
 }
 
 /* a context that shares the GL thread's objects, or EGL_NO_CONTEXT */
 static EGLContext share_new(void)
 {
-	return share_context == EGL_NO_CONTEXT ? EGL_NO_CONTEXT :
-		eglCreateContext(share_display, share_config, share_context, share_attributes);
+	return (share_context == EGL_NO_CONTEXT || !p_eglCreateContext) ? EGL_NO_CONTEXT :
+		p_eglCreateContext(share_display, share_config, share_context, share_attributes);
 }
 
 /* such a context current on the calling thread, without a surface
-(EGL_KHR_surfaceless_context): whether it is */
+(EGL_KHR_surfaceless_context), with 1x1 pbuffer fallback if surfaceless unsupported */
 static int share_make_current(EGLContext context)
 {
-	return context != EGL_NO_CONTEXT && eglMakeCurrent(share_display, EGL_NO_SURFACE, EGL_NO_SURFACE, context);
+	if (context == EGL_NO_CONTEXT || !p_eglMakeCurrent)
+		return 0;
+	if (p_eglMakeCurrent(share_display, EGL_NO_SURFACE, EGL_NO_SURFACE, context))
+		return 1;
+	if (share_pbuffer == EGL_NO_SURFACE && p_eglCreatePbufferSurface)
+	{
+		EGLint pbuffer_attribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+		share_pbuffer = p_eglCreatePbufferSurface(share_display, share_config, pbuffer_attribs);
+	}
+	if (share_pbuffer != EGL_NO_SURFACE)
+		return p_eglMakeCurrent(share_display, share_pbuffer, share_pbuffer, context);
+	return 0;
 }
 
 /* host_gl_texture_thread: a shared context of its own, current on the
@@ -1585,7 +1706,7 @@ static void builders_start(void)
 		host_logf(HOST_LOG_INFO, "programs are built by threads of their own");
 	else
 		host_logf(HOST_LOG_WARN, "cannot start the program builders (EGL error 0x%x): programs are built on the GL thread",
-			eglGetError());
+			p_eglGetError ? p_eglGetError() : 0);
 }
 
 /* the program names the builders' table takes (the driver's names are
@@ -1881,19 +2002,30 @@ static void run_create_context(void *context)
 	struct word_call *call = context;
 	int kind;
 
+	host_logf(HOST_LOG_INFO, "DIAG: run-create ENTER (gl)");
 	call->result = host_sdl_gl_create_context(call->a);
+	host_logf(HOST_LOG_INFO, "DIAG: run-create after create result=%u", call->result);
 	/* the reserve of names, now that there is a context */
 	if (call->result)
 	{
+		host_logf(HOST_LOG_INFO, "DIAG: refill start");
 		for (kind = 0; kind < _glthread_name_kinds; kind++)
 		{
 			if (!reserves[kind].count)
 				refill(kind, RESERVE_REFILL);
 		}
+		host_logf(HOST_LOG_INFO, "DIAG: refill done");
+		host_logf(HOST_LOG_INFO, "DIAG: share_initialize start");
 		share_initialize();
+		host_logf(HOST_LOG_INFO, "DIAG: share_initialize done");
+		host_logf(HOST_LOG_INFO, "DIAG: scanout_open start");
 		scanout_open();
+		host_logf(HOST_LOG_INFO, "DIAG: scanout_open done");
+		host_logf(HOST_LOG_INFO, "DIAG: builders_start start");
 		builders_start();
+		host_logf(HOST_LOG_INFO, "DIAG: builders_start done");
 	}
+	host_logf(HOST_LOG_INFO, "DIAG: run-create EXIT (gl)");
 }
 
 static void start(void);
@@ -1920,8 +2052,11 @@ static uint32_t synced_sdl_gl_create_context(uint32_t window)
 {
 	struct word_call call = { window, 0, 0, 0 };
 
+	host_logf(HOST_LOG_INFO, "DIAG: sync-create ENTER (main)");
 	start();
+	host_logf(HOST_LOG_INFO, "DIAG: sync-create after start() (main)");
 	glthread_sync(run_create_context, &call);
+	host_logf(HOST_LOG_INFO, "DIAG: sync-create EXIT (main) result=%u", call.result);
 	return call.result;
 }
 
@@ -1936,7 +2071,9 @@ static int synced_sdl_gl_make_current(uint32_t window, uint32_t context)
 {
 	struct word_call call = { window, context, 0, 0 };
 
+	host_logf(HOST_LOG_INFO, "DIAG: sync-make ENTER (main)");
 	glthread_sync(run_make_current, &call);
+	host_logf(HOST_LOG_INFO, "DIAG: sync-make EXIT (main) result=%d", call.result);
 	return (int)call.result;
 }
 

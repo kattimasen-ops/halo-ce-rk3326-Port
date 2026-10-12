@@ -1,0 +1,7 @@
+{
+  "name": "Halo CE on Anbernic RG35XX H: Native Knulli Port",
+  "description": "Halo: Combat Evolved runs natively on the Anbernic RG35XX H and other Allwinner H700 handhelds under Knulli: 60 fps menus, about 40 to 55 fps in the campaign. Open-source ARM64 port of the halo-ce-universal decompilation.",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
