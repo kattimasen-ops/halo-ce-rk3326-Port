@@ -2,22 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-patch_settings_only.py
+patch_settings_only.py  (v4)
+
 Automatisches Skript zur sauberen Injektion des PC-Einstellungsmenüs.
 
-NICHT MEHR dabei: die Expat/Zlib-Include-Pfad-Injektion in
-tools/android_build.py bzw. tools/linux_build.py. Diese hat den
-Ninja-Build gebrochen, weil die Zeichenkette "port/third_party/tomlc17"
-im Upstream AUCH zur Konstruktion des Quellpfades verwendet wird
-(Path(*GUEST_DIRS) / "tomlc17.c"). Sobald die Liste mehr als einen
-Eintrag hat, entsteht ein verketteter Pfad wie
-  port/third_party/tomlc17/port/third_party/expat/lib/.../tomlc17.c
-und ninja findet die Datei nicht.
+Wichtige Änderungen seit v3:
+- patch_event_dispatcher liest die Parameter-Namen der Zielfunktion
+  dynamisch aus der Signatur, statt sie zu raten. In früheren Versionen
+  wurden falsche Namen (widget_index, event_data) verwendet, was zu
+  Compile-Fehlern führte.
+- Alle Host-Funktionsnamen (config_folder, xgpu_gl_texture_deleted)
+  werden NICHT hier, sondern in build.sh als Forward-Deklaration
+  eingetragen.
 
-Die Include-Pfade werden jetzt stattdessen über die Umgebungsvariable
-CPATH in build.sh gesetzt. Sowohl clang als auch gcc suchen Header in
-den dort eingetragenen Verzeichnissen, ohne dass die Build-Dateien
-angefasst werden müssen.
+NICHT MEHR dabei (seit v3): die Expat/Zlib-Include-Pfad-Injektion in
+tools/android_build.py bzw. tools/linux_build.py.
 """
 
 import os
@@ -40,6 +39,42 @@ def read_file_content(path: str) -> str:
 def write_file_content(path: str, content: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
+
+
+def _split_top_level(text: str, sep: str = ",") -> list:
+    """Split text on sep at depth 0 (ignoring nested (), [])."""
+    parts = []
+    depth = 0
+    current = ""
+    for ch in text:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == sep and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        parts.append(current)
+    return parts
+
+
+def _extract_param_names(signature: str) -> list:
+    """Extract parameter names from a C parameter list."""
+    names = []
+    for p in _split_top_level(signature, ","):
+        p = p.strip()
+        if not p or p == "void":
+            continue
+        # Remove array suffix "[]"
+        p_clean = re.sub(r"\[[^\]]*\]\s*$", "", p)
+        # The last identifier is the name
+        m = re.search(r"(\w+)\s*$", p_clean)
+        if m:
+            names.append(m.group(1))
+    return names
 
 
 def patch_ui_widget(base_dir: str) -> None:
@@ -84,33 +119,96 @@ def patch_event_dispatcher(base_dir: str) -> None:
     create_backup(file_path)
     content = read_file_content(file_path)
 
+    if "PC_MENU_FUNCTION_BASE" in content:
+        print("[INFO] ui_widget_event_handler_functions.c bereits gepatcht.")
+        return
+
+    func_name = "ui_widget_event_handler_function_invoke"
+    idx = content.find(func_name)
+    if idx == -1:
+        print(f"[WARN] {func_name} nicht gefunden.")
+        return
+
+    # '(' after function name
+    paren_open = content.find("(", idx)
+    if paren_open == -1:
+        print("[WARN] keine Parameterliste gefunden.")
+        return
+
+    # Matching ')'
+    depth = 0
+    paren_close = -1
+    for i in range(paren_open, len(content)):
+        if content[i] == "(":
+            depth += 1
+        elif content[i] == ")":
+            depth -= 1
+            if depth == 0:
+                paren_close = i
+                break
+    if paren_close == -1:
+        print("[WARN] keine schliessende Klammer gefunden.")
+        return
+
+    brace_open = content.find("{", paren_close)
+    if brace_open == -1:
+        print("[WARN] keine oeffnende Klammer gefunden.")
+        return
+
+    signature = content[paren_open + 1:paren_close]
+    names = _extract_param_names(signature)
+    print(f"[INFO] Erkannte Parameter: {names}")
+
+    if len(names) < 3:
+        print(f"[WARN] zu wenige Parameter: {names}")
+        return
+
+    # function_index identifizieren
+    fi_idx = -1
+    for i, n in enumerate(names):
+        if n == "function_index":
+            fi_idx = i
+            break
+    if fi_idx == -1:
+        print(f"[WARN] 'function_index' nicht in {names}")
+        return
+
+    others = [(i, n) for i, n in enumerate(names) if i != fi_idx]
+    widget_name = others[0][1]
+    event_name = others[1][1]
+    fi_name = names[fi_idx]
+    wd_name = others[2][1] if len(others) > 2 else None
+
+    print(f"[INFO] widget={widget_name} event={event_name} "
+          f"fi={fi_name} wd={wd_name}")
+
+    # Header unmittelbar vor der Funktion einfuegen
     hook_header = (
-        "\n#include <stdint.h>\n"
+        "\n/* PC Settings Menu Hooks - v4 (dynamische Parametererkennung) */\n"
+        "#include <stdint.h>\n"
         "#ifndef PC_MENU_FUNCTION_BASE\n"
         "#define PC_MENU_FUNCTION_BASE 0x8000\n"
-        "extern uint32_t pc_menu_event_function_invoke(int32_t function_index, "
-        "int32_t widget_index, void *event_data);\n"
         "#endif\n"
+        "extern void pc_menu_event_function_invoke(void *widget, void *event,\n"
+        "                                          long function_index,\n"
+        "                                          void *widget_deleted);\n"
     )
+    content = content[:idx] + hook_header + content[idx:]
+    offset = len(hook_header)
+    new_brace_open = brace_open + offset
 
-    if "PC_MENU_FUNCTION_BASE" not in content:
-        content = hook_header + content
+    wd_arg = wd_name if wd_name else "0"
+    insertion = (
+        f"\n    if ({fi_name} >= PC_MENU_FUNCTION_BASE) {{\n"
+        f"        pc_menu_event_function_invoke({widget_name}, {event_name}, "
+        f"{fi_name}, (void *){wd_arg});\n"
+        f"        return;\n"
+        f"    }}"
+    )
+    content = content[:new_brace_open + 1] + insertion + content[new_brace_open + 1:]
 
-        pattern = r"(ui_widget_event_handler_function_invoke\s*\([^)]*\)\s*\{)"
-        replacement = (
-            r"\1\n"
-            r"    if (function_index >= PC_MENU_FUNCTION_BASE) {\n"
-            r"        return pc_menu_event_function_invoke((int32_t)function_index, "
-            r"(int32_t)widget_index, event_data);\n"
-            r"    }\n"
-        )
-        content, count = re.subn(pattern, replacement, content, count=1)
-
-        if count > 0:
-            write_file_content(file_path, content)
-            print("[OK] ui_widget_event_handler_functions.c gepatcht.")
-        else:
-            print("[WARN] ui_widget_event_handler_function_invoke nicht gefunden.")
+    write_file_content(file_path, content)
+    print("[OK] ui_widget_event_handler_functions.c gepatcht.")
 
 
 def patch_game_data_dispatcher(base_dir: str) -> None:
@@ -126,29 +224,83 @@ def patch_game_data_dispatcher(base_dir: str) -> None:
     create_backup(file_path)
     content = read_file_content(file_path)
 
+    if "pc_menu_game_data_function_invoke" in content:
+        print("[INFO] ui_widget_game_data_input_functions.c bereits gepatcht.")
+        return
+
+    func_name = "ui_widget_game_data_input_function_invoke"
+    idx = content.find(func_name)
+    if idx == -1:
+        print(f"[WARN] {func_name} nicht gefunden.")
+        return
+
+    paren_open = content.find("(", idx)
+    if paren_open == -1:
+        print("[WARN] keine Parameterliste gefunden.")
+        return
+
+    depth = 0
+    paren_close = -1
+    for i in range(paren_open, len(content)):
+        if content[i] == "(":
+            depth += 1
+        elif content[i] == ")":
+            depth -= 1
+            if depth == 0:
+                paren_close = i
+                break
+    if paren_close == -1:
+        print("[WARN] keine schliessende Klammer gefunden.")
+        return
+
+    brace_open = content.find("{", paren_close)
+    if brace_open == -1:
+        print("[WARN] keine oeffnende Klammer gefunden.")
+        return
+
+    signature = content[paren_open + 1:paren_close]
+    names = _extract_param_names(signature)
+    print(f"[INFO] Erkannte Parameter (game data): {names}")
+
+    if len(names) < 2:
+        print(f"[WARN] zu wenige Parameter: {names}")
+        return
+
+    fi_idx = -1
+    for i, n in enumerate(names):
+        if n == "function_index":
+            fi_idx = i
+            break
+    if fi_idx == -1:
+        print(f"[WARN] 'function_index' nicht in {names}")
+        return
+
+    others = [(i, n) for i, n in enumerate(names) if i != fi_idx]
+    widget_name = others[0][1]
+    fi_name = names[fi_idx]
+
     hook_header = (
-        "\n#include <stdint.h>\n"
-        "extern void pc_menu_game_data_function_invoke(int32_t function_index, "
-        "int32_t widget_index, void *data);\n"
+        "\n/* PC Settings Menu Hooks - game data (v4) */\n"
+        "#include <stdint.h>\n"
+        "extern void pc_menu_game_data_function_invoke(void *widget,\n"
+        "                                              long function_index,\n"
+        "                                              void *data);\n"
     )
+    content = content[:idx] + hook_header + content[idx:]
+    offset = len(hook_header)
+    new_brace_open = brace_open + offset
 
-    if "pc_menu_game_data_function_invoke" not in content:
-        content = hook_header + content
+    insertion = (
+        f"\n    if ({fi_name} >= 0x8000) {{\n"
+        f"        pc_menu_game_data_function_invoke({widget_name}, {fi_name}, "
+        f"(void *)0);\n"
+        f"        return;\n"
+        f"    }}"
+    )
+    content = content[:new_brace_open + 1] + insertion + content[new_brace_open + 1:]
 
-        pattern = r"(ui_widget_game_data_input_function_invoke\s*\([^)]*\)\s*\{)"
-        replacement = (
-            r"\1\n"
-            r"    if (function_index >= 0x8000) {\n"
-            r"        pc_menu_game_data_function_invoke((int32_t)function_index, "
-            r"(int32_t)widget_index, data);\n"
-            r"        return;\n"
-            r"    }\n"
-        )
-        content, count = re.subn(pattern, replacement, content, count=1)
-
-        if count > 0:
-            write_file_content(file_path, content)
-            print("[OK] ui_widget_game_data_input_functions.c gepatcht.")
+    write_file_content(file_path, content)
+    print("[OK] ui_widget_game_data_input_functions.c gepatcht.")
 
 
 def patch_cache_files(base_dir: str) -> None:
@@ -185,8 +337,6 @@ def patch_cache_files(base_dir: str) -> None:
 
 
 def patch_buildsystem_and_shim(root_dir: str, patches_dir: str) -> None:
-    """Kopiert port_settings_shim.c aus patches/ in den Quellbaum und
-    trägt libdl in port.json ein."""
     shim_src = os.path.join(patches_dir, "port_settings_shim.c")
     target_dir = os.path.join(root_dir, "port", "linux", "game")
 
