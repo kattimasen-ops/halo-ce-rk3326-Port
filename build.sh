@@ -4,15 +4,11 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════
 # Halo CE Universal — M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
-# Fix v5 (Hybrid):
-#  - Expat und Zlib in android_build.py aufgenommen (fuer menu_files.c
-#    und hud_hires.c, die aus OpenCE stammen).
-#  - HALO_ARM64_GUEST=1 in den Guest-Flags definiert.
-#  - Fehlende C-Funktionen in den Upstream eingefuegt:
-#    cache_files_tag_instances, cache_files_set_tag_instances,
-#    ui_widget_event_handler_function_name, xgpu_gl_texture_deleted.
-#  - guest_host_stubs.c fuer config_folder und SDL_LoadFile.
-#  - Expat/Zlib-Includes ueber CPATH (nicht mehr via Build-Datei-Patch).
+# Fix v6:
+#  - SDL2 und SDL3 werden mit -mno-outline-atomics gebaut, damit sie
+#    auf ARMv8.0 (Cortex-A35) keine LSE-Atomics enthalten. Die Diagnose
+#    hat gezeigt, dass libSDL2-2.0.so.0 zwei LSE-Instruktionen enthaelt,
+#    die den SIGILL beim Start verursachen.
 # ══════════════════════════════════════════════════════════════════════
 PGO_MODE=${PGO_MODE:-use}
 
@@ -196,7 +192,7 @@ print("  XML-Hunk entfernt; Patch ist jetzt %d Bytes kleiner." % (len(text) - le
 PYEOF
 
 # ══════════════════════════════════════════════════════════════════════
-# SDL3
+# SDL3 (nur bauen, wenn .so fehlt) — mit GCC, shared, ARMv8.0-kompatibel
 # ══════════════════════════════════════════════════════════════════════
 if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
     echo "== SDL3 $SDL3_TAG: kompiliere aus dem Quellcode (GCC, shared)"
@@ -213,6 +209,8 @@ if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
     cmake -S "$SDL3_SRC" -B "$SDL3_BUILD" \
         -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_C_COMPILER="$HOST_CC" \
+        -DCMAKE_C_FLAGS="-mno-outline-atomics" \
+        -DCMAKE_CXX_FLAGS="-mno-outline-atomics" \
         -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -235,7 +233,7 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-# SDL2
+# SDL2 (nur shared) — mit GCC, ARMv8.0-kompatibel
 # ══════════════════════════════════════════════════════════════════════
 SDL2_SRC=$WORK/SDL2-src
 SDL2_BUILD=$WORK/sdl2-build
@@ -305,6 +303,8 @@ PATCH_EOF
     cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
         -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_C_COMPILER="$HOST_CC" \
+        -DCMAKE_C_FLAGS="-mno-outline-atomics" \
+        -DCMAKE_CXX_FLAGS="-mno-outline-atomics" \
         -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -594,7 +594,7 @@ print("xbox_kernel.c geprueft")
 PYEOF
 
 # ══════════════════════════════════════════════════════════════════════
-# Fix 2: android_build.py — Compiler-Flags (KEINE Include-Pfade hier)
+# Fix 2: android_build.py — Compiler-Flags
 # ══════════════════════════════════════════════════════════════════════
 python3 - "$SRC/tools/android_build.py" <<'PYEOF'
 import sys
@@ -909,6 +909,7 @@ check_patch "tools/android_build.py"            '"-DHALO_ANDROID"'              
 check_patch "tools/android_build.py"            '"-DHALO_ARM64_GUEST=1"'        "android_build.py HALO_ARM64_GUEST"
 check_patch "tools/android_build.py"            'EXPAT_DIR = Path'              "android_build.py EXPAT_DIR"
 check_patch "tools/android_build.py"            'ZLIB_DIR = Path'               "android_build.py ZLIB_DIR"
+check_patch "tools/android_build.py"            '"-mno-outline-atomics"'        "android_build.py -mno-outline-atomics"
 check_patch "source/main/main.c"                "St0len-One"                    "main.c Credits"
 check_file  "port/linux/include/halo_menus.h"                                   "halo_menus.h"
 check_file  "port/linux/src/menu_files.c"                                       "menu_files.c"
@@ -1006,7 +1007,7 @@ stamp=$({
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v5-hybrid-expat-zlib"
+    echo "gcc9-host-dynamic=v6-sdl2-no-lse"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
@@ -1082,7 +1083,7 @@ else
     cat <<'RELEASE'
 
 ────────────────────────────────────────────────────────────────────────
-RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, Hybrid v5)
+RELEASE-BUILD (Settings-Only, GCC 9, dynamischer Host, Hybrid v6)
 ────────────────────────────────────────────────────────────────────────
 Installation auf M9 Pro (wenn halo_guest.elf existiert):
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
