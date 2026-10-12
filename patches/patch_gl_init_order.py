@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-patch_gl_init_order.py
+patch_gl_init_order.py  (v2)
 
-BUGFIX: Die GL-Initialisierung in host_glthread.c lief vor SDL_GL_MakeCurrent.
-Das führte dazu, dass refill() (glGenTextures etc.) ohne current context
-aufgerufen wurde und auf ARMv8.0 mit SIGILL abstürzte.
+BUGFIX + DIAGNOSE:
+1. Verschiebt die GL-Initialisierung (refill, share_initialize,
+   scanout_open, builders_start) von run_create_context nach
+   run_make_current, damit GL-Befehle erst nach SDL_GL_MakeCurrent
+   laufen.
+2. Loggt vor und nach jedem der vier Schritte, damit im Fehlerfall
+   sichtbar ist, welcher Aufruf den SIGILL ausloest.
 
-Dieser Patch verschiebt die Initialisierung (refill, share_initialize,
-scanout_open, builders_start) aus run_create_context nach run_make_current.
+Nach der Diagnose kann das Logging entfernt werden; die Verschiebung
+selbst bleibt bestehen.
 """
 
 import os
@@ -45,7 +49,7 @@ def main():
     backup(path)
     content = read(path)
 
-    # Alter run_create_context-Block (mit Init)
+    # ── 1. run_create_context: Init-Block entfernen ──
     old_create = (
         "static void run_create_context(void *context)\n"
         "{\n"
@@ -76,7 +80,7 @@ def main():
         "}"
     )
 
-    # Alter run_make_current-Block (ohne Init)
+    # ── 2. run_make_current: Init-Block MIT Logging einfuegen ──
     old_make = (
         "static void run_make_current(void *context)\n"
         "{\n"
@@ -92,19 +96,27 @@ def main():
         "\tint kind;\n"
         "\n"
         "\tcall->result = (uint32_t)host_sdl_gl_make_current(call->a, call->b);\n"
-        "\t/* FIX: Der GL-Kontext wird erst hier current. Vorher duerfen\n"
-        "\t   keine GL-Befehle laufen - refill() ruft glGenTextures etc. auf\n"
-        "\t   und loeste ohne current context SIGILL aus (x16 = -1). */\n"
+        "\t/* FIX + DIAGNOSE: Der GL-Kontext ist jetzt current. Die Init\n"
+        "\t   laeuft hier statt in run_create_context. Jeder Schritt loggt\n"
+        "\t   vorher und nachher, damit der SIGILL lokalisierbar ist. */\n"
         "\tif (call->result)\n"
         "\t{\n"
+        "\t\thost_logf(HOST_LOG_INFO, \"gl-init: refill start\");\n"
         "\t\tfor (kind = 0; kind < _glthread_name_kinds; kind++)\n"
         "\t\t{\n"
         "\t\t\tif (!reserves[kind].count)\n"
         "\t\t\t\trefill(kind, RESERVE_REFILL);\n"
         "\t\t}\n"
+        "\t\thost_logf(HOST_LOG_INFO, \"gl-init: refill done\");\n"
+        "\t\thost_logf(HOST_LOG_INFO, \"gl-init: share_initialize start\");\n"
         "\t\tshare_initialize();\n"
+        "\t\thost_logf(HOST_LOG_INFO, \"gl-init: share_initialize done\");\n"
+        "\t\thost_logf(HOST_LOG_INFO, \"gl-init: scanout_open start\");\n"
         "\t\tscanout_open();\n"
+        "\t\thost_logf(HOST_LOG_INFO, \"gl-init: scanout_open done\");\n"
+        "\t\thost_logf(HOST_LOG_INFO, \"gl-init: builders_start start\");\n"
         "\t\tbuilders_start();\n"
+        "\t\thost_logf(HOST_LOG_INFO, \"gl-init: builders_start done\");\n"
         "\t}\n"
         "}"
     )
@@ -113,15 +125,11 @@ def main():
         content = content.replace(old_create, new_create, 1)
         content = content.replace(old_make, new_make, 1)
         write(path, content)
-        print("[OK] host_glthread.c: GL-Init nach make_current verschoben.")
+        print("[OK] host_glthread.c: GL-Init nach make_current + Logging.")
         return
 
-    # Fallback: nur der Init-Block am Ende von run_create_context wird verschoben
-    if "/* the reserve of names, now that there is a context */" in content:
-        print("[WARN] exaktes Muster nicht gefunden, aber Init-Block existiert.")
-        print("       Bitte host_glthread.c manuell pruefen.")
-    else:
-        print("[WARN] Muster nicht gefunden; moeglicherweise andere Version.")
+    print("[WARN] exaktes Muster nicht gefunden — bitte host_glthread.c pruefen.")
+    print("       Erwartet: ungepatchter Original-Zustand.")
     sys.exit(0)
 
 
