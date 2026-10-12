@@ -1,0 +1,180 @@
+name: Diagnose Build Issues
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  diagnose:
+    name: Build-Diagnose
+    runs-on: ubuntu-22.04
+    container: ubuntu:20.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      SRC: ${{ github.workspace }}/work/halo-ce-universal
+      OPENCE_SRC: ${{ github.workspace }}/work/opence-source
+      DIAG: ${{ github.workspace }}/diagnose
+      UPSTREAM_COMMIT: ${{ github.workspace }}/UPSTREAM_COMMIT
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "System-Pakete installieren"
+        run: |
+          set -e
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl wget tar python3 python3-pip ca-certificates \
+            file binutils-aarch64-linux-gnu
+          python3 -m pip install --upgrade pip
+
+      - name: "Diagnose-Ordner anlegen"
+        run: mkdir -p "$DIAG"
+
+      - name: "Upstream klonen"
+        run: |
+          set -e
+          mkdir -p "$(dirname "$SRC")"
+          if [ ! -d "$SRC/.git" ]; then
+            git init -q "$SRC"
+            git -C "$SRC" remote add origin https://github.com/cybersecurity/halo-ce-universal.git
+          fi
+          COMMIT=$(tr -d '[:space:]' < "$UPSTREAM_COMMIT")
+          echo "Upstream-Commit: $COMMIT"
+          git -C "$SRC" fetch -q --depth 1 origin "$COMMIT" || git -C "$SRC" fetch -q origin
+          git -C "$SRC" checkout -q --force --detach "$COMMIT"
+          git -C "$SRC" reset -q --hard
+          git -C "$SRC" clean -q -fd
+
+      - name: "OpenCE klonen"
+        run: |
+          set -e
+          rm -rf "$OPENCE_SRC"
+          git clone --depth 1 https://github.com/OpenCommunityEdition/OpenCE.git "$OPENCE_SRC"
+
+      - name: "Fehlende Symbole in Upstream suchen"
+        run: |
+          set -e
+          echo "=== Suche nach cache_files_tag_instances ===" > "$DIAG/01_missing_symbols.txt"
+          grep -rn "cache_files_tag_instances\|cache_files_set_tag_instances" "$SRC/source/" >> "$DIAG/01_missing_symbols.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/01_missing_symbols.txt"
+          echo "" >> "$DIAG/01_missing_symbols.txt"
+          echo "=== Suche nach ui_widget_event_handler_function_name ===" >> "$DIAG/01_missing_symbols.txt"
+          grep -rn "ui_widget_event_handler_function_name" "$SRC/source/" >> "$DIAG/01_missing_symbols.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/01_missing_symbols.txt"
+          echo "" >> "$DIAG/01_missing_symbols.txt"
+          echo "=== Suche nach xgpu_gl_texture_deleted ===" >> "$DIAG/01_missing_symbols.txt"
+          grep -rn "xgpu_gl_texture_deleted" "$SRC/port/" >> "$DIAG/01_missing_symbols.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/01_missing_symbols.txt"
+          echo "" >> "$DIAG/01_missing_symbols.txt"
+          echo "=== Suche nach config_folder ===" >> "$DIAG/01_missing_symbols.txt"
+          grep -rn "config_folder" "$SRC/port/" >> "$DIAG/01_missing_symbols.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/01_missing_symbols.txt"
+
+      - name: "Fehlende Symbole in OpenCE suchen"
+        run: |
+          set -e
+          echo "=== OpenCE: ui_widget_event_handler_function_name ===" > "$DIAG/02_opence_symbols.txt"
+          grep -rn "ui_widget_event_handler_function_name" "$OPENCE_SRC/source/" >> "$DIAG/02_opence_symbols.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/02_opence_symbols.txt"
+          echo "" >> "$DIAG/02_opence_symbols.txt"
+          echo "=== OpenCE: cache_files_tag_instances ===" >> "$DIAG/02_opence_symbols.txt"
+          grep -rn "cache_files_tag_instances\|cache_files_set_tag_instances" "$OPENCE_SRC/source/" >> "$DIAG/02_opence_symbols.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/02_opence_symbols.txt"
+          echo "" >> "$DIAG/02_opence_symbols.txt"
+          echo "=== OpenCE: xgpu_gl_texture_deleted ===" >> "$DIAG/02_opence_symbols.txt"
+          grep -rn "xgpu_gl_texture_deleted" "$OPENCE_SRC/port/" >> "$DIAG/02_opence_symbols.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/02_opence_symbols.txt"
+          echo "" >> "$DIAG/02_opence_symbols.txt"
+          echo "=== OpenCE: HALO_ARM64_GUEST ===" >> "$DIAG/02_opence_symbols.txt"
+          grep -rn "HALO_ARM64_GUEST" "$OPENCE_SRC/tools/" >> "$DIAG/02_opence_symbols.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/02_opence_symbols.txt"
+
+      - name: "Build-Skripte vergleichen"
+        run: |
+          set -e
+          echo "=== Upstream android_build.py: EXPAT_DIR, ZLIB_DIR, GUEST_ABI_FLAGS ===" > "$DIAG/03_build_scripts.txt"
+          grep -n "EXPAT_DIR\|ZLIB_DIR\|GUEST_ABI_FLAGS\|HALO_ARM64_GUEST\|objects.append\|android_ar\|inputs=musl_objects" "$SRC/tools/android_build.py" >> "$DIAG/03_build_scripts.txt" 2>/dev/null
+          echo "" >> "$DIAG/03_build_scripts.txt"
+          echo "=== OpenCE android_build.py: EXPAT_DIR, ZLIB_DIR, GUEST_ABI_FLAGS ===" >> "$DIAG/03_build_scripts.txt"
+          grep -n "EXPAT_DIR\|ZLIB_DIR\|GUEST_ABI_FLAGS\|HALO_ARM64_GUEST\|objects.append\|android_ar\|inputs=musl_objects" "$OPENCE_SRC/tools/android_build.py" >> "$DIAG/03_build_scripts.txt" 2>/dev/null
+          echo "" >> "$DIAG/03_build_scripts.txt"
+          echo "=== Diff: Upstream vs OpenCE android_build.py ===" >> "$DIAG/03_build_scripts.txt"
+          diff -u "$SRC/tools/android_build.py" "$OPENCE_SRC/tools/android_build.py" >> "$DIAG/03_build_scripts.txt" 2>/dev/null || true
+
+      - name: "port.json prüfen"
+        run: |
+          set -e
+          echo "=== Upstream port.json ===" > "$DIAG/04_port_json.txt"
+          cat "$SRC/port/linux/port.json" >> "$DIAG/04_port_json.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/04_port_json.txt"
+          echo "" >> "$DIAG/04_port_json.txt"
+          echo "=== OpenCE port.json ===" >> "$DIAG/04_port_json.txt"
+          cat "$OPENCE_SRC/port/linux/port.json" >> "$DIAG/04_port_json.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/04_port_json.txt"
+
+      - name: "menu_files.c vergleichen"
+        run: |
+          set -e
+          echo "=== Upstream menu_files.c: HALO_ARM64_GUEST, SDL_LoadFile ===" > "$DIAG/05_menu_files.txt"
+          grep -n "HALO_ARM64_GUEST\|SDL_LoadFile\|config_folder\|xgpu_gl_texture_deleted" "$SRC/port/linux/src/menu_files.c" >> "$DIAG/05_menu_files.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/05_menu_files.txt"
+          echo "" >> "$DIAG/05_menu_files.txt"
+          echo "=== OpenCE menu_files.c: HALO_ARM64_GUEST, SDL_LoadFile ===" >> "$DIAG/05_menu_files.txt"
+          grep -n "HALO_ARM64_GUEST\|SDL_LoadFile\|config_folder\|xgpu_gl_texture_deleted" "$OPENCE_SRC/port/linux/src/menu_files.c" >> "$DIAG/05_menu_files.txt" 2>/dev/null
+          echo "" >> "$DIAG/05_menu_files.txt"
+          echo "=== Diff: Upstream vs OpenCE menu_files.c ===" >> "$DIAG/05_menu_files.txt"
+          diff -u "$SRC/port/linux/src/menu_files.c" "$OPENCE_SRC/port/linux/src/menu_files.c" >> "$DIAG/05_menu_files.txt" 2>/dev/null | head -200 || true
+
+      - name: "cache_files.c prüfen"
+        run: |
+          set -e
+          echo "=== Upstream cache_files.c: cache_files_tag_instances ===" > "$DIAG/06_cache_files.txt"
+          grep -n "cache_files_tag_instances\|cache_files_set_tag_instances\|global_tag_instances\|global_tag_count" "$SRC/source/cache/cache_files.c" >> "$DIAG/06_cache_files.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/06_cache_files.txt"
+          echo "" >> "$DIAG/06_cache_files.txt"
+          echo "=== OpenCE cache_files.c: cache_files_tag_instances ===" >> "$DIAG/06_cache_files.txt"
+          grep -n "cache_files_tag_instances\|cache_files_set_tag_instances\|global_tag_instances\|global_tag_count" "$OPENCE_SRC/source/cache/cache_files.c" >> "$DIAG/06_cache_files.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/06_cache_files.txt"
+
+      - name: "ui_widget_event_handler_functions.c vergleichen"
+        run: |
+          set -e
+          echo "=== Upstream: ui_widget_event_handler_function_name ===" > "$DIAG/07_event_handler.txt"
+          grep -n "ui_widget_event_handler_function_name\|ui_widget_event_handler_function_invoke" "$SRC/source/interface/ui_widget_event_handler_functions.c" >> "$DIAG/07_event_handler.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/07_event_handler.txt"
+          echo "" >> "$DIAG/07_event_handler.txt"
+          echo "=== OpenCE: ui_widget_event_handler_function_name ===" >> "$DIAG/07_event_handler.txt"
+          grep -n "ui_widget_event_handler_function_name\|ui_widget_event_handler_function_invoke" "$OPENCE_SRC/source/interface/ui_widget_event_handler_functions.c" >> "$DIAG/07_event_handler.txt" 2>/dev/null || echo "NICHT GEFUNDEN" >> "$DIAG/07_event_handler.txt"
+          echo "" >> "$DIAG/07_event_handler.txt"
+          echo "=== Diff: Upstream vs OpenCE ui_widget_event_handler_functions.c ===" >> "$DIAG/07_event_handler.txt"
+          diff -u "$SRC/source/interface/ui_widget_event_handler_functions.c" "$OPENCE_SRC/source/interface/ui_widget_event_handler_functions.c" >> "$DIAG/07_event_handler.txt" 2>/dev/null | head -300 || true
+
+      - name: "Git-Status und Patch-Info"
+        run: |
+          set -e
+          echo "=== UPSTREAM_COMMIT ===" > "$DIAG/08_git_info.txt"
+          cat "$UPSTREAM_COMMIT" >> "$DIAG/08_git_info.txt" 2>/dev/null
+          echo "" >> "$DIAG/08_git_info.txt"
+          echo "=== git status ===" >> "$DIAG/08_git_info.txt"
+          git -C "$SRC" status --short >> "$DIAG/08_git_info.txt" 2>/dev/null || true
+          echo "" >> "$DIAG/08_git_info.txt"
+          echo "=== git diff HEAD (Zusammenfassung) ===" >> "$DIAG/08_git_info.txt"
+          git -C "$SRC" diff HEAD --stat >> "$DIAG/08_git_info.txt" 2>/dev/null || true
+
+      - name: "Diagnose-Ergebnisse auflisten"
+        run: |
+          echo "=== Diagnose-Ergebnisse ==="
+          ls -la "$DIAG/"
+          echo ""
+          echo "=== 01_missing_symbols.txt ==="
+          cat "$DIAG/01_missing_symbols.txt"
+          echo ""
+          echo "=== 02_opence_symbols.txt ==="
+          cat "$DIAG/02_opence_symbols.txt"
+          echo ""
+          echo "=== 03_build_scripts.txt (Auszug) ==="
+          head -80 "$DIAG/03_build_scripts.txt"
+
+      - name: "Diagnose-Artefakte hochladen"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnose
+          path: diagnose/
+          if-no-files-found: warn
+          retention-days: 30
