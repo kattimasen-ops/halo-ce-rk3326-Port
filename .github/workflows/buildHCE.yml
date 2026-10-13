@@ -36,6 +36,9 @@ jobs:
           fetch-depth: 0
           submodules: false
 
+      - name: "Git Safe Directory"
+        run: git config --global --add safe.directory "*" || true
+
       - name: "glibc-Version im Container pruefen"
         run: |
           echo "== glibc im Container:"
