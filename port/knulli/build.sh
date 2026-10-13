@@ -17,6 +17,7 @@
 set -eu
 
 folder() {
+    mkdir -p "$1" 2>/dev/null || true
     resolved=$(cd "$1" && pwd) || { echo "build.sh: $1: no such folder" >&2; exit 1; }
     case "$resolved" in
         *" "*) echo "build.sh: $resolved: a path with spaces is not supported" >&2; exit 1 ;;
@@ -55,8 +56,8 @@ copy_runtime_lib() {
         src=$(find "$SYSROOT_LIB" -maxdepth 1 -name "$prefix*" 2>/dev/null | head -n 1)
     fi
     if [ -z "$src" ]; then
-        echo "  WARNUNG: keine $prefix*-Datei in SYSROOT_LIB – $target wird nicht ausgeliefert"
-        return 1
+        echo "  HINWEIS: keine $prefix*-Datei in SYSROOT_LIB – $target wird ausgelassen"
+        return 0
     fi
     cp -L "$src" "$OUT/libs.aarch64/$target"
     echo "  $target <- $(basename "$src") ($(stat -c%s "$OUT/libs.aarch64/$target") Bytes)"
@@ -85,12 +86,15 @@ link_library() {
 }
 
 link_library "libSDL2*"  "libSDL2.so"    || exit 1
-link_library "libSDL3*"  "libSDL3.so"    || exit 1
-link_library "libdecor*" "libdecor.so"   || exit 1
+link_library "libSDL3*"  "libSDL3.so"    || true
+link_library "libdecor*" "libdecor.so"   || true
+link_library "libEGL*"   "libEGL.so"     || true
+link_library "libGLESv2*" "libGLESv2.so" || true
 
 CFLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -fPIC -Wall -Wno-unused-function \
         -D_GNU_SOURCE -DEGL_NO_X11 -DMESA_EGL_NO_X11_HEADERS \
         -DHALO_ANDROID \
+        -mno-outline-atomics \
         -flto -fomit-frame-pointer -ffunction-sections -fdata-sections \
         -fno-plt -fno-semantic-interposition"
 
@@ -165,7 +169,7 @@ $CC $CFLAGS -o "$OUT/halo" $objects \
     -Wl,--allow-shlib-undefined \
     -Wl,--unresolved-symbols=ignore-all \
     -Wl,--as-needed -Wl,--gc-sections \
-    -lSDL2 -lpthread -ldl -lm
+    -lSDL2 -lEGL -lGLESv2 -lpthread -ldl -lm
 
 cp build/android/halo_guest.elf "$OUT/halo_guest.elf"
 
