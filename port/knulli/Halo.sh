@@ -9,15 +9,12 @@
 # Bibliotheks-Diagnose vor dem Spielstart:
 #   - ldd-Ausgabe der Host-Binary in log.txt
 #   - LD_DEBUG=libs-Log in halo-libdiag.txt
-#   Damit laesst sich die Bibliothek identifizieren, die einen
-#   etwaigen SIGILL ausloest.
-#   Abschalten: HALO_LIBDIAG=0 in die Umgebung setzen.
+#   Abschalten/Einschalten: HALO_LIBDIAG=1 bzw. 0 setzen.
 
 XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 
-# Standardmaessig aktiv: das Diagnose-Log wird beim naechsten Start
-# erzeugt. Es kostet nur ~5 Sekunden und laeuft einmal.
-export HALO_LIBDIAG="${HALO_LIBDIAG:-1}"
+# Standardmaessig inaktiv: Diagnose-Lauf bei Bedarf mit HALO_LIBDIAG=1
+export HALO_LIBDIAG="${HALO_LIBDIAG:-0}"
 
 # ── PFADE ────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
@@ -234,6 +231,9 @@ SYSTEM_MALI=""
 for candidate in \
     /usr/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so \
     /usr/local/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so \
+    /usr/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-wayland-gbm.so \
+    /usr/lib/aarch64-linux-gnu/mali/libmali.so \
+    /usr/lib/mali/libmali.so \
     /usr/lib/aarch64-linux-gnu/libmali.so.1 \
     /usr/lib/aarch64-linux-gnu/libmali.so \
     /usr/lib/libmali.so \
@@ -250,11 +250,11 @@ if [ -n "$SYSTEM_MALI" ] && [ -f "$SYSTEM_MALI" ]; then
     for name in libmali.so.0 libmali.so.1 libmali.so libgbm.so.1 libgbm.so.1.0.0 libgbm.so libEGL.so.1 libEGL.so libGLESv2.so.2 libGLESv2.so libGLESv1_CM.so.1 libGLESv1_CM.so; do
         ln -sf "$SYSTEM_MALI" "/tmp/halo-mali/$name"
     done
-    export LD_LIBRARY_PATH="/tmp/halo-mali:$GAMEDIR/libs.aarch64:$GAMEDIR"
+    export LD_LIBRARY_PATH="/tmp/halo-mali:$GAMEDIR/libs.aarch64:$GAMEDIR:/usr/lib/aarch64-linux-gnu"
     log "Mali-Symlinks in /tmp/halo-mali erstellt aus $SYSTEM_MALI"
 else
     log "WARNUNG: Kein bekannter Mali-Blob gefunden - nutze System-Libraries."
-    export LD_LIBRARY_PATH="$GAMEDIR/libs.aarch64:$GAMEDIR"
+    export LD_LIBRARY_PATH="$GAMEDIR/libs.aarch64:$GAMEDIR:/usr/lib/aarch64-linux-gnu"
 fi
 
 # ── ALSA aufraeumen ──────────────────────────────────────────────────
@@ -284,12 +284,13 @@ log "HALO_SAVE_ROOT=$HALO_SAVE_ROOT"
 # ── PERFORMANCE- & RUNTIME-TUNING ───────────────────────────────────
 log_section "PERFORMANCE- & RUNTIME-TUNING"
 
-# GL-Thread & async Program-Kompilierung
+# GL-Thread & Program-Kompilierung:
+# HALO_ASYNC_PROGRAMS=0 ist zwingend fuer Mali-G31 auf RK3326, um Multi-Context Race Conditions zu verhindern.
 export HALO_SWAP_INTERVAL=0
 export HALO_NO_VSYNC=1
 export HALO_GL_THREAD="${HALO_GL_THREAD:-1}"
 export HALO_GL_THREAD_FRAMES="${HALO_GL_THREAD_FRAMES:-1}"
-export HALO_ASYNC_PROGRAMS="${HALO_ASYNC_PROGRAMS:-1}"
+export HALO_ASYNC_PROGRAMS="${HALO_ASYNC_PROGRAMS:-0}"
 export HALO_BUTTON_REMAP=1
 
 # Glibc Allocator Tuning (verhindert Page-Thrashing und Memory-Fragmentation auf 1GB RAM)
@@ -306,7 +307,7 @@ export HALO_DISABLE_DEBUG_DRAWS=1
 export HALO_FAST_ANIMATION_LOD=1
 
 log "VSync AUS (HALO_SWAP_INTERVAL=0, HALO_NO_VSYNC=1)."
-log "GL-Thread=1, Mali Async-Buffers=2, Allocator-Trim=128k, CPU Sleep Bypass=1."
+log "GL-Thread=1, Async-Programs=0 (sicher), Allocator-Trim=128k, CPU Sleep Bypass=1."
 log "Bild- und Detail-Einstellungen kommen aus config.toml & OpenCE Ingame-Menue."
 
 # Debug- und Profiling-Logs sauber deaktivieren (verhindert I/O-Hänger)
@@ -365,7 +366,7 @@ log "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 log "SDL_VIDEODRIVER=$SDL_VIDEODRIVER"
 
 # ══════════════════════════════════════════════════════════════════════
-# LD_DEBUG-Diagnose (HALO_LIBDIAG=1, Default)
+# LD_DEBUG-Diagnose (HALO_LIBDIAG=1, optional)
 # ══════════════════════════════════════════════════════════════════════
 LIBDIAG_LOG="$GAMEDIR/halo-libdiag.txt"
 if [ "${HALO_LIBDIAG:-0}" = "1" ]; then
@@ -374,10 +375,8 @@ if [ "${HALO_LIBDIAG:-0}" = "1" ]; then
     : > "$LIBDIAG_LOG"
 
     if command -v timeout > /dev/null 2>&1; then
-        # timeout ist vorhanden (coreutils)
         ( LD_DEBUG=libs timeout 5 ./halo ) > /dev/null 2>> "$LIBDIAG_LOG" || true
     else
-        # Fallback ohne timeout: Hintergrund-Job + sleep + kill
         ( LD_DEBUG=libs ./halo ) > /dev/null 2>> "$LIBDIAG_LOG" &
         DIAG_PID=$!
         ( sleep 5 && kill -TERM "$DIAG_PID" 2>/dev/null ) &
@@ -401,8 +400,6 @@ if [ "${HALO_LIBDIAG:-0}" = "1" ]; then
 else
     log ""
     log "HALO_LIBDIAG=$HALO_LIBDIAG (Diagnose uebersprungen)."
-    log "Zum Aktivieren: HALO_LIBDIAG=1 in die Umgebung setzen oder"
-    log "die Zeile 'export HALO_LIBDIAG=1' oben in Halo.sh eintragen."
 fi
 
 # ══════════════════════════════════════════════════════════════════════
