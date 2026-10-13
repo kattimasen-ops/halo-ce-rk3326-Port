@@ -162,6 +162,13 @@ done
 compile port/third_party/tomlc17/tomlc17.c -w
 compile build/android/host/host_import_table.c
 
+OPTIONAL_LIBS=""
+for opt_lib in EGL GLESv2; do
+    if [ -f "$OUT/lib/lib${opt_lib}.so" ]; then
+        OPTIONAL_LIBS="$OPTIONAL_LIBS -l${opt_lib}"
+    fi
+done
+
 echo "LINK $OUT/halo (dynamisch, GCC 9)"
 $CC $CFLAGS -o "$OUT/halo" $objects \
     -L"$OUT/lib" \
@@ -169,7 +176,12 @@ $CC $CFLAGS -o "$OUT/halo" $objects \
     -Wl,--allow-shlib-undefined \
     -Wl,--unresolved-symbols=ignore-all \
     -Wl,--as-needed -Wl,--gc-sections \
-    -lSDL2 -lEGL -lGLESv2 -lpthread -ldl -lm
+    -lSDL2 $OPTIONAL_LIBS -lpthread -ldl -lm
+
+if [ ! -f "$OUT/halo" ]; then
+    echo "FEHLER: $OUT/halo konnte nicht erstellt werden!" >&2
+    exit 1
+fi
 
 cp build/android/halo_guest.elf "$OUT/halo_guest.elf"
 
