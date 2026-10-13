@@ -125,67 +125,35 @@ jobs:
           test -d "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64"
           echo "NDK: $ANDROID_NDK"
 
-      - name: "SYSROOT_LIB pruefen und vorbereiten"
+      - name: "SYSROOT_LIB pruefen"
         run: |
           set -e
           echo "== SYSROOT_LIB=$SYSROOT_LIB"
           mkdir -p "$SYSROOT_LIB"
+          ls -la "$SYSROOT_LIB" || true
 
-          # 1. libdecor-0.so.0 Stub fuer Ubuntu 20.04 (GLIBC 2.31 / ArkOS)
-          if [ ! -f "$SYSROOT_LIB/libdecor-0.so.0" ]; then
-            echo "== Erzeuge libdecor-0.so.0 Stub fuer ARM64 ..."
-            aarch64-linux-gnu-gcc -shared -fPIC -Wl,-soname,libdecor-0.so.0 -o "$SYSROOT_LIB/libdecor-0.so.0" -x c - <<'DECOR_EOF'
-void libdecor_new(void) {}
-void libdecor_unref(void) {}
-DECOR_EOF
+          missing=0
+          for lib in libdecor-0.so.0; do
+            if ls "$SYSROOT_LIB/$lib"* > /dev/null 2>&1; then
+              echo "  OK: $lib"
+            else
+              echo "  FEHLT (harte Voraussetzung): $lib"
+              missing=1
+            fi
+          done
+          for lib in libSDL3.so.0 libSDL2-2.0.so.0; do
+            if ls "$SYSROOT_LIB/$lib"* > /dev/null 2>&1; then
+              echo "  OK: $lib"
+            else
+              echo "  HINWEIS: $lib fehlt, build.sh baut sie aus dem Quellcode."
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            echo ""
+            echo "FEHLER: libdecor-0.so.0 muss in sysroot/ liegen."
+            exit 1
           fi
-
-          # 2. libEGL.so.1 Link-Stub falls nicht vorhanden
-          if [ ! -f "$SYSROOT_LIB/libEGL.so.1" ]; then
-            echo "== Erzeuge libEGL.so.1 Link-Stub fuer ARM64 ..."
-            aarch64-linux-gnu-gcc -shared -fPIC -Wl,-soname,libEGL.so.1 -o "$SYSROOT_LIB/libEGL.so.1" -x c - <<'EGL_EOF'
-void eglGetCurrentDisplay(void) {}
-void eglGetCurrentContext(void) {}
-void eglQueryContext(void) {}
-void eglChooseConfig(void) {}
-void eglCreateContext(void) {}
-void eglCreatePbufferSurface(void) {}
-void eglMakeCurrent(void) {}
-void eglGetError(void) {}
-void eglDestroyContext(void) {}
-void eglDestroySurface(void) {}
-void eglSwapBuffers(void) {}
-EGL_EOF
-          fi
-
-          # 3. libGLESv2.so.2 Link-Stub falls nicht vorhanden
-          if [ ! -f "$SYSROOT_LIB/libGLESv2.so.2" ]; then
-            echo "== Erzeuge libGLESv2.so.2 Link-Stub fuer ARM64 ..."
-            aarch64-linux-gnu-gcc -shared -fPIC -Wl,-soname,libGLESv2.so.2 -o "$SYSROOT_LIB/libGLESv2.so.2" -x c - <<'GLES_EOF'
-void glCreateShader(void) {}
-void glShaderSource(void) {}
-void glCompileShader(void) {}
-void glGetShaderiv(void) {}
-void glGetShaderInfoLog(void) {}
-void glDeleteShader(void) {}
-void glAttachShader(void) {}
-void glDetachShader(void) {}
-void glLinkProgram(void) {}
-void glGetProgramiv(void) {}
-void glGetProgramInfoLog(void) {}
-void glGetProgramBinary(void) {}
-void glProgramParameteri(void) {}
-void glFinish(void) {}
-void glFlush(void) {}
-void glActiveTexture(void) {}
-void glGetIntegerv(void) {}
-void glGetTexLevelParameteriv(void) {}
-void glGetTexParameteriv(void) {}
-GLES_EOF
-          fi
-
-          echo "== Inhalt von SYSROOT_LIB:"
-          ls -la "$SYSROOT_LIB"
 
       - name: "rej/-Ordner vorbereiten"
         run: mkdir -p rej
