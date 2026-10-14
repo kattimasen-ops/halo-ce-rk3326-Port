@@ -2,13 +2,15 @@
 set -euo pipefail
 # ======================================================================
 # Halo CE Universal - M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
-# Fix v20:
-#  - -I/usr/include/libdrm in allen cmake-Aufrufen (SDL2+SDL3)
+#
+# Fix v21:
+#  - PKG_CONFIG_SYSROOT_DIR ENTFERNT (prefixte Include-Pfade falsch)
+#  - Keine eigenen .pc-Dateien mehr (systemweite reichen)
 #  - CMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH statt ONLY
-#  - _clang_builtin_shim gibt kompletten Resource-Include-Pfad zurück
+#  - -I/usr/include/libdrm explizit in CFLAGS
+#  - _clang_builtin_shim überschreibt alten Patch statt zu überspringen
 #  - Keine literalen Newlines in Python r'...' Strings
-#  - .pc-Dateien mit includedir=/usr/include
-#  - Fallback: libdrm-Include-Pfad aus pkg-config extrahieren
+#  - SDL2 KMSDRM + Pageflip-Patch verifiziert
 # ======================================================================
 
 PGO_MODE=${PGO_MODE:-use}
@@ -63,61 +65,21 @@ fi
 done
 
 # ======================================================================
-# Fix v20: libdrm-Include-Pfad ermitteln
+# Fix v21: libdrm-Include-Pfad ermitteln
+# KEIN PKG_CONFIG_SYSROOT_DIR (prefixte Pfade falsch)
+# KEINE eigenen .pc-Dateien (systemweite reichen)
 # ======================================================================
 LIBDRM_INCLUDE="/usr/include/libdrm"
 if [ ! -d "$LIBDRM_INCLUDE" ]; then
-  echo "== /usr/include/libdrm existiert nicht, extrahiere Pfad aus pkg-config..."
   LIBDRM_CFLAGS=$(pkg-config --cflags libdrm 2>/dev/null || true)
   if [ -n "$LIBDRM_CFLAGS" ]; then
-    LIBDRM_INCLUDE=$(echo "$LIBDRM_CFLAGS" | grep -oP '(?<=-I)\S+' | head -1)
-    echo "   Gefunden: $LIBDRM_INCLUDE"
+    FOUND_INC=$(echo "$LIBDRM_CFLAGS" | grep -oP '(?<=-I)\S+' | head -1 || true)
+    if [ -n "$FOUND_INC" ] && [ -d "$FOUND_INC" ]; then
+      LIBDRM_INCLUDE="$FOUND_INC"
+    fi
   fi
 fi
-if [ ! -d "$LIBDRM_INCLUDE" ]; then
-  echo "WARNUNG: libdrm-Include-Verzeichnis nicht gefunden, verwende /usr/include"
-  LIBDRM_INCLUDE="/usr/include"
-fi
 echo "== LIBDRM_INCLUDE=$LIBDRM_INCLUDE"
-
-# ======================================================================
-# pkg-config für aarch64 konfigurieren
-# ======================================================================
-echo "== pkg-config für aarch64 konfigurieren..."
-export PKG_CONFIG_PATH=/usr/aarch64-linux-gnu/lib/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig
-export PKG_CONFIG_LIBDIR=/usr/aarch64-linux-gnu/lib/pkgconfig
-export PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu
-
-if [ ! -f /usr/aarch64-linux-gnu/lib/pkgconfig/libdrm.pc ]; then
-    echo "== Erstelle libdrm.pc für aarch64"
-    mkdir -p /usr/aarch64-linux-gnu/lib/pkgconfig
-    cat > /usr/aarch64-linux-gnu/lib/pkgconfig/libdrm.pc << 'EOF'
-prefix=/usr/aarch64-linux-gnu
-exec_prefix=${prefix}
-libdir=${exec_prefix}/lib
-includedir=/usr/include
-Name: libdrm
-Description: Userspace interface to kernel DRM services
-Version: 2.4.107
-Libs: -L${libdir} -ldrm
-Cflags: -I${includedir} -I${includedir}/libdrm
-EOF
-fi
-
-if [ ! -f /usr/aarch64-linux-gnu/lib/pkgconfig/gbm.pc ]; then
-    echo "== Erstelle gbm.pc für aarch64"
-    cat > /usr/aarch64-linux-gnu/lib/pkgconfig/gbm.pc << 'EOF'
-prefix=/usr/aarch64-linux-gnu
-exec_prefix=${prefix}
-libdir=${exec_prefix}/lib
-includedir=/usr/include
-Name: gbm
-Description: Generic Buffer Management
-Version: 21.2.6
-Libs: -L${libdir} -lgbm
-Cflags: -I${includedir}
-EOF
-fi
 
 if [ ! -f "$SYSROOT_LIB/libdecor-0.so.0" ]; then
 echo "== Erzeuge libdecor-0.so.0 Stub für ARM64 ..."
@@ -151,9 +113,7 @@ DIST=$(cd "$DIST" && pwd)
 REJ=$(cd "$REJ" && pwd)
 
 SRC=$WORK/halo-ce-universal
-OPENCE=$WORK/opence
 
-# -- OpenCE-Dateien holen ---------------------------------------------
 fetch_opence_files() {
 local opence_dir="$WORK/opence-source"
 local opence_tarball="$WORK/opence-main.tar.gz"
@@ -273,9 +233,8 @@ PYEOF
 # ======================================================================
 mkdir -p "$SYSROOT_LIB"
 if [ ! -f "$SYSROOT_LIB/libdecor-0.so.0" ] || readelf -s "$SYSROOT_LIB/libdecor-0.so.0" 2>/dev/null | grep -q "GLIBC_2\.3[2-9]"; then
-echo "== Kompiliere libdecor-0.so.0 Stub für Ubuntu 20.04 (GLIBC 2.31 / ArkOS4Clone) ..."
+echo "== Kompiliere libdecor-0.so.0 Stub für Ubuntu 20.04 ..."
 $HOST_CC -shared -fPIC -Wl,-soname,libdecor-0.so.0 -o "$SYSROOT_LIB/libdecor-0.so.0" -x c - <<'DECOR_EOF' || true
-/* libdecor dummy stub for ArkOS4Clone / KMSDRM where Wayland is not used */
 void libdecor_new(void) {}
 void libdecor_unref(void) {}
 DECOR_EOF
@@ -283,6 +242,7 @@ fi
 
 # ======================================================================
 # SDL3 (nur bauen, wenn .so fehlt)
+# Fix v21: CMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH, -I$LIBDRM_INCLUDE
 # ======================================================================
 if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
 echo "== SDL3 $SDL3_TAG: kompiliere aus dem Quellcode (GCC, shared)"
@@ -296,12 +256,6 @@ curl -L -o "$WORK/sdl3.tar.gz" \
 tar -xzf "$WORK/sdl3.tar.gz" -C "$WORK"
 fi
 
-# SDL3 3.2.10 ruft drmModeGetConnectorTypeName auf. Die Funktion
-# wurde erst in libdrm 2.4.112 eingeführt; Ubuntu 20.04 hat
-# 2.4.110. Der SDL3-Header wird um eine extern-Deklaration ergänzt,
-# damit GCC den Header durchläuft. SDL3 lädt die Funktion zur
-# Laufzeit über SDL_KMSDRM_SYM_OPT und akzeptiert ein fehlendes
-# Symbol.
 echo "== SDL3 KMSDRM: libdrm-2.4.110-Kompatibilität anwenden"
 python3 - "$SDL3_SRC/src/video/kmsdrm/SDL_kmsdrmsym.h" <<'KMSDRM_EOF'
 import sys
@@ -358,7 +312,8 @@ echo "== libSDL3.so.0 bereits vorhanden"
 fi
 
 # ======================================================================
-# SDL2
+# SDL2 mit KMSDRM + Pageflip-Patch
+# Fix v21: CMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH, -I$LIBDRM_INCLUDE
 # ======================================================================
 SDL2_SRC=$WORK/SDL2-src
 SDL2_BUILD=$WORK/sdl2-build
@@ -381,7 +336,6 @@ curl -L -o "$WORK/sdl2.tar.gz" "$SDL2_ARCHIVE"
 tar -xzf "$WORK/sdl2.tar.gz" -C "$SDL2_SRC" --strip-components=1
 
 echo "== SDL2 KMSDRM Pageflip-Patch für Mali-G31 anwenden"
-set +e
 python3 - "$SDL2_SRC/src/video/kmsdrm/SDL_kmsdrmopengles.c" <<'PATCH_EOF'
 import sys, re
 path = sys.argv[1]
@@ -436,7 +390,6 @@ with open(path, 'w') as f:
     f.write(text)
 print("SDL2 KMSDRM Pageflip-Patch angewendet")
 PATCH_EOF
-set -e
 
 cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
 -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
@@ -678,7 +631,6 @@ wait_old = (
     '\t\t\tbreak;\n'
     '\t\t}'
 )
-
 wait_new = (
     '\tif (alertable && platform_run_apcs())\n'
     '\t\t{\n'
@@ -709,7 +661,6 @@ wait_new = (
     '\t\t\tbreak;\n'
     '\t\t}'
 )
-
 if wait_old not in text:
     print("WARNUNG: WaitForSingleObjectEx-Muster nicht gefunden.")
 else:
@@ -729,7 +680,6 @@ sleep_old = (
     '\t\treturn WAIT_IO_COMPLETION;\n'
     '\treturn 0;'
 )
-
 sleep_new = (
     '\tif (milliseconds == INFINITE)\n'
     '\t{\n'
@@ -760,7 +710,6 @@ sleep_new = (
     '\t}\n'
     '\treturn 0;'
 )
-
 if sleep_old not in text:
     print("WARNUNG: SleepEx-Muster nicht gefunden.")
 else:
@@ -782,7 +731,6 @@ with open(path) as f:
 
 old_mcpu = '"-mcpu=cortex-a53"'
 new_mcpu = '"-mcpu=cortex-a35",\n"-mtune=cortex-a35"'
-
 if text.count(old_mcpu) > 0:
     text = text.replace(old_mcpu, new_mcpu)
     print("android_build.py: mcpu=cortex-a53 -> cortex-a35")
@@ -798,7 +746,6 @@ new_flags = (
     '"-fmerge-all-constants",\n'
     '"-fno-strict-aliasing",'
 )
-
 if old_flags in text:
     text = text.replace(old_flags, new_flags, 1)
     print("android_build.py: O2 -> O3 + Flags")
@@ -815,39 +762,25 @@ import sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
-
 if '"-DHALO_ANDROID"' in text:
     sys.exit(0)
-
 anchor = '"-DHALO_RELEASE"'
 if anchor in text:
     text = text.replace(anchor, '"-DHALO_ANDROID",\n"-DHALO_RELEASE"', 1)
-
 with open(path, 'w') as f:
     f.write(text)
 print("android_build.py: -DHALO_ANDROID")
 PYEOF
 
 # ======================================================================
-# Fix v20: clang-Builtin-Shim (kompletter Resource-Include-Pfad)
+# Fix v21: clang-Builtin-Shim — überschreibt alten Patch statt zu
+# überspringen. Gibt den kompletten Resource-Include-Pfad zurück.
 # ======================================================================
 python3 - "$SRC/tools/android_build.py" <<'PYEOF'
 import re, sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
-
-if "_clang_builtin_shim" in text:
-    sys.exit(0)
-
-anchor = (
-    '    for sdk in (Path.home() / "Android/Sdk", Path("/opt/android-sdk")):\n'
-    '        if (sdk / "ndk").is_dir():\n'
-    '            versions = sorted((sdk / "ndk").iterdir())\n'
-    '            if versions:\n'
-    '                return versions[-1]\n'
-    '    return None\n'
-)
 
 new_fn = (
     'def _clang_builtin_shim(cc: str) -> list:\n'
@@ -862,9 +795,33 @@ new_fn = (
     '    return ["-isystem", str(include)]\n'
 )
 
-if anchor in text:
-    text = text.replace(anchor, anchor + "\n" + new_fn, 1)
-    text = text.replace("_clang_resource_include(guest_cc)", "_clang_builtin_shim(guest_cc)")
+# Alten _clang_builtin_shim entfernen, falls vorhanden
+old_pattern = re.compile(
+    r'def _clang_builtin_shim\(cc: str\) -> list:.*?(?=\ndef |\nclass |\Z)',
+    re.DOTALL,
+)
+if old_pattern.search(text):
+    text = old_pattern.sub(new_fn, text, count=1)
+    print("clang-Builtin-Shim: alter Patch überschrieben (kompletter Include-Pfad)")
+else:
+    anchor = (
+        '    for sdk in (Path.home() / "Android/Sdk", Path("/opt/android-sdk")):\n'
+        '        if (sdk / "ndk").is_dir():\n'
+        '            versions = sorted((sdk / "ndk").iterdir())\n'
+        '            if versions:\n'
+        '                return versions[-1]\n'
+        '    return None\n'
+    )
+    if anchor in text:
+        text = text.replace(anchor, anchor + "\n" + new_fn, 1)
+        print("clang-Builtin-Shim: neu eingefügt (kompletter Include-Pfad)")
+    else:
+        print("WARNUNG: Anker für _clang_builtin_shim nicht gefunden.")
+
+text = text.replace(
+    "_clang_resource_include(guest_cc)",
+    "_clang_builtin_shim(guest_cc)",
+)
 
 if "guest_abi = " in text and "_clang_builtin_shim(guest_cc)" not in text:
     text = re.sub(
@@ -873,8 +830,6 @@ if "guest_abi = " in text and "_clang_builtin_shim(guest_cc)" not in text:
         text,
         count=1,
     )
-
-print("clang-Builtin-Shim eingebaut (kompletter Resource-Include-Pfad)")
 
 with open(path, 'w') as f:
     f.write(text)
@@ -886,14 +841,11 @@ import sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
-
 if "-fprofile-instr-generate" in text:
     sys.exit(0)
-
 for old in ('"-O3",', '"-O3"'):
     if old in text:
         text = text.replace(old, old.replace('"-O3"', '"-O3",\n"-fprofile-instr-generate"'), 1)
-
 with open(path, 'w') as f:
     f.write(text)
 print("android_build.py: -fprofile-instr-generate")
@@ -905,10 +857,8 @@ import sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
-
 if "guest_profile_runtime" in text:
     sys.exit(0)
-
 old = (
     '    n.rule(\n'
     '        name="android_guest_link",\n'
@@ -916,7 +866,6 @@ old = (
     '                 f"-Map $out.map -o $out @$out.rsp {libguestc} "\n'
     '                 "$$($android_host_cc -print-libgcc-file-name)"),'
 )
-
 new = (
     '    guest_profile_runtime = ""\n'
     '    for _cc_candidate in (guest_cc, str(ndk_bin / "clang")):\n'
@@ -942,10 +891,8 @@ new = (
     '                 f"-Map $out.map -o $out @$out.rsp {libguestc} {guest_profile_runtime} "\n'
     '                 "$$($android_host_cc -print-libgcc-file-name)"),'
 )
-
 if old in text:
     text = text.replace(old, new, 1)
-
 with open(path, 'w') as f:
     f.write(text)
 print("android_build.py: Profiling-Runtime zum Link")
@@ -960,10 +907,8 @@ import sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
-
 if 'OPTIMISATION = "-O3"' not in text:
     text = text.replace('OPTIMISATION = "-O2"', 'OPTIMISATION = "-O3"')
-
 old_abi = '"-ffp-contract=off",\nOPTIMISATION,'
 new_abi = (
     '"-ffp-contract=off",\n'
@@ -974,10 +919,8 @@ new_abi = (
     '"-fno-strict-aliasing",\n'
     'OPTIMISATION,'
 )
-
 if old_abi in text:
     text = text.replace(old_abi, new_abi, 1)
-
 with open(path, "w") as f:
     f.write(text)
 print("linux_build.py geprüft")
@@ -1039,16 +982,13 @@ import re, sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
-
 if "fps_overlay_enabled" not in text:
     sys.exit(0)
-
 pattern = re.compile(r'glUniform4f\(\s*fps_overlay_color\s*,\s*([^;]+?)\s*\)\s*;')
 new_text = pattern.sub(
     lambda m: '{ const float overlay_color[4] = { ' + m.group(1).strip() + ' }; '
               'glUniform4fv(fps_overlay_color, 1, overlay_color); }',
     text)
-
 if new_text != text:
     with open(path, "w") as f:
         f.write(new_text)
@@ -1067,14 +1007,11 @@ try:
 except ImportError as e:
     print(f"  HINWEIS: port_settings.py nicht importierbar ({e}).")
     sys.exit(0)
-
 if not hasattr(port_settings, "settings_files"):
     sys.exit(0)
-
 files = port_settings.settings_files()
 target_dir = os.path.join(src, "port", "assets", "menus", "ce")
 os.makedirs(target_dir, exist_ok=True)
-
 for name, lines in files.items():
     path = os.path.join(target_dir, name)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1216,7 +1153,7 @@ cat "$HERE/patches/$p" 2>/dev/null || true
 done
 [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
 echo "pgo-mode=$PGO_MODE"
-echo "gcc9-host-dynamic=v20-libdrm-include-arm-neon-fix"
+echo "gcc9-host-dynamic=v21-pkgconfig-sysroot-removed"
 (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 
@@ -1293,7 +1230,8 @@ fi
 
 cat <<'RELEASE'
 --------------------------------------------------------------------
-BUILD v20 - libdrm-Include-Pfad + arm_neon.h Fix
+BUILD v21 - PKG_CONFIG_SYSROOT_DIR entfernt, INCLUDE=BOTH,
+            clang_builtin_shim überschreibt alten Patch
 --------------------------------------------------------------------
 Installation auf M9 Pro:
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
