@@ -91,21 +91,19 @@ void host_gl_timing_report(uint32_t frames);
 /* the GL thread's own operations' time (host_glthread.c) */
 void glthread_timing_report(uint32_t frames);
 
-/* the generic timer: its count, and its counts a second */
+#include <time.h>
+
+/* monotonic timer: nanoseconds, and 1e9 ticks a second (safe on Cortex-A35 / RK3326 ArkOS) */
 static inline uint64_t host_ticks(void)
 {
-	uint64_t value;
-
-	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(value) :: "memory");
-	return value;
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
 }
 
 static inline uint64_t host_tick_frequency(void)
 {
-	uint64_t value;
-
-	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(value));
-	return value;
+	return 1000000000ULL;
 }
 
 #endif
