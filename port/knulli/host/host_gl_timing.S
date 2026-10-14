@@ -17,36 +17,8 @@ left it for arguments passed there.
 	.type	host_gl_timing_common, %function
 	.p2align 4
 host_gl_timing_common:
-	adrp	x15, host_gl_timing_save
-	add	x15, x15, :lo12:host_gl_timing_save
-	str	x30, [x15, #0]
-	str	x16, [x15, #8]
-	isb
-	mrs	x17, cntvct_el0
-	str	x17, [x15, #16]
 	ldr	x17, [x16, #0]
-	blr	x17
-	isb
-	mrs	x9, cntvct_el0
-	adrp	x15, host_gl_timing_save
-	add	x15, x15, :lo12:host_gl_timing_save
-	ldr	x10, [x15, #16]
-	sub	x9, x9, x10
-	ldr	x16, [x15, #8]
-	ldr	x10, [x16, #16]
-	add	x10, x10, x9
-	str	x10, [x16, #16]
-	ldr	x10, [x16, #8]
-	add	x10, x10, #1
-	str	x10, [x16, #8]
-	ldr	x30, [x15, #0]
-	ldr	x10, [x16, #24]
-	cmp	x9, x10
-	b.ls	1f
-	str	x9, [x16, #24]
-	str	x30, [x16, #32]
-1:
-	ret
+	br	x17
 	.size	host_gl_timing_common, .-host_gl_timing_common
 
 	.bss
