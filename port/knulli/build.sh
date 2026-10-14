@@ -1,52 +1,44 @@
 #!/bin/sh
-# Builds the Knulli port into build/knulli:
-#   halo            the aarch64 glibc host (the loader, SDL2, OpenGL ES)
-#   halo_guest.elf  the game, the Android port's guest image
-#   libs.aarch64/   die Laufzeitbibliotheken
-#
-# POSIX-sh-kompatibel (dash): set -eu statt set -euo pipefail.
-#
-# Host-Compiler: aarch64-linux-gnu-gcc (GCC 9.4 aus Ubuntu 20.04).
-# GCC 9 ist von Natur aus ARMv8.0-kompatibel — er erzeugt keine
-# LSE-Atomics und ruft die glibc-Pfade, die sie enthalten, nicht auf.
-# Damit tritt der SIGILL auf dem Cortex-A35 nicht auf.
-#
-# libmali wird NICHT gelinkt (die sysroot-libmali.so.0 ist beschaedigt);
-# die EGL/GLES-Symbole bleiben undefiniert und werden zur Laufzeit aus
-# /tmp/halo-mali geladen.
 set -eu
 
-folder() {
-    mkdir -p "$1" 2>/dev/null || true
-    resolved=$(cd "$1" && pwd) || { echo "build.sh: $1: no such folder" >&2; exit 1; }
-    case "$resolved" in
-        *" "*) echo "build.sh: $resolved: a path with spaces is not supported" >&2; exit 1 ;;
-    esac
-    echo "$resolved"
-}
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+cd "$ROOT"
 
-SDL2_INCLUDE=$(folder "${SDL2_INCLUDE:?the folder that holds SDL2/SDL.h}")
-SYSROOT_LIB=$(folder "${SYSROOT_LIB:?the device libraries}")
-NDK=$(folder "${ANDROID_NDK:?the Android NDK (for the OpenGL ES and EGL headers)}")
-
-cd "$(dirname "$0")/../.."
-ROOT=$(folder .)
-CC=${CC:-aarch64-linux-gnu-gcc}
-JOBS=${JOBS:-$(nproc)}
 OUT=build/knulli
 OBJ=$OUT/obj
+mkdir -p "$OUT/lib" "$OUT/libs.aarch64" "$OUT/gl_include" "$OBJ"
+
+CC=${CC:-gcc}
+JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
+SDL2_INCLUDE=${SDL2_INCLUDE:-/usr/include/SDL2}
+SYSROOT_LIB=${SYSROOT_LIB:-/usr/lib}
+ANDROID_NDK=${ANDROID_NDK:-}
+
+KHRONOS=$OUT/gl_include
+rm -rf "$KHRONOS"
+mkdir -p "$KHRONOS/KHR" "$KHRONOS/GLES2" "$KHRONOS/GLES3" "$KHRONOS/EGL"
+KHRONOS_SRC=
+if [ -n "$ANDROID_NDK" ] && [ -d "$ANDROID_NDK/toolchains/llvm/prebuilt" ]; then
+    KHRONOS_SRC=$(find "$ANDROID_NDK/toolchains/llvm/prebuilt" -type d -path '*/sysroot/usr/include' 2>/dev/null | head -n 1)
+fi
+if [ -n "$KHRONOS_SRC" ] && [ -d "$KHRONOS_SRC/GLES3" ]; then
+    cp -r "$KHRONOS_SRC/KHR/"*   "$KHRONOS/KHR/"   2>/dev/null || true
+    cp -r "$KHRONOS_SRC/GLES2/"* "$KHRONOS/GLES2/" 2>/dev/null || true
+    cp -r "$KHRONOS_SRC/GLES3/"* "$KHRONOS/GLES3/" 2>/dev/null || true
+    cp -r "$KHRONOS_SRC/EGL/"*   "$KHRONOS/EGL/"   2>/dev/null || true
+else
+    echo "build.sh: using system Khronos headers" >&2
+    for dir in /usr/include /usr/local/include; do
+        [ -d "$dir/KHR" ]   && cp -r "$dir/KHR/"*   "$KHRONOS/KHR/"   2>/dev/null || true
+        [ -d "$dir/GLES2" ] && cp -r "$dir/GLES2/"* "$KHRONOS/GLES2/" 2>/dev/null || true
+        [ -d "$dir/GLES3" ] && cp -r "$dir/GLES3/"* "$KHRONOS/GLES3/" 2>/dev/null || true
+        [ -d "$dir/EGL" ]   && cp -r "$dir/EGL/"*   "$KHRONOS/EGL/"   2>/dev/null || true
+    done
+fi
 
 ninja -j "$JOBS" build/android/halo_guest.elf build/android/host/host_import_table.c
-mkdir -p "$OBJ" "$OUT/gl_include" "$OUT/lib" "$OUT/libs.aarch64"
 
-KHRONOS=$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include
-for name in EGL GLES2 GLES3 KHR; do
-    ln -sfn "$KHRONOS/$name" "$OUT/gl_include/$name"
-done
-
-echo "== Inhalt von SYSROOT_LIB=$SYSROOT_LIB:"
-ls -la "$SYSROOT_LIB" || true
-
+# --- KNULLI SO-DEPENDENCIES ---
 echo "== Kopiere Laufzeitbibliotheken nach $OUT/libs.aarch64/"
 copy_runtime_lib() {
     prefix=$1
@@ -93,7 +85,7 @@ CFLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -fPIC -Wall -Wno-unused-function 
         -D_GNU_SOURCE -DEGL_NO_X11 -DMESA_EGL_NO_X11_HEADERS \
         -DHALO_ANDROID \
         -mno-outline-atomics \
-        -flto -fomit-frame-pointer -ffunction-sections -fdata-sections \
+        -fomit-frame-pointer -ffunction-sections -fdata-sections \
         -fno-plt -fno-semantic-interposition"
 
 CFLAGS="$CFLAGS -ffile-prefix-map=$ROOT=. -ffile-prefix-map=$SDL2_INCLUDE=sdl2"
@@ -178,13 +170,6 @@ cp build/android/halo_guest.elf "$OUT/halo_guest.elf"
 
 echo "== Host-Binary:"
 if command -v file > /dev/null 2>&1; then
-    file "$OUT/halo" || true
+    file "$OUT/halo"
 fi
-ls -l "$OUT/halo"
-HOST_SIZE=$(stat -c%s "$OUT/halo")
-echo "  Groesse: $HOST_SIZE Bytes"
-
-echo "== Inhalt von $OUT/libs.aarch64/:"
-ls -la "$OUT/libs.aarch64/"
-echo "== $OUT/halo und $OUT/halo_guest.elf:"
-ls -l "$OUT/halo" "$OUT/halo_guest.elf"
+ls -lh "$OUT/halo"
