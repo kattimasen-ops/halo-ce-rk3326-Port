@@ -4,10 +4,15 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════
 # Halo CE Universal — M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
+# Fix v13 (SDL3 KMSDRM auf libdrm 2.4.110):
+#  - SDL3 3.2.10 verlangt drmModeGetConnectorTypeName, das erst
+#    libdrm 2.4.112 einfuehrt. Ubuntu 20.04 hat 2.4.110. Der SDL3-Header
+#    bekommt eine extern-Deklaration, damit GCC durchlaeuft; SDL3 laedt
+#    die Funktion zur Laufzeit und akzeptiert ein fehlendes Symbol.
+#
 # Fix v12 (DIAGNOSE):
-#  - patch_gl_init_order.py v7 wird VOR dem Build aufgerufen und fuegt
-#    Log-Zeilen in host_glthread.c ein. Damit sehen wir, ob der SIGILL
-#    auf dem Hauptthread oder dem GL-Thread sitzt.
+#  - patch_gl_init_order.py wird VOR dem Build aufgerufen und fuegt
+#    Log-Zeilen in host_glthread.c ein.
 #
 # Fix v11: Dispatcher-Bereich in patch_settings_only.py korrigiert.
 # Fix v7:  -mno-outline-atomics entfernt, CMAKE_CXX_COMPILER gesetzt.
@@ -18,7 +23,6 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/cybersecurity/halo-ce-universal.git}
 UPSTREAM_COMMIT=$(tr -d '[:space:]' < "$HERE/UPSTREAM_COMMIT")
 PATCH=$HERE/patches/halo-ce-universal-knulli.patch
-[ -f "$PATCH" ] || PATCH=$HERE/patches/halo-ce-universal-knulli.patch
 SDL3_TAG=release-3.2.10
 SDL2_TAG=release-2.30.10
 SDL2_ARCHIVE=https://github.com/libsdl-org/SDL/archive/refs/tags/$SDL2_TAG.tar.gz
@@ -37,6 +41,7 @@ need ninja "install ninja-build"
 need curl "install curl"
 need tar "install tar"
 need cmake "install cmake"
+need pkg-config "install pkg-config"
 need "$HOST_CC" "install gcc-aarch64-linux-gnu, or set HOST_CC"
 need "$HOST_CXX" "install g++-aarch64-linux-gnu, or set HOST_CXX"
 need "$GUEST_CC" "install clang-22 from apt.llvm.org, or set GUEST_CC"
@@ -48,6 +53,14 @@ ANDROID_NDK=$(cd "$ANDROID_NDK" && pwd)
 [ -n "${SYSROOT_LIB:-}" ] || die "set SYSROOT_LIB to the folder with the runtime libraries"
 mkdir -p "$SYSROOT_LIB" 2>/dev/null || true
 SYSROOT_LIB=$(cd "$SYSROOT_LIB" && pwd)
+
+# Ohne diese Pakete deaktiviert SDL2/SDL3 den KMSDRM-Backend still und baut
+# ohne Fensterunterstuetzung (kmsdrm not available zur Laufzeit).
+for module in libdrm gbm; do
+    if ! pkg-config --exists "$module"; then
+        die "pkg-config findet '$module' nicht. Installiere libdrm-dev und libgbm-dev."
+    fi
+done
 
 # libdecor-0.so.0 Stub erzeugen falls noch nicht vorhanden
 if [ ! -f "$SYSROOT_LIB/libdecor-0.so.0" ]; then
@@ -198,13 +211,13 @@ print("  XML-Hunk entfernt; Patch ist jetzt %d Bytes kleiner." % (len(text) - le
 PYEOF
 
 # ══════════════════════════════════════════════════════════════════════
-# libdecor-0.so.0 (Stub fuer GLIBC 2.31 / ArkOS)
+# libdecor-0.so.0 (Stub fuer GLIBC 2.30 / ArkOS4Clone)
 # ══════════════════════════════════════════════════════════════════════
 mkdir -p "$SYSROOT_LIB"
 if [ ! -f "$SYSROOT_LIB/libdecor-0.so.0" ] || readelf -s "$SYSROOT_LIB/libdecor-0.so.0" 2>/dev/null | grep -q "GLIBC_2\.3[2-9]"; then
-    echo "== Kompiliere libdecor-0.so.0 Stub fuer Ubuntu 20.04 (GLIBC 2.31 / ArkOS) ..."
+    echo "== Kompiliere libdecor-0.so.0 Stub fuer Ubuntu 20.04 (GLIBC 2.31 / ArkOS4Clone) ..."
     $HOST_CC -shared -fPIC -Wl,-soname,libdecor-0.so.0 -o "$SYSROOT_LIB/libdecor-0.so.0" -x c - <<'DECOR_EOF' || true
-/* libdecor dummy stub for ArkOS / KMSDRM where Wayland is not used */
+/* libdecor dummy stub for ArkOS4Clone / KMSDRM where Wayland is not used */
 void libdecor_new(void) {}
 void libdecor_unref(void) {}
 DECOR_EOF
@@ -223,6 +236,36 @@ if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
             "https://github.com/libsdl-org/SDL/releases/download/$SDL3_TAG/SDL3-${SDL3_TAG#release-}.tar.gz"
         tar -xzf "$WORK/sdl3.tar.gz" -C "$WORK"
     fi
+
+    # SDL3 3.2.10 ruft drmModeGetConnectorTypeName auf. Die Funktion
+    # wurde erst in libdrm 2.4.112 eingefuehrt; Ubuntu 20.04 hat
+    # 2.4.110. Der SDL3-Header wird um eine extern-Deklaration ergaenzt,
+    # damit GCC den Header durchlaeuft. SDL3 laedt die Funktion zur
+    # Laufzeit ueber SDL_KMSDRM_SYM_OPT und akzeptiert ein fehlendes
+    # Symbol.
+    echo "== SDL3 KMSDRM: libdrm-2.4.110-Kompatibilitaet anwenden"
+    python3 - "$SDL3_SRC/src/video/kmsdrm/SDL_kmsdrmsym.h" <<'KMSDRM_EOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+if "extern const char *drmModeGetConnectorTypeName" in text:
+    print("  SDL3 KMSDRM: Kompatibilitaets-Deklaration bereits vorhanden.")
+    sys.exit(0)
+decl = (
+    "/* SDL3 on libdrm < 2.4.112: drmModeGetConnectorTypeName fehlt in den\n"
+    "   libdrm-Headern von Ubuntu 20.04 (2.4.110). Diese Deklaration\n"
+    "   macht den Header fuer GCC gueltig; SDL3 laedt das Symbol zur\n"
+    "   Laufzeit und akzeptiert ein fehlendes (SDL_KMSDRM_SYM_OPT). */\n"
+    "extern const char *drmModeGetConnectorTypeName(uint32_t connector_type);\n"
+    "\n"
+)
+text = decl + text
+with open(path, 'w') as f:
+    f.write(text)
+print("  SDL3 KMSDRM: Kompatibilitaets-Deklaration hinzugefuegt.")
+KMSDRM_EOF
+
     rm -rf "$SDL3_BUILD" "$SDL3_INSTALL"
     mkdir -p "$SDL3_BUILD" "$SDL3_INSTALL"
     cmake -S "$SDL3_SRC" -B "$SDL3_BUILD" \
@@ -576,7 +619,7 @@ wait_new = '''\tif (alertable && platform_run_apcs())
 \t\t\t{
 \t\t\t\tpthread_mutex_unlock(&handle->lock);
 \t\t\t\treturn WAIT_IO_COMPLETION;
-\t\t}
+\t\t\t}
 \t\t\tif (!handle_try_acquire(handle))
 \t\t\t\tresult = WAIT_TIMEOUT;
 \t\t\tbreak;
@@ -826,7 +869,7 @@ rm -rf "$SRC/port/knulli/__pycache__"
 chmod +x "$SRC/port/knulli/build.sh" 2>/dev/null || true
 
 # ══════════════════════════════════════════════════════════════════════
-# DIAGNOSE (v7): Logging in host_glthread.c einfuegen
+# DIAGNOSE: Logging in host_glthread.c einfuegen
 # ══════════════════════════════════════════════════════════════════════
 # Diesen Block nach dem Test wieder entfernen.
 if [ -f "$HERE/patches/patch_gl_init_order.py" ]; then
@@ -1036,7 +1079,7 @@ stamp=$({
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v12-diag"
+    echo "gcc9-host-dynamic=v13-sdl3-kmsdrm-fix"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
@@ -1108,7 +1151,7 @@ fi
 cat <<'RELEASE'
 
 ────────────────────────────────────────────────────────────────────────
-DIAGNOSE-BUILD v12 — Logging in host_glthread.c
+BUILD v13 — SDL3 KMSDRM auf libdrm 2.4.110
 ────────────────────────────────────────────────────────────────────────
 Installation auf M9 Pro:
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
@@ -1119,8 +1162,7 @@ Installation auf M9 Pro:
 WICHTIG: Der neue Build hat eine ANDERE BuildID als der vorherige!
 Vor dem Start pruefen:
   readelf -n /roms/ports/halo-ce/halo | grep -i build
-Die BuildID muss sich von der vorherigen (760f40be...) unterscheiden.
-Falls nicht: der neue Build wurde nicht deployt.
+Falls die BuildID gleich bleibt, wurde nicht deployt.
 
 FERTIG.
 ────────────────────────────────────────────────────────────────────────
