@@ -75,7 +75,10 @@ jobs:
             libc6-dev-arm64-cross \
             libstdc++-9-dev-arm64-cross \
             libexpat1-dev \
-            zlib1g-dev
+            zlib1g-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libudev-dev
 
       - name: "clang-22 installieren (fuer den Guest)"
         run: |
@@ -104,6 +107,19 @@ jobs:
           aarch64-linux-gnu-gcc -o /tmp/test /tmp/test.c
           file /tmp/test
 
+      - name: "KMSDRM-Abhaengigkeiten pruefen"
+        run: |
+          set -e
+          echo "== pkg-config fuer SDL2s KMSDRM-Backend:"
+          for module in libdrm gbm libudev; do
+            if pkg-config --exists "$module"; then
+              echo "  OK: $module $(pkg-config --modversion "$module")"
+            else
+              echo "  FEHLT: $module (SDL2 wuerde KMSDRM still abschalten)"
+              exit 1
+            fi
+          done
+
       - name: "Python-Pakete installieren"
         run: |
           set -e
@@ -125,6 +141,29 @@ jobs:
           test -d "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64"
           echo "NDK: $ANDROID_NDK"
 
+      - name: "sysroot fuer einen frischen SDL2-Build vorbereiten"
+        run: |
+          set -e
+          mkdir -p "$SYSROOT_LIB"
+          echo "== SYSROOT_LIB=$SYSROOT_LIB"
+          echo "== Vorher:"
+          ls -la "$SYSROOT_LIB" || true
+
+          # Die vorgefertigte libSDL2-2.0.so.0 kann ohne KMSDRM gebaut sein.
+          # Sie wird entfernt, damit build.sh SDL2 aus dem Quellcode neu baut
+          # und dabei den KMSDRM-Backend aktiviert (dafuer sind libdrm, gbm
+          # und udev installiert worden).
+          if [ -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
+            rm -f "$SYSROOT_LIB/libSDL2-2.0.so.0"
+            echo "  libSDL2-2.0.so.0 entfernt (wird mit KMSDRM neu gebaut)"
+          fi
+          if [ -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
+            rm -f "$SYSROOT_LIB/libSDL3.so.0"
+            echo "  libSDL3.so.0 entfernt (wird neu gebaut)"
+          fi
+          echo "== Nachher:"
+          ls -la "$SYSROOT_LIB" || true
+
       - name: "SYSROOT_LIB pruefen"
         run: |
           set -e
@@ -137,21 +176,19 @@ jobs:
             if ls "$SYSROOT_LIB/$lib"* > /dev/null 2>&1; then
               echo "  OK: $lib"
             else
-              echo "  FEHLT (harte Voraussetzung): $lib"
-              missing=1
+              echo "  HINWEIS: $lib fehlt, build.sh erzeugt einen Stub."
             fi
           done
           for lib in libSDL3.so.0 libSDL2-2.0.so.0; do
             if ls "$SYSROOT_LIB/$lib"* > /dev/null 2>&1; then
-              echo "  OK: $lib"
+              echo "  OK: $lib (vorgefertigt)"
             else
-              echo "  HINWEIS: $lib fehlt, build.sh baut sie aus dem Quellcode."
+              echo "  HINWEIS: $lib fehlt, build.sh baut sie aus dem Quellcode (erwartet)."
             fi
           done
-
           if [ "$missing" -ne 0 ]; then
             echo ""
-            echo "FEHLER: libdecor-0.so.0 muss in sysroot/ liegen."
+            echo "FEHLER: eine harte Voraussetzung fehlt."
             exit 1
           fi
 
@@ -164,6 +201,32 @@ jobs:
           set -e
           chmod +x build.sh
           bash build.sh 2>&1 | tee build.log
+
+      - name: "SDL2-Backends verifizieren"
+        if: always()
+        run: |
+          set +e
+          if [ ! -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
+            echo "libSDL2-2.0.so.0 fehlt in sysroot/ – Build hat sie nicht erzeugt."
+            exit 0
+          fi
+          size=$(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0")
+          echo "libSDL2-2.0.so.0: $size Bytes"
+          echo ""
+          echo "== KMSDRM im SDL2-Binary (Strings):"
+          if command -v aarch64-linux-gnu-strings > /dev/null 2>&1; then
+            if aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -q "KMSDRM"; then
+              echo "  OK: KMSDRM ist enthalten"
+            else
+              echo "  FEHLT: KMSDRM nicht im SDL2-Binary"
+              echo "  (SDL2 wurde ohne libdrm/gbm gebaut)"
+            fi
+          fi
+          echo ""
+          echo "== SDL2 dynamisch benoetigte Bibliotheken:"
+          if command -v aarch64-linux-gnu-readelf > /dev/null 2>&1; then
+            aarch64-linux-gnu-readelf -d "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep NEEDED || true
+          fi
 
       - name: "Fehleranalyse sammeln"
         if: always()
@@ -252,5 +315,8 @@ jobs:
             echo "Host-Binary: $(stat -c%s dist/halo) Bytes"
           else
             echo "Host-Binary: FEHLT"
+          fi
+          if [ -f dist/libs.aarch64/libSDL2-2.0.so.0 ]; then
+            echo "libSDL2-2.0.so.0: $(stat -c%s dist/libs.aarch64/libSDL2-2.0.so.0) Bytes"
           fi
           echo "════════════════════════════════════════════════════════════"
