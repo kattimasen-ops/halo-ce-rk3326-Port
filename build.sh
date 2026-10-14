@@ -4,13 +4,7 @@ set -euo pipefail
 # ======================================================================
 # Halo CE Universal - M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
-# Fix v14 (Multiarch libdrm/libgbm):
-#  - Der Container bekommt ueber den Workflow aarch64-Versionen von
-#    libdrm.so und libgbm.so unter /usr/aarch64-linux-gnu/lib. Der
-#    SDL2-KMSDRM-Build findet sie dort.
-#  - build.sh prueft, dass diese aarch64-Symlinks vorhanden sind.
-#
-# Fix v15 (Guest-Build: size_t-Kollision beheben):
+# Fix v15 (Guest-Build: size_t-Kollision beheben + Diagnose):
 #  - Der Guest-Build darf clangs Resource-Include-Verzeichnis NICHT
 #    ueber -isystem einbinden. Es enthaelt clangs __stddef_size_t.h,
 #    das mit musls alltypes.h kollidiert (arm64_32 / ILP32).
@@ -19,6 +13,16 @@ set -euo pipefail
 #    arm_bf16.h) verwendet.
 #  - Nach configure.py wird build.ninja geprueft und ein etwaiger
 #    -isystem /usr/lib/llvm-22/lib/clang/22/include entfernt.
+#  - Die Sanity-Pruefung in android_build.py ignoriert jetzt
+#    Kommentare/Docstrings und prueft nur echte String-Literale.
+#  - Die gepatchte android_build.py wird nach rej/ kopiert, damit
+#    man im Artifact nachvollziehen kann, was tatsaechlich drinsteht.
+#
+# Fix v14 (Multiarch libdrm/libgbm):
+#  - Der Container bekommt ueber den Workflow aarch64-Versionen von
+#    libdrm.so und libgbm.so unter /usr/aarch64-linux-gnu/lib. Der
+#    SDL2-KMSDRM-Build findet sie dort.
+#  - build.sh prueft, dass diese aarch64-Symlinks vorhanden sind.
 #
 # Fix v13 (SDL3 KMSDRM auf libdrm 2.4.110):
 #  - SDL3 3.2.10 verlangt drmModeGetConnectorTypeName, das erst
@@ -71,17 +75,22 @@ SYSROOT_LIB=$(cd "$SYSROOT_LIB" && pwd)
 
 # Ohne diese Pakete deaktiviert SDL2 den KMSDRM-Backend still und baut
 # ohne Fensterunterstuetzung (kmsdrm not available zur Laufzeit).
-for module in libdrm gbm; do
+# egl ist zwingend: ohne EGL-Header/Lib baut SDL2 KMSDRM gar nicht.
+for module in libdrm gbm egl; do
     if ! pkg-config --exists "$module"; then
-        die "pkg-config findet '$module' nicht. Installiere libdrm-dev und libgbm-dev."
+        die "pkg-config findet '$module' nicht. Installiere libdrm-dev, libgbm-dev und libegl1-mesa-dev."
     fi
 done
 
-# Der Cross-Linker braucht aarch64-Versionen von libdrm und libgbm.
-# Die amd64-Dev-Pakete liefern die Header und die pkg-config-Dateien,
-# aber nicht die aarch64-.so-Dateien; die kommen ueber die Multiarch-
-# Einrichtung im Workflow.
-for lib in /usr/aarch64-linux-gnu/lib/libdrm.so /usr/aarch64-linux-gnu/lib/libgbm.so; do
+# Der Cross-Linker braucht aarch64-Versionen von libdrm, libgbm,
+# libEGL und libGLESv2. Die amd64-Dev-Pakete liefern die Header und
+# pkg-config-Dateien, aber nicht die aarch64-.so-Dateien; die kommen
+# ueber die Multiarch-Einrichtung im Workflow.
+for lib in \
+    /usr/aarch64-linux-gnu/lib/libdrm.so \
+    /usr/aarch64-linux-gnu/lib/libgbm.so \
+    /usr/aarch64-linux-gnu/lib/libEGL.so \
+    /usr/aarch64-linux-gnu/lib/libGLESv2.so; do
     if [ ! -e "$lib" ]; then
         die "Cross-aarch64 $lib fehlt. Der Multiarch-Schritt im Workflow legt ihn an."
     fi
@@ -417,6 +426,20 @@ PATCH_EOF
     [ -n "$SDL2_LIB" ] || die "libSDL2-2.0.so.0 nicht gefunden"
     cp -L "$SDL2_LIB" "$SYSROOT_LIB/libSDL2-2.0.so.0"
     echo "== SDL2 nach sysroot kopiert: $(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0") Bytes"
+
+    # Verifikation, dass der Pageflip-Patch tatsaechlich kompiliert wurde.
+    if command -v aarch64-linux-gnu-strings >/dev/null 2>&1; then
+        if aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -q "Async pageflip rejected"; then
+            echo "== Verifikation: Mali-G31 Pageflip-Patch im SDL2-Binary vorhanden"
+        else
+            die "SDL2 KMSDRM Pageflip-Patch NICHT im Binary. Patch-Schritt fehlgeschlagen."
+        fi
+        if aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -q "KMSDRM"; then
+            echo "== Verifikation: KMSDRM-Backend im SDL2-Binary vorhanden"
+        else
+            die "SDL2 wurde ohne KMSDRM gebaut. libdrm/gbm/egl im Cross-Sysroot pruefen."
+        fi
+    fi
 else
     echo "== libSDL2-2.0.so.0 bereits in sysroot"
 fi
@@ -762,13 +785,17 @@ PYEOF
 #      _clang_builtin_shim(guest_cc),
 #   3. entfernt literale "-isystem", "<...>/lib/clang/<ver>/include"-
 #      Eintraege aus dem Quelltext,
-#   4. prueft am Ende, dass kein solcher Pfad mehr uebrig ist.
+#   4. prueft am Ende per String-Literal-Regex, dass keine echten
+#      Ressourcen-Pfade mehr im Code stehen (Docstrings und Kommentare
+#      werden ignoriert),
+#   5. kopiert die gepatchte android_build.py und die relevanten
+#      clang-Zeilen nach rej/, damit sie im Artifact sichtbar sind.
 #
 # Der Shim-Ordner enthaelt nur arm_neon.h, arm_vector_types.h,
 # arm_acle.h, arm_fp16.h, arm_bf16.h.
 # ----------------------------------------------------------------------
 python3 - "$SRC/tools/android_build.py" <<'PYEOF'
-import re, sys
+import re, sys, os
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
@@ -783,13 +810,11 @@ if "_clang_builtin_shim" not in text:
     shim_fn = '''
 def _clang_builtin_shim(cc):
     """Gibt ["-isystem", <shim>] zurueck, wobei <shim> nur die
-    ARM-spezifischen Builtin-Header enthaelt (arm_neon.h,
-    arm_vector_types.h, arm_acle.h, arm_fp16.h, arm_bf16.h).
+    ARM-spezifischen Builtin-Header enthaelt.
 
-    WICHTIG: clangs volles Resource-Include-Verzeichnis
-    (z.B. /usr/lib/llvm-22/lib/clang/22/include) darf hier NICHT
-    eingebunden werden. Es enthaelt clangs __stddef_size_t.h, das
-    mit musls alltypes.h im arm64_32-Guest-Build kollidiert und
+    WICHTIG: clangs volles Resource-Include-Verzeichnis darf hier
+    NICHT eingebunden werden. Es enthaelt clangs __stddef_size_t.h,
+    das mit musls alltypes.h im arm64_32-Guest-Build kollidiert und
     'typedef redefinition with different types' ausloest.
     """
     import shutil
@@ -834,7 +859,6 @@ if text != before:
     print("clang-Builtin-Shim: Aufrufe ersetzt.")
 
 # --- 3. Literale -isystem-Eintraege auf clang-Ressource entfernen ----
-#     Muster: "-isystem", "<...>/lib/clang/<ver>/include"
 before = text
 text = re.sub(
     r'"-isystem"\s*,\s*"[^"]*/lib/clang/[^"]*/include"\s*,?\s*\n',
@@ -844,22 +868,43 @@ text = re.sub(
 if text != before:
     print("clang-Builtin-Shim: literal -isystem auf clang-Ressource entfernt.")
 
-# --- 4. Sanity-Check -------------------------------------------------
+# --- 4. Sanity-Check (nur echte String-Literale) ---------------------
+str_lit_re = re.compile(r'''["']([^"'\\]*(?:\\.[^"'\\]*)*)["']''')
 bad = []
 for line in text.split("\n"):
-    s = line.strip()
-    if s.startswith("#"):
+    stripped = line.lstrip()
+    if stripped.startswith("#"):
         continue
-    if "/lib/clang/" in line and "/include" in line:
-        # Zeilen, die nur in einem Docstring stehen, ignorieren wir nicht
-        # pauschal - aber wir listen sie auf, damit der Benutzer sie sieht.
-        bad.append(line)
+    literals = str_lit_re.findall(line)
+    if not literals:
+        continue
+    for lit in literals:
+        if "/lib/clang/" in lit and "/include" in lit:
+            bad.append(line.strip())
+            break
 
 with open(path, "w") as f:
     f.write(text)
 
+# --- 5. Diagnose-Ausgabe fuer rej/ -----------------------------------
+try:
+    rej_dir = os.environ.get("REJ_DIR") or os.path.join(os.getcwd(), "rej")
+    os.makedirs(rej_dir, exist_ok=True)
+    with open(os.path.join(rej_dir, "android_build_after_shim.py"), "w") as dbg:
+        dbg.write(text)
+    relevant = []
+    for i, line in enumerate(text.split("\n"), 1):
+        if "clang" in line and ("include" in line or "isystem" in line):
+            relevant.append(f"{i:5d}: {line}")
+    with open(os.path.join(rej_dir, "android_build_clang_lines.txt"), "w") as dbg:
+        dbg.write("\n".join(relevant) + "\n")
+    print(f"Diagnose: android_build.py nach rej/ kopiert "
+          f"({len(relevant)} clang-relevante Zeilen)")
+except Exception as _e:
+    print(f"Diagnose-Ausgabe fehlgeschlagen: {_e}")
+
 if bad:
-    print("FEHLER: android_build.py enthaelt weiterhin clang-Resource-Pfade:")
+    print("FEHLER: android_build.py enthaelt clang-Resource-Pfade in echten String-Literalen:")
     for line in bad[:8]:
         print("  " + line)
     print("Diese Zeilen verursachen die size_t-Kollision im Guest-Build.")
@@ -1177,7 +1222,7 @@ stamp=$({
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v15-clang-shim-robust"
+    echo "gcc9-host-dynamic=v15b-clang-shim-robust-sanity-fix"
     (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
@@ -1185,7 +1230,7 @@ echo "$stamp" > "$SRC/.port-stamp"
 # ======================================================================
 # Build
 # ======================================================================
-export ANDROID_NDK SYSROOT_LIB SDL2_INCLUDE SDL2_LIB_DIR GUEST_CC HOST_CC JOBS
+export ANDROID_NDK SYSROOT_LIB SDL2_INCLUDE SDL2_LIB_DIR GUEST_CC HOST_CC JOBS REJ_DIR="$REJ"
 cd "$SRC"
 
 echo "== Konfiguriere mit $LTO_FLAG $PGO_FLAG $PGO_EXTRA_ARGS ..."
@@ -1194,12 +1239,6 @@ python3 configure.py --release "$LTO_FLAG" "$PGO_FLAG" $PGO_EXTRA_ARGS \
 
 # ----------------------------------------------------------------------
 # Fix v15 (Post-Configure): Sicherheitsnetz fuer build.ninja
-#
-# Falls configure.py (oder ein spaeterer Patch) den clang-Resource-Pfad
-# trotzdem in die Guest-Compile-Zeilen schreibt, entfernen wir ihn hier
-# hart aus build.ninja. Der Shim in build/guest/clang_builtin_shim/
-# liefert bereits arm_neon.h und Co., dieser Pfad ist daher redundant
-# und schaedlich.
 # ----------------------------------------------------------------------
 if [ -f build.ninja ]; then
     if grep -qE '[-]isystem [^ ]*/lib/clang/[^ ]*/include' build.ninja 2>/dev/null; then
@@ -1274,7 +1313,7 @@ fi
 cat <<'RELEASE'
 
 --------------------------------------------------------------------
-BUILD v15 - clang-Builtin-Shim robust + Multiarch libdrm/libgbm
+BUILD v15b - clang-Builtin-Shim robust + Sanity-Check-Fix
 --------------------------------------------------------------------
 Was gegenueber v14 neu ist:
   - Der Guest-Build bindet clangs volle Resource-Include-Verzeichnis
@@ -1282,10 +1321,14 @@ Was gegenueber v14 neu ist:
     mit nur den ARM-Headern (arm_neon.h etc.) verwendet. Damit ist
     die size_t-Kollision zwischen clangs __stddef_size_t.h und musls
     alltypes.h behoben.
-  - Nach configure.py wird build.ninja geprueft und ein etwaiger
-    -isystem /usr/lib/llvm-22/lib/clang/22/include entfernt. So kann
-    auch ein spaeterer Patch (patch_android_build_hybrid.py,
-    'Fix v22') den Guest-Build nicht mehr kaputt machen.
+  - Die Sanity-Pruefung flaggt nur noch echte String-Literale, nicht
+    mehr Docstrings und Kommentare.
+  - Die gepatchte android_build.py und die clang-relevanten Zeilen
+    werden nach rej/android_build_after_shim.py bzw.
+    rej/android_build_clang_lines.txt kopiert, damit man im Artifact
+    nachvollziehen kann, was tatsaechlich im Code steht.
+  - SDL2 wird nach dem Build verifiziert: KMSDRM-String und
+    Mali-G31-Pageflip-String muessen beide im Binary sein.
 
 Installation auf M9 Pro:
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
@@ -1298,9 +1341,15 @@ Vor dem Start pruefen:
   readelf -n /roms/ports/halo-ce/halo | grep -i build
 Falls die BuildID gleich bleibt, wurde nicht deployt.
 
-Auf dem M9 pruefen, ob libmali.so.0 in NEEDED steht:
+Auf dem M9 pruefen:
   readelf -d /roms/ports/halo-ce/halo | grep NEEDED
-  → "libmali.so.0" MUSS in der Liste sein.
+  -> "libmali.so.0" MUSS in der Liste sein.
+
+  aarch64-linux-gnu-strings /roms/ports/halo-ce/libs.aarch64/libSDL2-2.0.so.0 | grep -i kmsdrm
+  -> "KMSDRM" MUSS erscheinen.
+
+  aarch64-linux-gnu-strings /roms/ports/halo-ce/libs.aarch64/libSDL2-2.0.so.0 | grep "Async pageflip"
+  -> "Async pageflip rejected" MUSS erscheinen.
 
 FERTIG.
 --------------------------------------------------------------------
