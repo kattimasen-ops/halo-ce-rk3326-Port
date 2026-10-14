@@ -40,7 +40,7 @@ Paths, each overridable from the environment:
 #include <signal.h>
 #include <ucontext.h>
 
-void host_install_signal_handlers(void);
+static void install_signal_handlers(void);
 
 /* ---------- logging and termination */
 
@@ -131,7 +131,7 @@ int host_errno(void)
 
 /* ---------- crash diagnosis signal handlers */
 
-static void host_signal_handler(int sig, siginfo_t *info, void *ucontext_ptr)
+static void signal_handler(int sig, siginfo_t *info, void *ucontext_ptr)
 {
 	ucontext_t *uc = (ucontext_t *)ucontext_ptr;
 	uintptr_t pc = 0;
@@ -147,7 +147,7 @@ static void host_signal_handler(int sig, siginfo_t *info, void *ucontext_ptr)
 	_exit(128 + sig);
 }
 
-void host_install_signal_handlers(void)
+static void install_signal_handlers(void)
 {
 	struct sigaction sa;
 	memset(&sa, 0, sizeof(sa));
