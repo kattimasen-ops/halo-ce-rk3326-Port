@@ -28,7 +28,6 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/cybersecurity/halo-ce-universal.git}
 UPSTREAM_COMMIT=$(tr -d '[:space:]' < "$HERE/UPSTREAM_COMMIT")
 PATCH=$HERE/patches/halo-ce-universal-knulli.patch
-[ -f "$PATCH" ] || PATCH=$HERE/patches/halo-ce-universal-knulli.patch
 SDL3_TAG=release-3.2.10
 SDL2_TAG=release-2.30.10
 SDL2_ARCHIVE=https://github.com/libsdl-org/SDL/archive/refs/tags/$SDL2_TAG.tar.gz
@@ -866,7 +865,7 @@ new_abi = '''"-ffp-contract=off",
     OPTIMISATION,'''
 if old_abi in text:
     text = text.replace(old_abi, new_abi, 1)
-with open(path, 'w') as f:
+with open(path, "w") as f:
     f.write(text)
 print("linux_build.py geprueft")
 PYEOF
@@ -875,14 +874,14 @@ PYEOF
 # port/knulli kopieren
 # ======================================================================
 echo ""
-echo "== Kopiere port/knnuli in den Quellbaum ..."
-if [ ! -d "$HERE/port/knnuli" ]; then
-    die "port/knnuli/ existiert nicht im Repo"
+echo "== Kopiere port/knulli in den Quellbaum ..."
+if [ ! -d "$HERE/port/knulli" ]; then
+    die "port/knulli/ existiert nicht im Repo"
 fi
-rm -rf "$SRC/port/knnuli"
-cp -a "$HERE/port/knnuli" "$SRC/port/knnuli"
-rm -rf "$SRC/port/knnuli/__pycache__"
-chmod +x "$SRC/port/knnuli/build.sh" 2>/dev/null || true
+rm -rf "$SRC/port/knulli"
+cp -a "$HERE/port/knulli" "$SRC/port/knulli"
+rm -rf "$SRC/port/knulli/__pycache__"
+chmod +x "$SRC/port/knulli/build.sh" 2>/dev/null || true
 
 # ======================================================================
 # DIAGNOSE: Logging in host_glthread.c einfuegen
@@ -1044,7 +1043,7 @@ check_patch "source/cache/cache_files.c"        "menu_tags_loaded"              
 check_patch "port/linux/src/menu_files.c"       "MENU_FILES_HOST_FUNCS_DECLARED" "menu_files.c Forward-Deklarationen"
 
 if [ -f "$HERE/patches/patch_gl_init_order.py" ]; then
-    check_patch "port/knnuli/host/host_glthread.c" "DIAG: sync-create ENTER" "host_glthread.c DIAG-Logs eingefuegt"
+    check_patch "port/knulli/host/host_glthread.c" "DIAG: sync-create ENTER" "host_glthread.c DIAG-Logs eingefuegt"
 fi
 
 if grep -q "settings_only: game data dispatcher" \
@@ -1095,7 +1094,7 @@ stamp=$({
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
     echo "gcc9-host-dynamic=v14-multiarch-libdrm-gbm"
-    (cd "$HERE/port/knnuli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
+    (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
 
@@ -1112,8 +1111,8 @@ python3 configure.py --release "$LTO_FLAG" "$PGO_FLAG" $PGO_EXTRA_ARGS \
 echo "== Baue Guest-ELF (halo_guest.elf) ..."
 ninja -j "$JOBS" -k 0 build/android/halo_guest.elf || true
 
-echo "== Baue Host-Binary (halo, dynamisch, GCC 9) ueber port/knnuli/build.sh ..."
-bash "$SRC/port/knnuli/build.sh"
+echo "== Baue Host-Binary (halo, dynamisch, GCC 9) ueber port/knulli/build.sh ..."
+bash "$SRC/port/knulli/build.sh"
 
 # ======================================================================
 # Distribution
@@ -1121,15 +1120,15 @@ bash "$SRC/port/knnuli/build.sh"
 echo "== copying the build into $DIST"
 rm -rf "$DIST"
 mkdir -p "$DIST"
-if [ -f "$SRC/build/knnuli/halo" ]; then
-    cp "$SRC/build/knnuli/halo" "$DIST/halo"
+if [ -f "$SRC/build/knulli/halo" ]; then
+    cp "$SRC/build/knulli/halo" "$DIST/halo"
     chmod +x "$DIST/halo" 2>/dev/null || true
 else
-    echo "FEHLER: Host-Binary ($SRC/build/knnuli/halo) wurde nicht gebaut!" >&2
+    echo "FEHLER: Host-Binary ($SRC/build/knulli/halo) wurde nicht gebaut!" >&2
     exit 1
 fi
 for candidate in \
-    "$SRC/build/knnuli/halo_guest.elf" \
+    "$SRC/build/knulli/halo_guest.elf" \
     "$SRC/build/android/halo_guest.elf"; do
     if [ -f "$candidate" ]; then
         cp "$candidate" "$DIST/halo_guest.elf"
@@ -1137,13 +1136,13 @@ for candidate in \
         break
     fi
 done
-[ -f "$SRC/port/knnuli/Halo.sh" ] && cp "$SRC/port/knnuli/Halo.sh" "$DIST/Halo.sh"
-[ -f "$SRC/port/knnuli/halo_extract.py" ] && cp "$SRC/port/knnuli/halo_extract.py" "$DIST/halo_extract.py"
-[ -f "$SRC/port/knnuli/halo_screen.py" ] && cp "$SRC/port/knnuli/halo_screen.py" "$DIST/halo_screen.py"
-[ -f "$SRC/port/knnuli/sdl_mapping.py" ] && cp "$SRC/port/knnuli/sdl_mapping.py" "$DIST/sdl_mapping.py"
-if [ -d "$SRC/build/knnuli/libs.aarch64" ]; then
+[ -f "$SRC/port/knulli/Halo.sh" ] && cp "$SRC/port/knulli/Halo.sh" "$DIST/Halo.sh"
+[ -f "$SRC/port/knulli/halo_extract.py" ] && cp "$SRC/port/knulli/halo_extract.py" "$DIST/halo_extract.py"
+[ -f "$SRC/port/knulli/halo_screen.py" ] && cp "$SRC/port/knulli/halo_screen.py" "$DIST/halo_screen.py"
+[ -f "$SRC/port/knulli/sdl_mapping.py" ] && cp "$SRC/port/knulli/sdl_mapping.py" "$DIST/sdl_mapping.py"
+if [ -d "$SRC/build/knulli/libs.aarch64" ]; then
     mkdir -p "$DIST/libs.aarch64"
-    cp -a "$SRC/build/knnuli/libs.aarch64/." "$DIST/libs.aarch64/"
+    cp -a "$SRC/build/knulli/libs.aarch64/." "$DIST/libs.aarch64/"
 fi
 chmod +x "$DIST/Halo.sh" 2>/dev/null || true
 
