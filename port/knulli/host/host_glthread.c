@@ -1289,7 +1289,9 @@ static void run_generate(void *context)
 {
 	struct generate_call *call = context;
 
+	host_logf(HOST_LOG_INFO, "DIAG: run_generate kind=%d n=%d", call->kind, call->n);
 	glthread_generate_names(call->kind, call->n, call->names);
+	host_logf(HOST_LOG_INFO, "DIAG: run_generate done");
 }
 
 void glthread_reserved_names(int kind, GLsizei n, GLuint *names)
@@ -1475,6 +1477,16 @@ static struct program_job *builder_pop(struct builder *builder)
 	pthread_mutex_unlock(&builder->lock);
 	return job;
 }
+
+/* ---------- dynamic EGL resolution (Knulli on ArkOS4Clone)
+
+The host is linked without EGL (the sysroot libmali is not linked; the
+EGL/GLES symbols stay undefined and are resolved at run time from
+/tmp/halo-mali). The static GOT entries for eglGetCurrentDisplay and the
+other functions in share_initialize were the source of a SIGILL on the
+Cortex-A35: the calls went through a PLT/GOT entry that was never
+populated. This block resolves the EGL functions with dlopen/dlsym before
+they are used, so the calls go through real function pointers. */
 
 typedef EGLDisplay (*pfn_eglGetCurrentDisplay)(void);
 typedef EGLContext (*pfn_eglGetCurrentContext)(void);
@@ -1950,7 +1962,9 @@ static void run_get_string(void *context)
 {
 	struct string_call *call = context;
 
+	host_logf(HOST_LOG_INFO, "DIAG: run_get_string name=%u index=%d", call->name, call->index);
 	host_gl_get_string(call->name, call->index, call->buffer, call->size);
+	host_logf(HOST_LOG_INFO, "DIAG: run_get_string done");
 }
 
 static void synced_gl_get_string(uint32_t name, int index, char *buffer, uint32_t size)
@@ -1964,7 +1978,9 @@ static void run_has_extension(void *context)
 {
 	struct string_call *call = context;
 
+	host_logf(HOST_LOG_INFO, "DIAG: run_has_extension: %s", call->extension ? call->extension : "(null)");
 	call->result = (uint32_t)host_gl_has_extension(call->extension);
+	host_logf(HOST_LOG_INFO, "DIAG: run_has_extension done: %u", call->result);
 }
 
 static int synced_gl_has_extension(const char *name)
@@ -1986,7 +2002,9 @@ static void run_read_buffer_word(void *context)
 {
 	struct word_call *call = context;
 
+	host_logf(HOST_LOG_INFO, "DIAG: run_read_buffer_word buffer=%u offset=%u", call->a, call->b);
 	call->result = host_gl_read_buffer_word(call->a, call->b);
+	host_logf(HOST_LOG_INFO, "DIAG: run_read_buffer_word done: %u", call->result);
 }
 
 static uint32_t synced_gl_read_buffer_word(uint32_t buffer, uint32_t offset)
@@ -2064,7 +2082,9 @@ static void run_make_current(void *context)
 {
 	struct word_call *call = context;
 
+	host_logf(HOST_LOG_INFO, "DIAG: run_make_current window=%u context=%u", call->a, call->b);
 	call->result = (uint32_t)host_sdl_gl_make_current(call->a, call->b);
+	host_logf(HOST_LOG_INFO, "DIAG: run_make_current done: %u", call->result);
 }
 
 static int synced_sdl_gl_make_current(uint32_t window, uint32_t context)
@@ -2081,9 +2101,11 @@ static void run_swap_interval(void *context)
 {
 	struct word_call *call = context;
 
+	host_logf(HOST_LOG_INFO, "DIAG: run_swap_interval interval=%d", call->c);
 	call->result = (uint32_t)host_sdl_gl_set_swap_interval(call->c);
 	/* frames that do not wait for the display have no refresh to be due at */
 	vsync_on = host_sdl_gl_swap_interval() != 0;
+	host_logf(HOST_LOG_INFO, "DIAG: run_swap_interval done");
 }
 
 static int synced_sdl_gl_set_swap_interval(int interval)
