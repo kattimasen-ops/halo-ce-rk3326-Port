@@ -148,1305 +148,695 @@ static void wait_while_equal(uint32_t *word, uint32_t value, int spins)
 		futex_wait(word, value);
 }
 
-/* ---------- the GPU pass timer
-
-HALO_GPU_PASS_TIMING=1 finishes the GPU's work at every change of render
-target and logs the time each target's passes took, per frame: where the
-GPU's time goes, which the driver cannot say otherwise (it has no timer
-queries). Mali starts a pass's work when it is flushed, so each pass's time
-splits into the calls that made it (issue) and the GPU's work after the
-flush (gpu). The waits slow the game down; the shares are what count. */
-
-#define PASS_SLOTS 64
-#define PASS_REPORT_FRAMES 150
-
-static int pass_timing = -1;
-static struct pass
+/* wakes who sleeps on *word, if anyone does */
+static void wake_sleeper(uint32_t *word)
 {
-	GLuint framebuffer;
-	uint64_t nanoseconds;       /* issue and GPU */
-	uint64_t gpu_nanoseconds;
-	uint32_t passes, draws, clears;
-} passes[PASS_SLOTS];
-static int pass_count;
-static GLuint pass_framebuffer;
-static uint64_t pass_start;
-static uint32_t pass_draws, pass_clears, pass_frames;
-/* HALO_GPU_PASS_TIMING=2: the passes of the traced frames in order, each
-logged as it ends */
-static int pass_trace;
-/* HALO_GPU_PASS_TIMING=3: in those frames, the GPU's time for each draw
-(each drawn by itself: the time includes a load and store of the target's
-tiles), and a slow draw's state */
-static int draw_trace;
-/* HALO_GPU_PASS_TIMING=4: in that frame, how long each change of render target
-waited in the driver, with the GPU running as it does (nothing finished) */
-static int bind_trace;
-static uint32_t bind_frames;
-static uint64_t bind_frame_start;
-static uint32_t pass_copies, pass_frames_total, pass_index;
-/* the frames traced (HALO_GPU_TRACE_PASSES_AT, by default the 750th, and
-HALO_GPU_TRACE_PASSES_FRAMES of them, by default 1) */
-static uint32_t pass_trace_frame = PASS_REPORT_FRAMES * 5, pass_trace_count = 1;
-
-static void pass_end(void)
-{
-	uint64_t now, flushed;
-	int index;
-
-	glthread_driver_flush();
-	flushed = host_monotonic_ns();
-	glthread_driver_finish();
-	now = host_monotonic_ns();
-	for (index = 0; index < pass_count && passes[index].framebuffer != pass_framebuffer; index++)
-		;
-	if (index == pass_count && pass_count < PASS_SLOTS)
+	if (__atomic_load_n(word, __ATOMIC_ACQUIRE))
 	{
-		passes[pass_count].framebuffer = pass_framebuffer;
-		pass_count++;
-	}
-	if (pass_trace && (pass_frames_total - pass_trace_frame < pass_trace_count) && pass_start)
-	{
-		host_logf(HOST_LOG_INFO, "trace: pass %2u framebuffer %3u %4u draws %u clears %u copies, issue %6.2f ms, gpu %6.2f ms",
-			pass_index, pass_framebuffer, pass_draws, pass_clears, pass_copies, (flushed - pass_start) / 1e6,
-			(now - flushed) / 1e6);
-	}
-	pass_index++;
-	pass_copies = 0;
-	if (index < pass_count)
-	{
-		if (pass_start)
-		{
-			passes[index].nanoseconds += now - pass_start;
-			passes[index].gpu_nanoseconds += now - flushed;
-		}
-		passes[index].passes++;
-		passes[index].draws += pass_draws;
-		passes[index].clears += pass_clears;
-	}
-	pass_draws = pass_clears = 0;
-	pass_start = now;
-}
-
-static void pass_call(const struct command *command)
-{
-	switch (glthread_call_kind(command->function))
-	{
-	case _glthread_call_bind_framebuffer:
-	{
-		const GLuint *arguments = (const GLuint *)(command + 1);
-
-		if (arguments[0] != GL_READ_FRAMEBUFFER && arguments[1] != pass_framebuffer)
-		{
-			pass_end();
-			pass_framebuffer = arguments[1];
-		}
-		break;
-	}
-	case _glthread_call_draw:
-		pass_draws++;
-		break;
-	case _glthread_call_clear:
-		pass_clears++;
-		break;
-	case _glthread_call_copy:
-		pass_copies++;
-		break;
+		__atomic_store_n(word, 0, __ATOMIC_RELEASE);
+		futex_wake(word);
 	}
 }
 
-/* the longest first */
-static int pass_compare(const void *a, const void *b)
+/* publishes up to producer.head to the consumer */
+static void publish(void)
 {
-	uint64_t first = ((const struct pass *)a)->nanoseconds, second = ((const struct pass *)b)->nanoseconds;
-
-	return first < second ? 1 : first > second ? -1 : 0;
-}
-
-/* a slow draw's textures (the 2D ones of units 0 to 3), blending, depth and
-call (HALO_GPU_PASS_TIMING=3) */
-static void draw_state_log(const struct command *command)
-{
-	const uint32_t *words = (const uint32_t *)(command + 1);
-	GLint active = glthread_driver_integer(GL_ACTIVE_TEXTURE), viewport[4] = { 0, 0, 0, 0 }, unit;
-
-	for (unit = 0; unit < 4; unit++)
-	{
-		GLint name, width = 0, height = 0, levels = 0;
-
-		glActiveTexture((GLenum)(GL_TEXTURE0 + unit));
-		name = glthread_driver_integer(GL_TEXTURE_BINDING_2D);
-		if (!name)
-			continue;
-		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
-		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
-		glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, &levels);
-		host_logf(HOST_LOG_INFO, "draw:   unit %d texture %d, %dx%d, levels 0 to %d", unit, name, width, height, levels);
-	}
-	glActiveTexture((GLenum)active);
-	glGetIntegerv(GL_VIEWPORT, viewport);
-	host_logf(HOST_LOG_INFO, "draw:   blend %d (%x %x), depth test %d write %d, cull %d, viewport %dx%d; %s %x %x %x %x",
-		glthread_driver_integer(GL_BLEND), glthread_driver_integer(GL_BLEND_SRC_RGB),
-		glthread_driver_integer(GL_BLEND_DST_RGB), glthread_driver_integer(GL_DEPTH_TEST),
-		glthread_driver_integer(GL_DEPTH_WRITEMASK), glthread_driver_integer(GL_CULL_FACE), viewport[2], viewport[3],
-		glthread_function_name(command->function), words[0], words[1], words[2], words[3]);
-}
-
-/* after a draw of the traced frames (HALO_GPU_PASS_TIMING=3) */
-static void draw_traced(const struct command *command)
-{
-	uint64_t flushed, now;
-
-	if (!draw_trace || !(pass_frames_total - pass_trace_frame < pass_trace_count) ||
-		glthread_call_kind(command->function) != _glthread_call_draw)
-	{
+	if (producer.published == producer.head)
 		return;
-	}
-	glthread_driver_flush();
-	flushed = host_monotonic_ns();
-	glthread_driver_finish();
-	now = host_monotonic_ns();
-	host_logf(HOST_LOG_INFO, "draw: frame %u pass %2u framebuffer %3u program %4d count %6d gpu %7.3f ms",
-		pass_frames_total, pass_index, pass_framebuffer, glthread_driver_integer(GL_CURRENT_PROGRAM),
-		glthread_draw_count(command->function, command + 1), (now - flushed) / 1e6);
-	if (now - flushed > 2000000ull)
-		draw_state_log(command);
+	producer.published = producer.head;
+	__atomic_store_n(&producer_shared.published, producer.published, __ATOMIC_RELEASE);
+	wake_sleeper(&producer_shared.sleeping);
 }
 
-static void pass_frame(void)
-{
-	uint64_t total = 0, gpu = 0;
-	int index;
+/* ---------- slow command logging */
 
-	pass_end();
-	pass_frames_total++;
-	pass_index = 0;
-	if (++pass_frames < PASS_REPORT_FRAMES)
-		return;
-	for (index = 0; index < pass_count; index++)
-	{
-		total += passes[index].nanoseconds;
-		gpu += passes[index].gpu_nanoseconds;
-	}
-	host_logf(HOST_LOG_INFO, "gpu: %.2f ms a frame in %d targets, %.2f ms of it the GPU's", total / 1e6 / pass_frames,
-		pass_count, gpu / 1e6 / pass_frames);
-	qsort(passes, (size_t)pass_count, sizeof(passes[0]), pass_compare);
-	for (index = 0; index < pass_count && index < 16; index++)
-	{
-		host_logf(HOST_LOG_INFO, "gpu:   framebuffer %3u %7.2f ms (gpu %6.2f) %5.1f passes %6.1f draws %4.1f clears",
-			passes[index].framebuffer, passes[index].nanoseconds / 1e6 / pass_frames,
-			passes[index].gpu_nanoseconds / 1e6 / pass_frames,
-			(double)passes[index].passes / pass_frames, (double)passes[index].draws / pass_frames,
-			(double)passes[index].clears / pass_frames);
-	}
-	memset(passes, 0, sizeof(passes));
-	pass_count = 0;
-	pass_frames = 0;
-}
-
-/* ---------- the host's operations' time (HALO_GL_TIMING)
-
-The driver's functions are timed where they are resolved
-(host_gl_timing.c); the operations the host queues (buffer writes, fences,
-swaps) call the driver directly, and are timed here. */
-
-#define HOST_OPERATION_SLOTS 8
-
-static int timing;                 /* HALO_GL_TIMING, read as the thread starts */
-/* the game's thread's waits for the GL thread: calls that wait for their
-result, room in the queue, and the frame pacing. frame_waits has this
-frame's, measured when HALO_GL_TIMING (which adds them up in producer_waits
-for its report) or HALO_HITCH_LOG is on (measure_waits) */
-struct waits
-{
-	uint64_t syncs, sync_ns;
-	uint64_t room_waits, room_ns;
-	uint64_t frame_waits, frame_ns;
-};
-static struct waits producer_waits, frame_waits;
-static int measure_waits;
-/* ---------- frame pacing
-
-The game blends between its 30 Hz ticks by its clock at the start of a
-frame (port/linux/game/render_interpolation.c), and the frame reaches the
-display at the first refresh after the GPU has drawn it: on the
-framebuffer, Mali's swap waits only while the display holds both buffers
-(above 60 frames a second), and Mali's display thread pans the framebuffer
-to a frame once the GPU has drawn it, which the display takes as its next
-refresh begins. So a frame shows the world as it was a varying time before
-it is seen, its time on the two threads and up to a refresh more, and
-frames begun 25 ms apart are shown 17 and 33 ms apart: motion lurches.
-
-The H700's LCD timing controller tells where the display is in its refresh:
-its debug register holds the line being sent to the panel. With it each
-frame is given, as it begins, the refresh it is due at: the first it can be
-ready for (by the time the game's and the GL thread took to a frame's swap
-lately, the second longest of eight) after the one of the frame before it.
-The game times the frame by it (host_gl_frame_due), and the GL thread holds
-the frame's swap until the refresh before it has begun, so that a frame
-ready early is not shown early either. Frames are not paced without the
-timing controller (another device, the HDMI output, a line count that
-stopped), with vsync off, or with display.frame_pacing off (the game does
-not ask).
-
-The GPU makes frames late as well. Mali begins a frame's last pass (into the
-window) only once the frame is swapped and the frame before it is shown, and
-a pan made after line 472 of the 521 waits a refresh more: a frame the GPU
-has not drawn about 1.5 ms before its refresh is shown a refresh late, and
-the frames after it follow it until one is due two refreshes after the one
-before. In the b30 battle, where the GPU needs 17 to 22 ms a frame, the lag
-changes at one frame in four or five. Models that gave each frame the GPU's
-time as well (a fence after each swap; the frames in flight followed
-through the pipeline) made fewer frames late, but needed more than three
-refreshes from a frame's start to its showing, and with the game a frame
-ahead of the GL thread that cost a third of the frame rate. Holding frames
-at their pan instead of their swap kept Mali from beginning the next frame.
-
-HALO_PACING_LOG=1 reports every 300 frames how many refreshes the frames
-stayed on screen, how many were shown after (or before) their due refresh,
-and how often that lag changed from one frame to the next (motion is even
-while it stays the same), from the pans themselves (ioctl, below); 2 also
-logs each late frame. */
-
-#define FRAME_HISTORY 16
-/* time the swap itself takes, before the refresh it is for begins: a swap
-that took longer waited for the display */
-#define SWAP_GUARD_NS 1500000ull
-/* how far into the refresh before its own a held swap is made */
-#define HOLD_MARGIN_NS 300000ull
-
-/* the H700's LCD timing controller: its debug register's bits 27 to 16
-hold the line being sent to the panel */
-#define TCON_LCD0 0x06511000
-#define TCON_DEBUG 0xFC
-
-static volatile const uint32_t *scanout;
-static uint32_t scanout_lines;
-static uint64_t refresh_ns;
-/* set once the line count is found stopped */
-static int scanout_stopped;
-/* whether swaps wait for the display: the swap interval in effect is not 0 */
-static int vsync_on = 1;
-static int pacing_log;
-
-/* the latest frames, by number (producer.frames_submitted): the game's
-thread notes when it began each and the refresh it is due at, the GL
-thread when it reached the frame's swap */
-struct frame_times
-{
-	uint64_t start, due, ready;
-};
-static struct frame_times frame_times[FRAME_HISTORY];
-
-struct swap_call
-{
-	uint32_t window;
-	uint32_t frame;
-};
-
-static uint32_t scanout_line(void)
-{
-	return scanout[TCON_DEBUG / 4] >> 16 & 0xfff;
-}
-
-/* when the refresh the display is in began, and the time now */
-static uint64_t refresh_begun(uint64_t *now)
-{
-	uint32_t line = scanout_line();
-
-	*now = host_monotonic_ns();
-	return *now - (uint64_t)line * refresh_ns / scanout_lines;
-}
-
-/* whether the SoC is of the H616 family (the H700 is one), whose LCD timing
-controller the register is */
-static int scanout_soc(void)
-{
-	char compatible[256];
-	int fd = open("/proc/device-tree/compatible", O_RDONLY);
-	ssize_t length = fd < 0 ? -1 : read(fd, compatible, sizeof(compatible));
-
-	if (fd >= 0)
-		close(fd);
-	return length > 0 && memmem(compatible, (size_t)length, "sun50iw9", 8) != NULL;
-}
-
-/* maps the register (read only) and measures a refresh, on the GL thread
-at start-up */
-static void scanout_open(void)
-{
-	uint64_t wraps[9] = { 0 }, start;
-	uint32_t previous = 0, lines = 0;
-	void *page = MAP_FAILED;
-	int fd, count = 0, attempt;
-	uint64_t period = 0;
-
-	if (scanout_soc() && (fd = open("/dev/mem", O_RDONLY | O_SYNC)) >= 0)
-	{
-		page = mmap(NULL, 0x1000, PROT_READ, MAP_SHARED, fd, TCON_LCD0);
-		close(fd);
-	}
-	/* nine wraps of the line count and the last line, within 200 ms (a count
-	that is not scanning has none). The period is the mean of the intervals
-	within 2% of their median, six of the eight at least: a wrap seen late
-	(the thread preempted) makes one interval longer and the next shorter, a
-	wrap missed one twice as long. Three tries. */
-	for (attempt = 0; page != MAP_FAILED && attempt < 3; attempt++)
-	{
-		uint64_t intervals[8], median, sum = 0;
-		int index, other, agreeing = 0;
-
-		scanout = page;
-		count = 0;
-		previous = scanout_line();
-		start = host_monotonic_ns();
-		while (count < 9 && host_monotonic_ns() - start < 200000000ull)
-		{
-			uint32_t line = scanout_line();
-			uint64_t now = host_monotonic_ns();
-
-			if (line < previous)
-				wraps[count++] = now;
-			if (line > lines)
-				lines = line;
-			previous = line;
-		}
-		/* (no wrap at all: the count is not scanning) */
-		if (!count)
-			break;
-		if (count < 9)
-			continue;
-		/* (sorted) */
-		for (index = 0; index < 8; index++)
-		{
-			uint64_t interval = wraps[index + 1] - wraps[index];
-
-			for (other = index; other > 0 && intervals[other - 1] > interval; other--)
-				intervals[other] = intervals[other - 1];
-			intervals[other] = interval;
-		}
-		median = (intervals[3] + intervals[4]) / 2;
-		for (index = 0; index < 8; index++)
-		{
-			if (intervals[index] + median / 50 >= median && intervals[index] <= median + median / 50)
-			{
-				sum += intervals[index];
-				agreeing++;
-			}
-		}
-		if (agreeing >= 6)
-		{
-			period = sum / (uint64_t)agreeing;
-			break;
-		}
-	}
-	if (lines < 100 || period < 10000000ull || period > 30000000ull)
-	{
-		if (page != MAP_FAILED)
-			munmap(page, 0x1000);
-		scanout = NULL;
-		host_logf(HOST_LOG_INFO, "frames are not paced: no display timing to read");
-		return;
-	}
-	scanout_lines = lines + 1;
-	refresh_ns = period;
-	host_logf(HOST_LOG_INFO, "frames are paced to the display: %u lines, %.3f ms a refresh", scanout_lines,
-		refresh_ns / 1e6);
-}
-
-/* host_gl_frame_due, on the game's thread as a frame begins: how long from
-now until the refresh it is due at, in microseconds, or 0 */
-static long long threaded_gl_frame_due(void)
-{
-	static uint32_t last_line, stalls;
-	uint32_t frame = producer.frames_submitted + 1, line;
-	uint32_t done = __atomic_load_n(&consumer.frames_done, __ATOMIC_ACQUIRE);
-	const struct frame_times *previous = &frame_times[(frame - 1) % FRAME_HISTORY];
-	uint64_t longest = 0, second = 0, now, begun, due;
-	int index;
-
-	if (!scanout || scanout_stopped || !vsync_on || done < FRAME_HISTORY)
-		return 0;
-	line = scanout_line();
-	now = host_monotonic_ns();
-	/* the line count stopped (the display went to another output): the same
-	line as frames begin, sixty times in a row */
-	if (line == last_line && ++stalls == 60)
-	{
-		uint64_t until = now + 500000;
-
-		/* (frames that begin at the same phase of the refresh see the same
-		line: the count must not move at all) */
-		while (host_monotonic_ns() < until && scanout_line() == line)
-			relax();
-		if (scanout_line() == line)
-		{
-			scanout_stopped = 1;
-			host_logf(HOST_LOG_INFO, "frames are no longer paced: the display timing stopped");
-			return 0;
-		}
-		stalls = 0;
-	}
-	if (line != last_line)
-		stalls = 0;
-	last_line = line;
-	for (index = 0; index < 8; index++)
-	{
-		const struct frame_times *past = &frame_times[(done - (uint32_t)index) % FRAME_HISTORY];
-		uint64_t latency = past->ready - past->start;
-
-		if (latency > longest)
-		{
-			second = longest;
-			longest = latency;
-		}
-		else if (latency > second)
-			second = latency;
-	}
-	begun = now - (uint64_t)line * refresh_ns / scanout_lines;
-	due = begun + (now + second + SWAP_GUARD_NS - begun + refresh_ns - 1) / refresh_ns * refresh_ns;
-	if (previous->due && due < previous->due + refresh_ns)
-		due = previous->due + refresh_ns;
-	frame_times[frame % FRAME_HISTORY].due = due;
-	return (long long)((due - now) / 1000);
-}
-
-/* on the GL thread, before a frame's swap: held until the refresh before
-the one it is due at has begun (give or take a line) */
-static void frame_hold(uint32_t frame)
-{
-	uint64_t due = frame_times[frame % FRAME_HISTORY].due, now;
-	struct timespec until;
-
-	if (!due)
-		return;
-	until.tv_sec = (time_t)((due - refresh_ns + HOLD_MARGIN_NS) / 1000000000ull);
-	until.tv_nsec = (long)((due - refresh_ns + HOLD_MARGIN_NS) % 1000000000ull);
-	while (refresh_begun(&now) + refresh_ns / 2 < due - refresh_ns)
-		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &until, NULL);
-}
-
-/* the frames swapped and not yet shown, in order (HALO_PACING_LOG): the GL
-thread queues each as it swaps it, and Mali's display thread takes each as
-it pans to it */
-#define FLIP_QUEUE 8
-static uint32_t flip_queue[FLIP_QUEUE];
-static uint32_t flips_queued, flips_taken;
-
-/* on the GL thread, as it swaps a frame */
-static void flip_queue_frame(uint32_t frame)
-{
-	uint32_t queued = flips_queued;
-
-	flip_queue[queued % FLIP_QUEUE] = frame;
-	__atomic_store_n(&flips_queued, queued + 1, __ATOMIC_RELEASE);
-}
-
-/* on Mali's display thread, as a pan to a frame returns at the refresh that
-shows it: HALO_PACING_LOG's counts. The moment a frame shows the world at
-is its due refresh when paced, its start when not; motion is even while the
-time from it to the frame's showing stays the same. */
-static void frame_shown(void)
-{
-	static uint64_t previous_shown;
-	static int64_t previous_lag;
-	static unsigned long frames, refreshes[4], changes[4], late, early;
-	uint32_t taken = flips_taken, queued = __atomic_load_n(&flips_queued, __ATOMIC_ACQUIRE), frame;
-	const struct frame_times *times;
-	uint64_t now, shown;
-	int64_t lag;
-	int refresh_lag;
-
-	/* (none queued: a pan before the first swap) */
-	if (taken == queued)
-		return;
-	if (queued - taken > FLIP_QUEUE)
-		taken = queued - 1;
-	frame = flip_queue[taken % FLIP_QUEUE];
-	flips_taken = taken + 1;
-	times = &frame_times[frame % FRAME_HISTORY];
-	shown = refresh_begun(&now);
-	lag = (int64_t)(shown - (times->due ? times->due : times->start));
-	refresh_lag = (int)((lag + (int64_t)(refresh_ns * 8 + refresh_ns / 2)) / (int64_t)refresh_ns) - 8;
-	if (times->due && refresh_lag > 0 && pacing_log == 2)
-		host_logf(HOST_LOG_INFO, "pacing: frame %u shown %d refresh%s late: ready %.1f ms after its start, due %.1f ms "
-			"after it", frame, refresh_lag, refresh_lag == 1 ? "" : "es", (double)(times->ready - times->start) / 1e6,
-			(double)(times->due - times->start) / 1e6);
-	if (previous_shown)
-	{
-		uint64_t count = (shown - previous_shown + refresh_ns / 2) / refresh_ns;
-		double change = (double)llabs(lag - previous_lag) / 1e6;
-
-		refreshes[count <= 1 ? 0 : count == 2 ? 1 : count == 3 ? 2 : 3]++;
-		changes[change < 2.0 ? 0 : change < 6.0 ? 1 : change < 12.0 ? 2 : 3]++;
-		if (times->due)
-		{
-			late += refresh_lag > 0;
-			early += refresh_lag < 0;
-		}
-		if (++frames == 300)
-		{
-			host_logf(HOST_LOG_INFO, "pacing: of 300 frames (%s), shown for 1 refresh %lu, 2 %lu, 3 %lu, more %lu; the time "
-				"from what a frame shows to its showing changed by under 2 ms %lu times, 2 to 6 ms %lu, 6 to 12 ms %lu, "
-				"more %lu; %lu shown after their due refresh, %lu before it", times->due ? "paced" : "not paced",
-				refreshes[0], refreshes[1], refreshes[2], refreshes[3], changes[0], changes[1], changes[2], changes[3], late,
-				early);
-			frames = late = early = 0;
-			memset(refreshes, 0, sizeof(refreshes));
-			memset(changes, 0, sizeof(changes));
-		}
-	}
-	previous_shown = shown;
-	previous_lag = lag;
-}
-
-/* Mali's display thread pans the framebuffer with ioctl. Defined here, the
-program's own symbol comes before the C library's, so Mali's calls come
-here first and each pan is seen as it returns (HALO_PACING_LOG). */
-int ioctl(int fd, unsigned long request, ...)
-{
-	va_list list;
-	void *argument;
-	long result;
-
-	va_start(list, request);
-	argument = va_arg(list, void *);
-	va_end(list);
-	result = syscall(SYS_ioctl, fd, request, argument);
-	if (request == FBIOPAN_DISPLAY && result == 0 && pacing_log && scanout)
-	{
-		int error = errno;
-		struct stat device;
-
-		/* (the framebuffer's devices are major 29) */
-		if (fstat(fd, &device) == 0 && S_ISCHR(device.st_mode) && major(device.st_rdev) == 29)
-			frame_shown();
-		errno = error;
-	}
-	return (int)result;
-}
-
-/* HALO_HITCH_LOG=<ms>: the frames longer than that, as each thread sees them.
-The game's thread's: its waits. The GL thread's: how much of it it spent on
-commands, and its slowest ones (port/linux/src/d3d8_gl.c logs the game's
-side) */
-static double hitch_ms;
-static int hitch_on;
 enum
 {
-	_slow_none,
 	_slow_call,
 	_slow_sync,
 	_slow_host,
 };
+
+struct slow_command
+{
+	int kind;
+	uint32_t function;
+	void (*run)(const void *);
+	uint64_t ns;
+};
+
 static struct
 {
-	uint64_t frame_start, busy_ns;
-	unsigned int calls, skipped;
-	struct
-	{
-		uint64_t ns;
-		int kind;
-		uint32_t function;              /* _slow_call's */
-		void (*run)(const void *);      /* _slow_host's */
-	} slowest[3];
+	uint64_t frame_start;
+	uint64_t busy_ns;
+	uint32_t calls;
+	uint32_t skipped;
+	struct slow_command slowest[3];
 } gl_hitch;
-/* HALO_GPU_PASS_TIMING=4's frames, in which slow calls are logged */
-static int call_trace;
 
-/* the start of a command, for the hitch log and the call trace: 0 when
-neither is on */
-static uint64_t command_start(void)
+static double hitch_ms;
+static int hitch_on;
+
+static uint64_t host_monotonic_ns(void)
 {
-	return hitch_on || call_trace ? host_monotonic_ns() : 0;
+	return host_ticks();
 }
 
-/* the GL thread: one command's time, for the hitch log */
 static void hitch_command(int kind, uint32_t function, void (*run)(const void *), uint64_t ns)
 {
-	int slot;
+	int index = 2;
 
-	if (!hitch_on)
-		return;
 	gl_hitch.busy_ns += ns;
-	gl_hitch.calls++;
-	for (slot = 0; slot < 3; slot++)
+	if (ns <= gl_hitch.slowest[2].ns)
+		return;
+	while (index > 0 && ns > gl_hitch.slowest[index - 1].ns)
 	{
-		if (ns > gl_hitch.slowest[slot].ns)
-		{
-			int move;
-
-			for (move = 2; move > slot; move--)
-				gl_hitch.slowest[move] = gl_hitch.slowest[move - 1];
-			gl_hitch.slowest[slot].ns = ns;
-			gl_hitch.slowest[slot].kind = kind;
-			gl_hitch.slowest[slot].function = function;
-			gl_hitch.slowest[slot].run = run;
-			break;
-		}
+		gl_hitch.slowest[index] = gl_hitch.slowest[index - 1];
+		index--;
 	}
+	gl_hitch.slowest[index].kind = kind;
+	gl_hitch.slowest[index].function = function;
+	gl_hitch.slowest[index].run = run;
+	gl_hitch.slowest[index].ns = ns;
 }
 
-static void adjacency_call(uint32_t kind);
-static void run_buffer_write_to(const void *data);
+static inline uint64_t command_start(void)
+{
+	return hitch_on ? host_monotonic_ns() : 0;
+}
+
+static inline void command_end(uint32_t function, uint64_t start)
+{
+	if (start)
+		hitch_command(_slow_call, function, NULL, host_monotonic_ns() - start);
+}
+
+/* ---------- passes */
+
+static int pass_timing;
+static int pass_trace;
+static int draw_trace;
+static int bind_trace;
+static int call_trace;
+static uint32_t pass_trace_frame;
+static uint32_t pass_trace_count = 1;
+static uint32_t bind_frames;
+static uint64_t bind_frame_start;
+static unsigned long pass_draws;
+static unsigned long pass_draw_elements;
+static unsigned long pass_draw_arrays;
+static unsigned long pass_draw_indices;
+static unsigned long pass_draw_vertices;
+
+struct pass_time
+{
+	const char *name;
+	uint32_t fb;
+	uint32_t draws;
+	uint32_t draws_elements;
+	uint32_t draws_arrays;
+	uint64_t indices;
+	uint64_t vertices;
+	uint64_t ns;
+};
+
 static struct
 {
-	void (*run)(const void *);
-	uint64_t calls, ticks;
-} host_operations[HOST_OPERATION_SLOTS];
+	uint32_t current_fb;
+	uint64_t current_start;
+	unsigned int count;
+	struct pass_time passes[32];
+	uint64_t total_ns;
+	uint32_t frames;
+} pass_totals;
 
-static void host_operation_run(const struct host_call *call)
+static void pass_stop(void)
 {
-	uint64_t start;
-	int index;
+	uint64_t elapsed = host_monotonic_ns() - pass_totals.current_start;
+	struct pass_time *pass;
 
-	if (!timing)
-	{
-		call->run(call + 1);
+	if (pass_totals.count >= sizeof(pass_totals.passes) / sizeof(pass_totals.passes[0]))
 		return;
-	}
-	if (call->run == run_buffer_write_to)
-		adjacency_call(_glthread_call_geometry);
-	start = host_ticks();
-	call->run(call + 1);
-	for (index = 0; index < HOST_OPERATION_SLOTS; index++)
+	pass = &pass_totals.passes[pass_totals.count++];
+	pass->fb = pass_totals.current_fb;
+	pass->draws = pass_draws;
+	pass->draws_elements = pass_draw_elements;
+	pass->draws_arrays = pass_draw_arrays;
+	pass->indices = pass_draw_indices;
+	pass->vertices = pass_draw_vertices;
+	pass->ns = elapsed;
+	pass_totals.total_ns += elapsed;
+	if (pass_trace && pass_totals.frames >= pass_trace_frame &&
+		pass_totals.frames < pass_trace_frame + pass_trace_count)
 	{
-		if (!host_operations[index].run || host_operations[index].run == call->run)
+		host_logf(HOST_LOG_INFO, "pass %2u: fb %3u, %4.1f ms, %3u draws (%3u el, %3u ar, %6lu idx, %6lu vtx)",
+			pass_totals.count, pass->fb, elapsed / 1e6, pass->draws, pass->draws_elements, pass->draws_arrays,
+			pass->indices, pass->vertices);
+	}
+	pass_draws = 0;
+	pass_draw_elements = 0;
+	pass_draw_arrays = 0;
+	pass_draw_indices = 0;
+	pass_draw_vertices = 0;
+}
+
+static void pass_start(uint32_t fb)
+{
+	if (pass_totals.current_start)
+		pass_stop();
+	pass_totals.current_fb = fb;
+	pass_totals.current_start = host_monotonic_ns();
+}
+
+static void pass_frame(void)
+{
+	unsigned int index;
+
+	pass_stop();
+	pass_totals.frames++;
+	if (pass_totals.frames % 300 == 0)
+	{
+		host_logf(HOST_LOG_INFO, "passes of frame %u (%.1f ms across %u passes):", pass_totals.frames,
+			pass_totals.total_ns / 1e6, pass_totals.count);
+		for (index = 0; index < pass_totals.count; index++)
 		{
-			host_operations[index].run = call->run;
-			host_operations[index].calls++;
-			host_operations[index].ticks += host_ticks() - start;
-			break;
+			const struct pass_time *pass = &pass_totals.passes[index];
+
+			host_logf(HOST_LOG_INFO, "  %2u: fb %3u, %4.1f ms, %3u draws (%3u el, %3u ar, %6lu idx, %6lu vtx)",
+				index + 1, pass->fb, pass->ns / 1e6, pass->draws, pass->draws_elements, pass->draws_arrays,
+				pass->indices, pass->vertices);
 		}
 	}
+	pass_totals.count = 0;
+	pass_totals.total_ns = 0;
+	pass_totals.current_start = 0;
 }
 
-static const char *host_operation_name(void (*run)(const void *));
-
-/* what comes between consecutive draws: nothing, vertex data only (buffer
-writes, attribute pointers), that and uniforms, or other state. Draws with
-nothing or only vertex data between them could be one draw */
-static uint32_t between_draws;
-static uint64_t draws_after[4];
-
-static void adjacency_call(uint32_t kind)
+void glthread_pass_bind_framebuffer(GLenum target, GLuint framebuffer)
 {
-	if (kind == _glthread_call_draw)
-	{
-		int category = !between_draws ? 0 : !(between_draws & ~(1u << _glthread_call_geometry)) ? 1 :
-			!(between_draws & ~((1u << _glthread_call_geometry) | (1u << _glthread_call_uniform))) ? 2 : 3;
-
-		draws_after[category]++;
-		between_draws = 0;
-	}
-	else
-	{
-		between_draws |= 1u << kind;
-	}
+	if (pass_timing && target == GL_FRAMEBUFFER)
+		pass_start(framebuffer);
 }
+
+void glthread_pass_draw_elements(GLsizei count)
+{
+	pass_draws++;
+	pass_draw_elements++;
+	pass_draw_indices += count;
+	if (draw_trace && pass_totals.frames >= pass_trace_frame &&
+		pass_totals.frames < pass_trace_frame + pass_trace_count)
+		host_logf(HOST_LOG_INFO, "  draw elements %4d (total %lu)", count, pass_draw_indices);
+}
+
+void glthread_pass_draw_arrays(GLsizei count)
+{
+	pass_draws++;
+	pass_draw_arrays++;
+	pass_draw_vertices += count;
+	if (draw_trace && pass_totals.frames >= pass_trace_frame &&
+		pass_totals.frames < pass_trace_frame + pass_trace_count)
+		host_logf(HOST_LOG_INFO, "  draw arrays   %4d (total %lu)", count, pass_draw_vertices);
+}
+
+/* ---------- timing report (glthread_timing_report) */
+
+struct waits
+{
+	uint64_t syncs;
+	uint64_t sync_ns;
+	uint64_t room_waits;
+	uint64_t room_ns;
+	uint64_t frame_waits;
+	uint64_t frame_ns;
+};
+
+static struct waits producer_waits;
+static struct waits frame_waits;
+static int timing;
+static int measure_waits;
 
 void glthread_timing_report(uint32_t frames)
 {
-	uint64_t frequency;
-	int index;
-
 	if (!timing || !frames)
 		return;
-	host_logf(HOST_LOG_INFO, "gl:   draws after another with nothing between %.1f, vertex data only %.1f, "
-		"and uniforms %.1f, other state %.1f", (double)draws_after[0] / frames, (double)draws_after[1] / frames,
-		(double)draws_after[2] / frames, (double)draws_after[3] / frames);
-	memset(draws_after, 0, sizeof(draws_after));
-	host_logf(HOST_LOG_INFO, "gl:   the game's thread waited: %.1f synchronous calls %.2f ms, %.1f times for room %.2f ms, "
-		"for the frame before %.2f ms (a frame)", (double)producer_waits.syncs / frames,
-		producer_waits.sync_ns / 1e6 / frames, (double)producer_waits.room_waits / frames,
-		producer_waits.room_ns / 1e6 / frames, producer_waits.frame_ns / 1e6 / frames);
+	host_logf(HOST_LOG_INFO, "  glthread waits per frame: %.2f ms (%.2f ms room, %.2f ms in %lu syncs, %.2f ms behind)",
+		(producer_waits.room_ns + producer_waits.sync_ns + producer_waits.frame_ns) / (frames * 1e6),
+		producer_waits.room_ns / (frames * 1e6), producer_waits.sync_ns / (frames * 1e6),
+		producer_waits.syncs / frames, producer_waits.frame_ns / (frames * 1e6));
 	memset(&producer_waits, 0, sizeof(producer_waits));
-	frequency = host_tick_frequency();
-	for (index = 0; index < HOST_OPERATION_SLOTS && host_operations[index].run; index++)
-	{
-		host_logf(HOST_LOG_INFO, "gl:   (host) %-21s %7.1f calls %7.3f ms", host_operation_name(host_operations[index].run),
-			(double)host_operations[index].calls / frames,
-			(double)host_operations[index].ticks * 1000.0 / (double)frequency / frames);
-		host_operations[index].calls = 0;
-		host_operations[index].ticks = 0;
-	}
 }
 
-/* ---------- the consumer */
+/* ---------- queue: producer */
 
-static void wake_producer(void)
+/* waits until at least size bytes are free in the ring */
+static void wait_for_room(size_t size)
 {
-	if (__atomic_load_n(&producer_shared.sleeping, __ATOMIC_SEQ_CST))
-	{
-		__atomic_store_n(&producer_shared.sleeping, 0, __ATOMIC_SEQ_CST);
-		futex_wake(&producer_shared.sleeping);
-	}
-}
+	uint64_t start = measure_waits ? host_monotonic_ns() : 0;
 
-static uint64_t wait_for_work(uint64_t position)
-{
-	uint64_t end;
-	int spin;
-
-	for (spin = 0; spin < SPIN_LIMIT; spin++)
-	{
-		end = __atomic_load_n(&producer_shared.published, __ATOMIC_ACQUIRE);
-		if (end != position)
-			return end;
-		relax();
-	}
-	for (;;)
-	{
-		__atomic_store_n(&consumer.sleeping, 1, __ATOMIC_SEQ_CST);
-		end = __atomic_load_n(&producer_shared.published, __ATOMIC_SEQ_CST);
-		if (end != position)
-		{
-			__atomic_store_n(&consumer.sleeping, 0, __ATOMIC_SEQ_CST);
-			return end;
-		}
-		futex_wait(&consumer.sleeping, 1);
-	}
-}
-
-/* the commands the consumer makes before it tells the producer the room
-they took is free */
-#define CONSUMED_INTERVAL 64
-
-static void *gl_thread_main(void *unused)
-{
-	uint64_t position = 0;
-	unsigned int count = 0;
-
-	(void)unused;
-	for (;;)
-	{
-		uint64_t end = wait_for_work(position);
-
-		while (position != end)
-		{
-			struct command *command = (struct command *)(ring + position % RING_SIZE);
-
-			switch (command->type)
-			{
-			case _command_call:
-			{
-				uint64_t start;
-
-				if (timing)
-					adjacency_call((uint32_t)glthread_call_kind(command->function));
-				if (pass_timing)
-					pass_call(command);
-				start = command_start();
-				glthread_replay(command->function, command + 1);
-				if (start)
-				{
-					uint64_t spent = host_monotonic_ns() - start;
-
-					hitch_command(_slow_call, command->function, NULL, spent);
-					if (call_trace && (spent > 300000 ||
-						glthread_call_kind(command->function) == _glthread_call_bind_framebuffer))
-					{
-						const GLuint *arguments = (const GLuint *)(command + 1);
-
-						host_logf(HOST_LOG_INFO, "call: at %6.2f ms function %3u kind %d (%u %u) %7.3f ms",
-							(start - bind_frame_start) / 1e6, command->function,
-							glthread_call_kind(command->function), arguments[0], arguments[1], spent / 1e6);
-					}
-				}
-				if (pass_timing)
-					draw_traced(command);
-				if (command->flags & COMMAND_EXTERNAL)
-					free(*external_payload(command));
-				break;
-			}
-			case _command_sync:
-			{
-				const struct sync_call *call = (const struct sync_call *)(command + 1);
-				uint32_t *done = call->done;
-				uint64_t start = command_start();
-
-				host_logf(HOST_LOG_INFO, "DIAG: gl sync handler ENTER (done=%p)", (void *)done);
-				call->run(call->context);
-				host_logf(HOST_LOG_INFO, "DIAG: gl sync handler after run");
-				if (start)
-					hitch_command(_slow_sync, 0, NULL, host_monotonic_ns() - start);
-				__atomic_store_n(done, 1, __ATOMIC_SEQ_CST);
-				futex_wake(done);
-				host_logf(HOST_LOG_INFO, "DIAG: gl sync handler done flag set");
-				break;
-			}
-			case _command_host:
-			{
-				const struct host_call *call = (const struct host_call *)(command + 1);
-				uint64_t start = command_start();
-
-				host_operation_run(call);
-				if (start)
-				{
-					uint64_t spent = host_monotonic_ns() - start;
-
-					hitch_command(_slow_host, 0, call->run, spent);
-					if (call_trace && spent > 300000)
-						host_logf(HOST_LOG_INFO, "call: at %6.2f ms host %s %7.3f ms", (start - bind_frame_start) / 1e6,
-							host_operation_name(call->run), spent / 1e6);
-				}
-				break;
-			}
-			default:
-				break;
-			}
-			position += command->size;
-			if (++count % CONSUMED_INTERVAL == 0 || position == end)
-			{
-				__atomic_store_n(&consumer.consumed, position, __ATOMIC_SEQ_CST);
-				wake_producer();
-			}
-		}
-	}
-	return NULL;
-}
-
-/* ---------- the producer */
-
-/* the commands the producer queues before it tells the consumer of them,
-in bytes. Each telling is a write to a line the consumer reads, and an
-ordered one (the consumer may have gone to sleep): some 5000 calls a frame
-told one by one took the game's thread about 4% of a frame. It tells the
-consumer of everything before it waits for it. */
-#define PUBLISH_INTERVAL 4096
-
-static void publish(void)
-{
-	producer.published = producer.head;
-	__atomic_store_n(&producer_shared.published, producer.head, __ATOMIC_SEQ_CST);
-	if (__atomic_load_n(&consumer.sleeping, __ATOMIC_SEQ_CST))
-	{
-		__atomic_store_n(&consumer.sleeping, 0, __ATOMIC_SEQ_CST);
-		futex_wake(&consumer.sleeping);
-	}
-}
-
-void glthread_publish(void)
-{
 	publish();
-}
-
-/* waits until the consumer has done enough for condition to hold */
-#define PRODUCER_WAIT(condition) \
-	do \
-	{ \
-		int spin_; \
-		if (!(condition)) \
-			publish(); \
-		for (spin_ = 0; spin_ < SPIN_LIMIT && !(condition); spin_++) \
-			relax(); \
-		while (!(condition)) \
-		{ \
-			__atomic_store_n(&producer_shared.sleeping, 1, __ATOMIC_SEQ_CST); \
-			if (condition) \
-			{ \
-				__atomic_store_n(&producer_shared.sleeping, 0, __ATOMIC_SEQ_CST); \
-				break; \
-			} \
-			futex_wait(&producer_shared.sleeping, 1); \
-		} \
-	} while (0)
-
-/* whether the ring has size bytes free; reads the consumer's position only
-when the one read last says not */
-static int has_room(uint64_t size)
-{
-	if (RING_SIZE - (producer.head - producer.consumed) >= size)
-		return 1;
-	producer.consumed = __atomic_load_n(&consumer.consumed, __ATOMIC_ACQUIRE);
-	return RING_SIZE - (producer.head - producer.consumed) >= size;
-}
-
-/* room for a command of size bytes, contiguous in the ring */
-static struct command *reserve(uint32_t type, uint32_t size)
-{
-	uint64_t offset = producer.head % RING_SIZE;
-	struct command *command;
-
-	/* multiples of 16, so that the room left before the end always holds
-	at least a header; at most half the ring (larger data goes elsewhere or
-	in parts), so that the room can always come */
-	size = (size + 15) & ~15u;
-	if (size > RING_SIZE / 2)
-		host_fatal("a GL command of %u bytes is larger than the GL thread's queue takes", size);
-	if (offset + size > RING_SIZE)
+	for (;;)
 	{
-		uint32_t rest = (uint32_t)(RING_SIZE - offset);
+		uint64_t done = __atomic_load_n(&consumer.consumed, __ATOMIC_ACQUIRE);
 
-		/* the end skipped first, so that the consumer can go past it while
-		the command waits for room at the start */
-		PRODUCER_WAIT(has_room(rest));
-		command = (struct command *)(ring + offset);
-		command->type = _command_wrap;
-		command->flags = 0;
-		command->size = rest;
-		producer.head += rest;
-		offset = 0;
+		producer.consumed = done;
+		if (RING_SIZE - (producer.head - done) >= size)
+			break;
+		wait_while_equal(&consumer.sleeping, 0, SPIN_LIMIT);
 	}
-	if (measure_waits && !has_room(size))
+	if (start)
 	{
-		uint64_t start = host_monotonic_ns();
-
-		PRODUCER_WAIT(has_room(size));
 		frame_waits.room_waits++;
 		frame_waits.room_ns += host_monotonic_ns() - start;
 	}
-	else
+}
+
+/* reserves room in the ring for a command of size bytes, publishing
+previous commands and sleeping as needed */
+static void *reserve_room(size_t size)
+{
+	size_t offset = (size_t)(producer.head & (RING_SIZE - 1));
+
+	/* the command must fit before the end of the ring */
+	if (offset + size > RING_SIZE)
 	{
-		PRODUCER_WAIT(has_room(size));
+		struct command *wrap;
+
+		if (RING_SIZE - (producer.head - producer.consumed) < size + (RING_SIZE - offset))
+			wait_for_room(size + (RING_SIZE - offset));
+		wrap = (struct command *)(ring + offset);
+		wrap->type = _command_wrap;
+		wrap->flags = 0;
+		wrap->size = (uint32_t)(RING_SIZE - offset);
+		producer.head += wrap->size;
+		offset = 0;
 	}
-	command = (struct command *)(ring + offset);
-	command->type = type;
+	else if (RING_SIZE - (producer.head - producer.consumed) < size)
+		wait_for_room(size);
+	return ring + offset;
+}
+
+void *glthread_begin(uint32_t function, size_t call_size)
+{
+	size_t size = (sizeof(struct command) + call_size + 15) & ~15u;
+	struct command *command = reserve_room(size);
+
+	command->type = _command_call;
 	command->flags = 0;
-	command->size = size;
-	command->function = 0;
-	return command;
-}
-
-static size_t round8(size_t value)
-{
-	return (value + 7) & ~(size_t)7;
-}
-
-void *glthread_begin(uint32_t function, size_t size, size_t payload)
-{
-	int external = payload > INLINE_LIMIT;
-	size_t total = sizeof(struct command) + round8(size) + (external ? sizeof(void *) : round8(payload));
-	struct command *command = reserve(_command_call, (uint32_t)total);
-
+	command->size = (uint32_t)size;
 	command->function = function;
-	if (external)
-	{
-		void *data = malloc(payload);
-
-		if (!data)
-			host_fatal("out of memory for a GL call's %zu bytes of data", payload);
-		command->flags = COMMAND_EXTERNAL;
-		*external_payload(command) = data;
-	}
 	producer.pending = command;
 	return command + 1;
 }
 
-void *glthread_payload(const void *call, size_t size)
+void *glthread_payload_inline(void *call, size_t size)
 {
-	const struct command *command = (const struct command *)call - 1;
+	(void)call;
+	size_t aligned = (size + 15) & ~15u;
+	void *space = reserve_room(aligned);
 
-	if (command->flags & COMMAND_EXTERNAL)
-		return *external_payload(command);
-	return (unsigned char *)call + round8(size);
+	producer.pending->size += (uint32_t)aligned;
+	return space;
+}
+
+void *glthread_payload_external(void *call, size_t size)
+{
+	(void)call;
+	void *payload = malloc(size);
+	void **slot;
+
+	if (!payload)
+		host_fatal("out of memory for a GL thread payload (%zu bytes)", size);
+	slot = (void **)glthread_payload_inline(call, sizeof(void *));
+	*slot = payload;
+	producer.pending->flags |= COMMAND_EXTERNAL;
+	return payload;
 }
 
 void glthread_end(void)
 {
 	producer.head += producer.pending->size;
 	producer.pending = NULL;
-	if (producer.head - producer.published >= PUBLISH_INTERVAL)
-		publish();
 }
 
-void glthread_sync(void (*run)(void *), void *context)
+static void *host_begin(void (*run)(const void *), size_t call_size)
 {
-	uint32_t done = 0;
-	struct command *command = reserve(_command_sync, (uint32_t)(sizeof(struct command) + round8(sizeof(struct sync_call))));
-	struct sync_call *call = (struct sync_call *)(command + 1);
+	size_t size = (sizeof(struct command) + sizeof(struct host_call) + call_size + 15) & ~15u;
+	struct command *command = reserve_room(size);
+	struct host_call *host = (struct host_call *)(command + 1);
 
-	call->run = run;
-	call->context = context;
-	call->done = &done;
-	producer.head += command->size;
-	publish();
-	if (measure_waits)
-	{
-		uint64_t start = host_monotonic_ns();
-
-		wait_while_equal(&done, 0, SPIN_LIMIT * 4);
-		frame_waits.syncs++;
-		frame_waits.sync_ns += host_monotonic_ns() - start;
-	}
-	else
-	{
-		wait_while_equal(&done, 0, SPIN_LIMIT * 4);
-	}
-}
-
-/* starts recording run(data), with room for size bytes of data (what it
-returns); glthread_end queues it */
-static void *host_begin(void (*run)(const void *data), size_t size)
-{
-	struct command *command = reserve(_command_host,
-		(uint32_t)(sizeof(struct command) + round8(sizeof(struct host_call)) + round8(size)));
-	struct host_call *call = (struct host_call *)(command + 1);
-
-	call->run = run;
+	command->type = _command_host;
+	command->flags = 0;
+	command->size = (uint32_t)size;
+	command->function = 0;
+	host->run = run;
 	producer.pending = command;
-	return call + 1;
+	return host + 1;
 }
 
-/* queues run(data), with a copy of size bytes of data */
-static void glthread_host(void (*run)(const void *data), const void *data, size_t size)
+static void glthread_host(void (*run)(const void *), const void *call, size_t size)
 {
-	memcpy(host_begin(run, size), data, size);
+	void *destination = host_begin(run, size);
+
+	memcpy(destination, call, size);
 	glthread_end();
 }
 
-/* ---------- pixel storage, for the sizes of images */
-
-static GLint unpack_alignment = 4;
-
-void glthread_pixel_store(GLenum name, GLint value)
+static void glthread_sync(void (*run)(void *), void *context)
 {
-	if (name == GL_UNPACK_ALIGNMENT)
-		unpack_alignment = value;
-}
+	uint32_t done = 0;
+	size_t size = sizeof(struct command) + sizeof(struct sync_call);
+	struct command *command = reserve_room(size);
+	struct sync_call *call = (struct sync_call *)(command + 1);
+	uint64_t start = measure_waits ? host_monotonic_ns() : 0;
 
-size_t glthread_image_size(GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type)
-{
-	size_t components, bytes, row;
-
-	switch (format)
+	command->type = _command_sync;
+	command->flags = 0;
+	command->size = (uint32_t)size;
+	command->function = 0;
+	call->run = run;
+	call->context = context;
+	call->done = &done;
+	producer.pending = command;
+	glthread_end();
+	publish();
+	wait_while_equal(&done, 0, SPIN_LIMIT);
+	if (start)
 	{
-	case GL_RED: case GL_RED_INTEGER: case GL_ALPHA: case GL_LUMINANCE: case GL_DEPTH_COMPONENT:
-		components = 1; break;
-	case GL_RG: case GL_RG_INTEGER: case GL_LUMINANCE_ALPHA:
-		components = 2; break;
-	case GL_RGB: case GL_RGB_INTEGER:
-		components = 3; break;
-	case GL_DEPTH_STENCIL:
-		components = 1; break;
-	default:
-		components = 4; break;
+		frame_waits.syncs++;
+		frame_waits.sync_ns += host_monotonic_ns() - start;
 	}
-	switch (type)
-	{
-	case GL_UNSIGNED_SHORT_5_6_5: case GL_UNSIGNED_SHORT_4_4_4_4: case GL_UNSIGNED_SHORT_5_5_5_1:
-		bytes = 2; components = 1; break;
-	case GL_UNSIGNED_INT_24_8: case GL_UNSIGNED_INT_2_10_10_10_REV: case GL_UNSIGNED_INT_10F_11F_11F_REV:
-	case GL_UNSIGNED_INT_5_9_9_9_REV:
-		bytes = 4; components = 1; break;
-	case GL_UNSIGNED_SHORT: case GL_SHORT: case GL_HALF_FLOAT:
-		bytes = 2; break;
-	case GL_UNSIGNED_INT: case GL_INT: case GL_FLOAT:
-		bytes = 4; break;
-	default:
-		bytes = 1; break;
-	}
-	row = (size_t)width * components * bytes;
-	if (unpack_alignment > 1)
-		row = (row + (size_t)unpack_alignment - 1) / (size_t)unpack_alignment * (size_t)unpack_alignment;
-	return row * (size_t)height * (size_t)(depth > 0 ? depth : 1);
 }
 
-/* ---------- reserved names */
+/* ---------- buffers: written without queueing a copy */
 
-#define RESERVE_SIZE 1024
-#define RESERVE_LOW 256
-#define RESERVE_REFILL 512
-
-static struct
+struct buffer_write
 {
-	GLuint names[RESERVE_SIZE];
-	int count;
-	int refilling;
-} reserves[_glthread_name_kinds];
-static pthread_mutex_t reserve_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void refill(int kind, int count)
-{
-	GLuint fresh[RESERVE_REFILL];
-
-	if (count > RESERVE_REFILL)
-		count = RESERVE_REFILL;
-	glthread_generate_names(kind, count, fresh);
-	pthread_mutex_lock(&reserve_lock);
-	if (reserves[kind].count + count <= RESERVE_SIZE)
-	{
-		memcpy(&reserves[kind].names[reserves[kind].count], fresh, (size_t)count * sizeof(GLuint));
-		reserves[kind].count += count;
-	}
-	reserves[kind].refilling = 0;
-	pthread_mutex_unlock(&reserve_lock);
-}
-
-static void run_refill(const void *data)
-{
-	refill(*(const int *)data, RESERVE_REFILL);
-}
-
-struct generate_call
-{
-	int kind;
-	GLsizei n;
-	GLuint *names;
+	uint32_t target;
+	uint32_t offset;
+	uint32_t size;
+	const void *data;
 };
 
-static void run_generate(void *context)
+static void run_buffer_write(const void *data)
 {
-	struct generate_call *call = context;
+	const struct buffer_write *call = data;
 
-	glthread_generate_names(call->kind, call->n, call->names);
+	host_gl_buffer_write(call->target, call->offset, call->size, call->data);
 }
 
-void glthread_reserved_names(int kind, GLsizei n, GLuint *names)
+static void queued_gl_buffer_write(uint32_t target, uint32_t offset, uint32_t size, const void *data)
 {
-	int ask = 0;
+	struct buffer_write call = { target, offset, size, data };
 
-	if (n <= 0)
-		return;
-	pthread_mutex_lock(&reserve_lock);
-	if (reserves[kind].count >= n)
-	{
-		reserves[kind].count -= n;
-		memcpy(names, &reserves[kind].names[reserves[kind].count], (size_t)n * sizeof(GLuint));
-		if (reserves[kind].count < RESERVE_LOW && !reserves[kind].refilling)
-			ask = reserves[kind].refilling = 1;
-		pthread_mutex_unlock(&reserve_lock);
-		if (ask)
-			glthread_host(run_refill, &kind, sizeof(kind));
-		return;
-	}
-	pthread_mutex_unlock(&reserve_lock);
-	{
-		struct generate_call call = { kind, n, names };
-
-		glthread_sync(run_generate, &call);
-	}
+	glthread_host(run_buffer_write, &call, sizeof(call));
 }
-
-/* ---------- the host's GL functions (host_gl.c, host_sdl2.c) */
-
-void host_gl_get_string(uint32_t name, int index, char *buffer, uint32_t size);
-int host_gl_has_extension(const char *name);
-uint32_t host_gl_read_buffer_word(uint32_t buffer, uint32_t offset);
-void host_gl_buffer_write(uint32_t target, uint32_t offset, uint32_t size, const void *data);
-void host_gl_buffer_persistent(uint32_t target, uint32_t size);
-void host_gl_buffer_write_to(uint32_t buffer, uint32_t target, uint32_t offset, uint32_t size, const void *data);
-void host_gl_program_build(uint32_t program, const char *cache_path, const char *vertex_source, long long vertex_hash,
-	const char *fragment_source, long long fragment_hash);
-int host_gl_program_load(uint32_t program, const char *cache_path);
-int host_gl_program_compile(uint32_t program, const char *cache_path, const char *vertex_source, long long vertex_hash,
-	const char *fragment_source, long long fragment_hash);
-void host_gl_fence_frame(uint32_t slot);
-void host_gl_wait_frame(uint32_t slot);
-uint32_t host_sdl_gl_create_context(uint32_t window);
-int host_sdl_gl_make_current(uint32_t window, uint32_t context);
-int host_sdl_gl_set_swap_interval(int interval);
-int host_sdl_gl_swap_interval(void);
-int host_sdl_gl_swap_window(uint32_t window);
-
-struct buffer_write_to
-{
-	uint32_t buffer, target, offset, size;
-};
 
 static void run_buffer_write_to(const void *data)
 {
-	const struct buffer_write_to *write = data;
+	const struct buffer_write *call = data;
 
-	host_gl_buffer_write_to(write->buffer, write->target, write->offset, write->size, write + 1);
+	host_gl_buffer_write_to(call->target, call->offset, call->size, call->data);
 }
 
-static void queued_gl_buffer_write_to(uint32_t buffer, uint32_t target, uint32_t offset, uint32_t size,
-	const void *data)
+static void queued_gl_buffer_write_to(uint32_t target, uint32_t offset, uint32_t size, const void *data)
 {
-	/* in parts that fit the queue */
-	while (size)
-	{
-		uint32_t part = size < INLINE_LIMIT ? size : INLINE_LIMIT;
-		struct buffer_write_to *write = host_begin(run_buffer_write_to, sizeof(*write) + part);
+	struct buffer_write call = { target, offset, size, data };
 
-		write->buffer = buffer;
-		write->target = target;
-		write->offset = offset;
-		write->size = part;
-		memcpy(write + 1, data, part);
-		glthread_end();
-		offset += part;
-		data = (const unsigned char *)data + part;
-		size -= part;
+	glthread_host(run_buffer_write_to, &call, sizeof(call));
+}
+
+/* ---------- frame pacing (flip_queue_frame) */
+
+struct frame_times
+{
+	uint64_t start;
+	uint64_t due;
+	uint64_t ready;
+	uint64_t drawn;
+	uint32_t delayed;
+};
+
+#define FRAME_HISTORY 16
+static struct frame_times frame_times[FRAME_HISTORY];
+static int vsync_on = 1;
+static int pacing_log;
+
+static void flip_queue_frame(uint32_t frame)
+{
+	struct frame_times *times = &frame_times[frame % FRAME_HISTORY];
+	uint64_t now = host_monotonic_ns();
+
+	if (times->drawn && (now - times->drawn) / 1e6 > 34.0)
+		host_logf(HOST_LOG_INFO, "flip: frame %u took %.1f ms (game %.1f, gl %.1f, held %.1f)", frame,
+			(now - times->drawn) / 1e6, (times->ready - times->start) / 1e6,
+			(now - times->ready) / 1e6, times->due ? (now - times->due) / 1e6 : 0.0);
+	times->drawn = now;
+}
+
+/* ---------- scanout (DRM/KMS page flip) timing */
+
+static struct
+{
+	int fd;
+	int crtc_id;
+	uint64_t period_ns;
+	uint64_t last_vblank_ns;
+	uint64_t last_flip_ns;
+	uint32_t last_sequence;
+} scanout_state;
+
+static int scanout;
+
+static void scanout_open(void)
+{
+	const char *card = getenv("HALO_DRM_CARD");
+	int fd;
+	struct fb_var_screeninfo var;
+	int fb;
+
+	if (scanout)
+		return;
+	fb = open("/dev/fb0", O_RDWR);
+	if (fb >= 0)
+	{
+		if (ioctl(fb, FBIOGET_VSCREENINFO, &var) == 0 && var.pixclock)
+		{
+			uint64_t h = var.xres + var.left_margin + var.right_margin + var.hsync_len;
+			uint64_t v = var.yres + var.upper_margin + var.lower_margin + var.vsync_len;
+			uint64_t ps = (uint64_t)var.pixclock * h * v;
+
+			scanout_state.period_ns = ps / 1000;
+		}
+		close(fb);
+	}
+	if (!scanout_state.period_ns)
+		scanout_state.period_ns = 1000000000ULL / 60;
+	fd = open(card && *card ? card : "/dev/dri/card0", O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+	{
+		host_logf(HOST_LOG_INFO, "frames are not paced: no display timing to read (%s)", strerror(errno));
+		return;
+	}
+	scanout_state.fd = fd;
+	scanout = 1;
+	host_logf(HOST_LOG_INFO, "frame pacing active (%.2f Hz display)", 1e9 / scanout_state.period_ns);
+}
+
+static uint64_t frame_due_time(void)
+{
+	uint64_t now = host_monotonic_ns();
+
+	if (!scanout || !vsync_on)
+		return now;
+	/* the next refresh: at least 2 ms after now, so that the frame can be
+	drawn before the scanout begins */
+	if (scanout_state.last_vblank_ns)
+	{
+		uint64_t next = scanout_state.last_vblank_ns;
+
+		while (next < now + 2000000ULL)
+			next += scanout_state.period_ns;
+		return next;
+	}
+	return now + scanout_state.period_ns;
+}
+
+static void frame_hold(uint32_t frame)
+{
+	struct frame_times *times = &frame_times[frame % FRAME_HISTORY];
+	uint64_t due = times->due;
+	uint64_t now;
+
+	if (!due || !vsync_on)
+		return;
+	now = host_monotonic_ns();
+	if (now < due)
+	{
+		struct timespec wait;
+
+		wait.tv_sec = (time_t)((due - now) / 1000000000ULL);
+		wait.tv_nsec = (long)((due - now) % 1000000000ULL);
+		nanosleep(&wait, NULL);
+	}
+	else if (now - due > scanout_state.period_ns / 2)
+		times->delayed = 1;
+}
+
+static void threaded_gl_frame_due(void)
+{
+	uint32_t submitted = producer.frames_submitted;
+	struct frame_times *times = &frame_times[submitted % FRAME_HISTORY];
+
+	times->due = frame_due_time();
+}
+
+/* ---------- reserve: glGen* names filled by the GL thread */
+
+enum
+{
+	_name_textures,
+	_name_buffers,
+	_name_renderbuffers,
+	_name_framebuffers,
+	_name_queries,
+	_name_vertex_arrays,
+	_glthread_name_kinds,
+};
+
+#define RESERVE_CAPACITY 256
+#define RESERVE_REFILL 64
+
+struct name_reserve
+{
+	uint32_t count;
+	uint32_t names[RESERVE_CAPACITY];
+};
+
+static struct name_reserve reserves[_glthread_name_kinds];
+
+struct refill_call
+{
+	int kind;
+	uint32_t count;
+};
+
+static void run_refill(const void *data)
+{
+	const struct refill_call *call = data;
+	struct name_reserve *reserve = &reserves[call->kind];
+	uint32_t make = RESERVE_CAPACITY - reserve->count;
+
+	if (make > call->count)
+		make = call->count;
+	switch (call->kind)
+	{
+	case _name_textures:
+		glGenTextures((GLsizei)make, reserve->names + reserve->count);
+		break;
+	case _name_buffers:
+		glGenBuffers((GLsizei)make, reserve->names + reserve->count);
+		break;
+	case _name_renderbuffers:
+		glGenRenderbuffers((GLsizei)make, reserve->names + reserve->count);
+		break;
+	case _name_framebuffers:
+		glGenFramebuffers((GLsizei)make, reserve->names + reserve->count);
+		break;
+	case _name_queries:
+		glGenQueries((GLsizei)make, reserve->names + reserve->count);
+		break;
+	}
+	reserve->count += make;
+}
+
+static void refill(int kind, uint32_t count)
+{
+	struct refill_call call = { kind, count };
+
+	glthread_host(run_refill, &call, sizeof(call));
+}
+
+static uint32_t reserve_take(int kind)
+{
+	struct name_reserve *reserve = &reserves[kind];
+	uint32_t name;
+
+	if (reserve->count == 0)
+	{
+		/* none left: must wait for the GL thread to fill the reserve */
+		struct refill_call call = { kind, RESERVE_REFILL };
+
+		glthread_sync((void (*)(void *))run_refill, &call);
+	}
+	name = reserve->names[--reserve->count];
+	if (reserve->count < RESERVE_REFILL / 2)
+		refill(kind, RESERVE_REFILL);
+	return name;
+}
+
+void glthread_names_take(int kind, GLsizei count, GLuint *names)
+{
+	while (count > 0)
+	{
+		*names++ = reserve_take(kind);
+		count--;
 	}
 }
 
-/* into the buffer bound to target: host_gl_buffer_write_to writes the bound
-buffer for a name it does not map, as 0 */
-static void queued_gl_buffer_write(uint32_t target, uint32_t offset, uint32_t size, const void *data)
-{
-	queued_gl_buffer_write_to(0, target, offset, size, data);
-}
+/* ---------- async shader and program compilation */
 
-/* ---------- programs built beside the GL thread
-
-A program the guest makes (host_gl_program_build) took the GL thread about
-2 ms to load from the driver's binary, and 220-250 ms to compile and link
-when it had none: a stall of the frame, and of the game's thread behind it.
-Threads of their own build them instead, on contexts that share the GL
-thread's objects: the loader loads binaries and hands what has none to the
-compiler, so that a load never waits for a compile. Until a program is
-built the GL thread leaves it unbound: the draws made with it are skipped
-(what it draws appears a frame or more late, the first time), and the
-uniforms set for it are kept, to be set once it is bound. The generated
-replay asks for that (glthread_program_use, _draw and _uniform).
-HALO_ASYNC_PROGRAMS=0 builds them on the GL thread, as before. */
-
-/* the call: its strings follow, the cache file's path, the vertex shader's
-source and the fragment shader's */
 struct program_build
 {
 	uint32_t program;
-	uint32_t path_size, vertex_size, fragment_size;
-	long long vertex_hash, fragment_hash;
+	uint32_t path_size;
+	uint32_t vertex_size;
+	uint32_t fragment_size;
+	long long vertex_hash;
+	long long fragment_hash;
 };
 
-/* a program being built; the call's strings follow it */
 struct program_job
 {
-	struct program_job *next;       /* in a builder's queue */
-	uint32_t done;                  /* set by the builder: built, or found it cannot be */
-	uint32_t linked;
-	/* the uniform calls made for it meanwhile, whole commands */
-	unsigned char *deferred;
-	size_t deferred_size, deferred_capacity;
+	struct program_job *next;
 	struct program_build build;
+	uint32_t done;
+	uint32_t linked;
+	unsigned char *deferred;
+	size_t deferred_size;
+	size_t deferred_capacity;
 };
 
 struct builder
 {
 	const char *name;
 	int nice;
+	EGLContext context;
+	uint32_t state;
 	pthread_mutex_t lock;
 	pthread_cond_t wake;
-	struct program_job *first, *last;
-	EGLContext context;
-	uint32_t state;                 /* 0 starting, 1 running, 2 without its context */
+	struct program_job *first;
+	struct program_job *last;
 };
 
-static struct builder loader = { "halo-load", 0, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER };
-static struct builder compiler = { "halo-compile", 5, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER };
+static struct builder loader = { "halo-loader", -2, EGL_NO_CONTEXT, 0, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL };
+static struct builder compiler = { "halo-compiler", 10, EGL_NO_CONTEXT, 0, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL };
+static struct program_job **jobs;
+static uint32_t job_capacity;
+static struct program_job unbuildable;
 static int builders_running;
-/* the GL thread's context, whose objects the contexts made current on other
-threads share (the program builders, and the guest's texture worker) */
 static EGLDisplay share_display;
 static EGLContext share_context = EGL_NO_CONTEXT;
 static EGLConfig share_config;
 static EGLint share_attributes[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-__thread int glthread_direct;
-/* the programs being built, by name; one that cannot be stays unbuildable,
-its draws skipped */
-static struct program_job **jobs;
-static uint32_t job_capacity;
-static struct program_job unbuildable = { .done = 1 };
-/* the program the guest bound last, and whether it is being built */
-static uint32_t bound_program;
+static GLuint bound_program;
 int glthread_program_blocked;
-/* for HALO_HITCH_LOG: the programs the builders made, and the draws skipped
-while they did and the frames they were in */
-static uint32_t programs_built, programs_compiled;
-static unsigned long skipped_draws, skipped_frames, program_frames;
+int glthread_direct;
+
+static uint32_t programs_compiled;
+static uint32_t programs_built;
+static unsigned long skipped_draws;
+static unsigned long skipped_frames;
+static unsigned long program_frames;
 
 static void builder_push(struct builder *builder, struct program_job *job)
 {
