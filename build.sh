@@ -1,23 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 # ======================================================================
 # Halo CE Universal - M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
-# Fix v22:
-#  - arm_neon.h fehlt im clang-22-Resource-Verzeichnis.
-#    Der Guest-Compile nutzt -isystem $(clang -print-resource-dir)/include
-#    und dort liegt keine arm_neon.h fuer --target=arm64_32-apple-watchos.
-#    Loesung: Header aus dem NDK-clang-Resource-Verzeichnis (oder einem
-#    anderen System-clang) in das Resource-Verzeichnis des GUEST_CC kopieren,
-#    NACH configure.py und VOR ninja.
-#  - libmali-Stub (innere build.sh) exportiert jetzt echte GL/EGL-Symbole
-#  - PKG_CONFIG_SYSROOT_DIR bleibt ENTFERNT
-#  - CMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH fuer SDL2/SDL3
-#  - -I$LIBDRM_INCLUDE in allen cmake-Aufrufen
-#  - Keine literalen Newlines in Python r'...' Strings
+# Fix v14 (Multiarch libdrm/libgbm):
+#  - Der Container bekommt ueber den Workflow aarch64-Versionen von
+#    libdrm.so und libgbm.so unter /usr/aarch64-linux-gnu/lib. Der
+#    SDL2-KMSDRM-Build findet sie dort.
+#  - build.sh prueft, dass diese aarch64-Symlinks vorhanden sind.
+#
+# Fix v15 (Guest-Build: size_t-Kollision beheben):
+#  - Der Guest-Build darf clangs Resource-Include-Verzeichnis NICHT
+#    ueber -isystem einbinden. Es enthaelt clangs __stddef_size_t.h,
+#    das mit musls alltypes.h kollidiert (arm64_32 / ILP32).
+#  - Stattdessen wird ein Shim-Verzeichnis mit NUR den ARM-Headern
+#    (arm_neon.h, arm_vector_types.h, arm_acle.h, arm_fp16.h,
+#    arm_bf16.h) verwendet.
+#  - Nach configure.py wird build.ninja geprueft und ein etwaiger
+#    -isystem /usr/lib/llvm-22/lib/clang/22/include entfernt.
+#
+# Fix v13 (SDL3 KMSDRM auf libdrm 2.4.110):
+#  - SDL3 3.2.10 verlangt drmModeGetConnectorTypeName, das erst
+#    libdrm 2.4.112 einfuehrt. Ubuntu 20.04 hat 2.4.110. Der SDL3-Header
+#    bekommt eine extern-Deklaration, damit GCC durchlaeuft.
+#
+# Fix v12 (DIAGNOSE):
+#  - patch_gl_init_order.py wird VOR dem Build aufgerufen und fuegt
+#    Log-Zeilen in host_glthread.c ein.
+#
+# Fix v11: Dispatcher-Bereich in patch_settings_only.py korrigiert.
+# Fix v7:  -mno-outline-atomics entfernt, CMAKE_CXX_COMPILER gesetzt.
 # ======================================================================
-
 PGO_MODE=${PGO_MODE:-use}
+
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/cybersecurity/halo-ce-universal.git}
 UPSTREAM_COMMIT=$(tr -d '[:space:]' < "$HERE/UPSTREAM_COMMIT")
@@ -44,54 +60,49 @@ need pkg-config "install pkg-config"
 need "$HOST_CC" "install gcc-aarch64-linux-gnu, or set HOST_CC"
 need "$HOST_CXX" "install g++-aarch64-linux-gnu, or set HOST_CXX"
 need "$GUEST_CC" "install clang-22 from apt.llvm.org, or set GUEST_CC"
-
 "$GUEST_CC" -print-targets 2> /dev/null | grep -q aarch64_32 ||
-die "$GUEST_CC has no arm64_32 (aarch64_32) target; use clang 22 from apt.llvm.org"
-
+    die "$GUEST_CC has no arm64_32 (aarch64_32) target; use clang 22 from apt.llvm.org"
 [ -n "${ANDROID_NDK:-}" ] || die "set ANDROID_NDK to the Android NDK r28c folder"
 [ -d "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64" ] || die "ANDROID_NDK=$ANDROID_NDK is not an Android NDK"
 ANDROID_NDK=$(cd "$ANDROID_NDK" && pwd)
-
 [ -n "${SYSROOT_LIB:-}" ] || die "set SYSROOT_LIB to the folder with the runtime libraries"
 mkdir -p "$SYSROOT_LIB" 2>/dev/null || true
 SYSROOT_LIB=$(cd "$SYSROOT_LIB" && pwd)
 
+# Ohne diese Pakete deaktiviert SDL2 den KMSDRM-Backend still und baut
+# ohne Fensterunterstuetzung (kmsdrm not available zur Laufzeit).
 for module in libdrm gbm; do
-if ! pkg-config --exists "$module"; then
-die "pkg-config findet '$module' nicht. Installiere libdrm-dev und libgbm-dev."
-fi
-done
-
-for lib in /usr/aarch64-linux-gnu/lib/libdrm.so /usr/aarch64-linux-gnu/lib/libgbm.so; do
-if [ ! -e "$lib" ]; then
-die "Cross-aarch64 $lib fehlt. Der Multiarch-Schritt im Workflow legt ihn an."
-fi
-done
-
-# ======================================================================
-# libdrm-Include-Pfad ermitteln
-# KEIN PKG_CONFIG_SYSROOT_DIR (haette Include-Pfade falsch prefixt)
-# KEINE eigenen .pc-Dateien (systemweite reichen)
-# ======================================================================
-LIBDRM_INCLUDE="/usr/include/libdrm"
-if [ ! -d "$LIBDRM_INCLUDE" ]; then
-  LIBDRM_CFLAGS=$(pkg-config --cflags libdrm 2>/dev/null || true)
-  if [ -n "$LIBDRM_CFLAGS" ]; then
-    FOUND_INC=$(echo "$LIBDRM_CFLAGS" | sed -n 's/.*-I\([^ ]*\).*/\1/p' | head -1)
-    if [ -n "$FOUND_INC" ] && [ -d "$FOUND_INC" ]; then
-      LIBDRM_INCLUDE="$FOUND_INC"
+    if ! pkg-config --exists "$module"; then
+        die "pkg-config findet '$module' nicht. Installiere libdrm-dev und libgbm-dev."
     fi
-  fi
+done
+
+# Der Cross-Linker braucht aarch64-Versionen von libdrm und libgbm.
+# Die amd64-Dev-Pakete liefern die Header und die pkg-config-Dateien,
+# aber nicht die aarch64-.so-Dateien; die kommen ueber die Multiarch-
+# Einrichtung im Workflow.
+for lib in /usr/aarch64-linux-gnu/lib/libdrm.so /usr/aarch64-linux-gnu/lib/libgbm.so; do
+    if [ ! -e "$lib" ]; then
+        die "Cross-aarch64 $lib fehlt. Der Multiarch-Schritt im Workflow legt ihn an."
+    fi
+done
+
+# libdecor-0.so.0 Stub erzeugen falls noch nicht vorhanden
+if [ ! -f "$SYSROOT_LIB/libdecor-0.so.0" ]; then
+    echo "== Erzeuge libdecor-0.so.0 Stub fuer ARM64 ..."
+    $HOST_CC -shared -fPIC -Wl,-soname,libdecor-0.so.0 -o "$SYSROOT_LIB/libdecor-0.so.0" -x c - <<'DECOR_EOF' || true
+void libdecor_new(void) {}
+void libdecor_unref(void) {}
+DECOR_EOF
 fi
-echo "== LIBDRM_INCLUDE=$LIBDRM_INCLUDE"
 
 if ! printf '%s' "$UPSTREAM_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
-die "UPSTREAM_COMMIT='$UPSTREAM_COMMIT' ist kein 40-stelliger Hex-Hash"
+    die "UPSTREAM_COMMIT='$UPSTREAM_COMMIT' ist kein 40-stelliger Hex-Hash"
 fi
 
 case "$PGO_MODE" in
-use|off|train) ;;
-*) die "PGO_MODE='$PGO_MODE' ungueltig; erlaubt: use, off, train" ;;
+    use|off|train) ;;
+    *) die "PGO_MODE='$PGO_MODE' ungueltig; erlaubt: use, off, train" ;;
 esac
 
 echo "== Upstream: $UPSTREAM_URL @ $UPSTREAM_COMMIT"
@@ -107,99 +118,99 @@ mkdir -p "$WORK" "$DIST" "$REJ"
 WORK=$(cd "$WORK" && pwd)
 DIST=$(cd "$DIST" && pwd)
 REJ=$(cd "$REJ" && pwd)
-
 SRC=$WORK/halo-ce-universal
+OPENCE=$WORK/opence
 
+# -- OpenCE-Dateien holen ---------------------------------------------
 fetch_opence_files() {
-local opence_dir="$WORK/opence-source"
-local opence_tarball="$WORK/opence-main.tar.gz"
+    local opence_dir="$WORK/opence-source"
+    local opence_tarball="$WORK/opence-main.tar.gz"
 
-echo ""
-echo "== Hole OpenCE-Dateien (Menue-System + Assets) ..."
-rm -rf "$opence_dir"
+    echo ""
+    echo "== Hole OpenCE-Dateien (Menue-System + Assets) ..."
+    rm -rf "$opence_dir"
 
-if git clone --depth 1 "$OPEN_CE_URL" "$opence_dir" > /dev/null 2>&1; then
-echo "   + Git-Clone erfolgreich."
-else
-rm -f "$opence_tarball"
-if ! curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 30 \
--o "$opence_tarball" \
-"https://github.com/OpenCommunityEdition/OpenCE/archive/refs/heads/main.tar.gz"; then
-die "Konnte OpenCE nicht klonen und auch nicht als Tarball laden."
-fi
-mkdir -p "$opence_dir"
-if ! tar -xzf "$opence_tarball" -C "$opence_dir" --strip-components=1; then
-die "Konnte OpenCE-Tarball nicht entpacken."
-fi
-echo "   + Tarball erfolgreich."
-fi
+    if git clone --depth 1 "$OPEN_CE_URL" "$opence_dir" > /dev/null 2>&1; then
+        echo "   + Git-Clone erfolgreich."
+    else
+        rm -f "$opence_tarball"
+        if ! curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 30 \
+            -o "$opence_tarball" \
+            "https://github.com/OpenCommunityEdition/OpenCE/archive/refs/heads/main.tar.gz"; then
+            die "Konnte OpenCE nicht klonen und auch nicht als Tarball laden."
+        fi
+        mkdir -p "$opence_dir"
+        if ! tar -xzf "$opence_tarball" -C "$opence_dir" --strip-components=1; then
+            die "Konnte OpenCE-Tarball nicht entpacken."
+        fi
+        echo "   + Tarball erfolgreich."
+    fi
 
-mkdir -p "$SRC/port/linux/include" "$SRC/port/linux/src" \
-"$SRC/port/linux/game" "$SRC/port/third_party"
+    mkdir -p "$SRC/port/linux/include" "$SRC/port/linux/src" \
+             "$SRC/port/linux/game" "$SRC/port/third_party"
+    for f in \
+        port/linux/include/halo_menus.h \
+        port/linux/include/halo_keyboard.h \
+        port/linux/src/menu_files.c \
+        port/linux/src/menu_files.h \
+        port/linux/game/menu_tags.c \
+        ; do
+        if [ -f "$opence_dir/$f" ]; then
+            cp "$opence_dir/$f" "$SRC/$f"
+            echo "   + $f"
+        else
+            die "OpenCE hat $f nicht."
+        fi
+    done
 
-for f in \
-port/linux/include/halo_menus.h \
-port/linux/include/halo_keyboard.h \
-port/linux/src/menu_files.c \
-port/linux/src/menu_files.h \
-port/linux/game/menu_tags.c \
-; do
-if [ -f "$opence_dir/$f" ]; then
-cp "$opence_dir/$f" "$SRC/$f"
-echo "   + $f"
-else
-die "OpenCE hat $f nicht."
-fi
-done
+    for f in port/linux/src/hud_hires.c port/linux/src/hud_hires.h; do
+        if [ -f "$opence_dir/$f" ]; then
+            cp "$opence_dir/$f" "$SRC/$f"
+            echo "   + $f (OpenCE-Version)"
+        fi
+    done
 
-for f in port/linux/src/hud_hires.c port/linux/src/hud_hires.h; do
-if [ -f "$opence_dir/$f" ]; then
-cp "$opence_dir/$f" "$SRC/$f"
-echo "   + $f (OpenCE-Version)"
-fi
-done
+    if [ -d "$opence_dir/port/third_party/expat" ]; then
+        rm -rf "$SRC/port/third_party/expat"
+        cp -a "$opence_dir/port/third_party/expat" "$SRC/port/third_party/"
+        echo "   + port/third_party/expat/"
+    else
+        die "OpenCE hat keinen port/third_party/expat-Ordner."
+    fi
 
-if [ -d "$opence_dir/port/third_party/expat" ]; then
-rm -rf "$SRC/port/third_party/expat"
-cp -a "$opence_dir/port/third_party/expat" "$SRC/port/third_party/"
-echo "   + port/third_party/expat/"
-else
-die "OpenCE hat keinen port/third_party/expat-Ordner."
-fi
+    if [ -d "$opence_dir/port/third_party/zlib" ]; then
+        rm -rf "$SRC/port/third_party/zlib"
+        cp -a "$opence_dir/port/third_party/zlib" "$SRC/port/third_party/"
+        echo "   + port/third_party/zlib/"
+    else
+        die "OpenCE hat keinen port/third_party/zlib-Ordner."
+    fi
 
-if [ -d "$opence_dir/port/third_party/zlib" ]; then
-rm -rf "$SRC/port/third_party/zlib"
-cp -a "$opence_dir/port/third_party/zlib" "$SRC/port/third_party/"
-echo "   + port/third_party/zlib/"
-else
-die "OpenCE hat keinen port/third_party/zlib-Ordner."
-fi
+    for t in tools/ce_menus.py tools/port_settings.py; do
+        if [ -f "$opence_dir/$t" ]; then
+            cp "$opence_dir/$t" "$SRC/$t"
+            echo "   + $t"
+        fi
+    done
 
-for t in tools/ce_menus.py tools/port_settings.py; do
-if [ -f "$opence_dir/$t" ]; then
-cp "$opence_dir/$t" "$SRC/$t"
-echo "   + $t"
-fi
-done
+    if [ -f "$opence_dir/tools/embed_assets.py" ]; then
+        cp "$opence_dir/tools/embed_assets.py" "$SRC/tools/embed_assets.py"
+        echo "   + tools/embed_assets.py (OpenCE-Version)"
+    fi
 
-if [ -f "$opence_dir/tools/embed_assets.py" ]; then
-cp "$opence_dir/tools/embed_assets.py" "$SRC/tools/embed_assets.py"
-echo "   + tools/embed_assets.py (OpenCE-Version)"
-fi
+    if [ -d "$opence_dir/port/assets/menus" ]; then
+        rm -rf "$SRC/port/assets/menus"
+        mkdir -p "$SRC/port/assets"
+        cp -a "$opence_dir/port/assets/menus" "$SRC/port/assets/menus"
+        local count
+        count=$(find "$SRC/port/assets/menus/ce" -name "*.xml" 2>/dev/null | wc -l)
+        echo "   + port/assets/menus/ ($count XML-Dateien)"
+    else
+        die "OpenCE hat keinen port/assets/menus-Ordner."
+    fi
 
-if [ -d "$opence_dir/port/assets/menus" ]; then
-rm -rf "$SRC/port/assets/menus"
-mkdir -p "$SRC/port/assets"
-cp -a "$opence_dir/port/assets/menus" "$SRC/port/assets/menus"
-local count
-count=$(find "$SRC/port/assets/menus/ce" -name "*.xml" 2>/dev/null | wc -l)
-echo "   + port/assets/menus/ ($count XML-Dateien)"
-else
-die "OpenCE hat keinen port/assets/menus-Ordner."
-fi
-
-rm -rf "$opence_dir" "$opence_tarball"
-echo "== OpenCE-Dateien geholt."
+    rm -rf "$opence_dir" "$opence_tarball"
+    echo "== OpenCE-Dateien geholt."
 }
 
 # -- XML-Hunk aus dem Knulli-Patch entfernen (idempotent) ------------
@@ -229,8 +240,9 @@ PYEOF
 # ======================================================================
 mkdir -p "$SYSROOT_LIB"
 if [ ! -f "$SYSROOT_LIB/libdecor-0.so.0" ] || readelf -s "$SYSROOT_LIB/libdecor-0.so.0" 2>/dev/null | grep -q "GLIBC_2\.3[2-9]"; then
-echo "== Kompiliere libdecor-0.so.0 Stub fuer Ubuntu 20.04 ..."
-$HOST_CC -shared -fPIC -Wl,-soname,libdecor-0.so.0 -o "$SYSROOT_LIB/libdecor-0.so.0" -x c - <<'DECOR_EOF' || true
+    echo "== Kompiliere libdecor-0.so.0 Stub fuer Ubuntu 20.04 (GLIBC 2.31 / ArkOS4Clone) ..."
+    $HOST_CC -shared -fPIC -Wl,-soname,libdecor-0.so.0 -o "$SYSROOT_LIB/libdecor-0.so.0" -x c - <<'DECOR_EOF' || true
+/* libdecor dummy stub for ArkOS4Clone / KMSDRM where Wayland is not used */
 void libdecor_new(void) {}
 void libdecor_unref(void) {}
 DECOR_EOF
@@ -240,19 +252,24 @@ fi
 # SDL3 (nur bauen, wenn .so fehlt)
 # ======================================================================
 if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
-echo "== SDL3 $SDL3_TAG: kompiliere aus dem Quellcode (GCC, shared)"
-SDL3_SRC=$WORK/SDL3-${SDL3_TAG#release-}
-SDL3_BUILD=$WORK/sdl3-build
-SDL3_INSTALL=$WORK/sdl3-install
+    echo "== SDL3 $SDL3_TAG: kompiliere aus dem Quellcode (GCC, shared)"
+    SDL3_SRC=$WORK/SDL3-${SDL3_TAG#release-}
+    SDL3_BUILD=$WORK/sdl3-build
+    SDL3_INSTALL=$WORK/sdl3-install
+    if [ ! -d "$SDL3_SRC" ]; then
+        curl -L -o "$WORK/sdl3.tar.gz" \
+            "https://github.com/libsdl-org/SDL/releases/download/$SDL3_TAG/SDL3-${SDL3_TAG#release-}.tar.gz"
+        tar -xzf "$WORK/sdl3.tar.gz" -C "$WORK"
+    fi
 
-if [ ! -d "$SDL3_SRC" ]; then
-curl -L -o "$WORK/sdl3.tar.gz" \
-"https://github.com/libsdl-org/SDL/releases/download/$SDL3_TAG/SDL3-${SDL3_TAG#release-}.tar.gz"
-tar -xzf "$WORK/sdl3.tar.gz" -C "$WORK"
-fi
-
-echo "== SDL3 KMSDRM: libdrm-2.4.110-Kompatibilitaet anwenden"
-python3 - "$SDL3_SRC/src/video/kmsdrm/SDL_kmsdrmsym.h" <<'KMSDRM_EOF'
+    # SDL3 3.2.10 ruft drmModeGetConnectorTypeName auf. Die Funktion
+    # wurde erst in libdrm 2.4.112 eingefuehrt; Ubuntu 20.04 hat
+    # 2.4.110. Der SDL3-Header wird um eine extern-Deklaration ergaenzt,
+    # damit GCC den Header durchlaeuft. SDL3 laedt die Funktion zur
+    # Laufzeit ueber SDL_KMSDRM_SYM_OPT und akzeptiert ein fehlendes
+    # Symbol.
+    echo "== SDL3 KMSDRM: libdrm-2.4.110-Kompatibilitaet anwenden"
+    python3 - "$SDL3_SRC/src/video/kmsdrm/SDL_kmsdrmsym.h" <<'KMSDRM_EOF'
 import sys
 path = sys.argv[1]
 with open(path) as f:
@@ -274,105 +291,97 @@ with open(path, 'w') as f:
 print("  SDL3 KMSDRM: Kompatibilitaets-Deklaration hinzugefuegt.")
 KMSDRM_EOF
 
-rm -rf "$SDL3_BUILD" "$SDL3_INSTALL"
-mkdir -p "$SDL3_BUILD" "$SDL3_INSTALL"
-
-cmake -S "$SDL3_SRC" -B "$SDL3_BUILD" \
--DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
--DCMAKE_C_COMPILER="$HOST_CC" \
--DCMAKE_CXX_COMPILER="$HOST_CXX" \
--DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
--DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
--DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
--DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
--DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
--DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
--DCMAKE_BUILD_TYPE=Release \
--DSDL_SHARED=ON -DSDL_STATIC=OFF \
--DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
--DSDL_INSTALL_TESTS=OFF -DSDL_WERROR=OFF -DSDL_UNIX_CONSOLE_BUILD=ON \
--DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
--DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
--DCMAKE_INSTALL_PREFIX="$SDL3_INSTALL"
-
-cmake --build "$SDL3_BUILD" -j "$JOBS"
-cmake --install "$SDL3_BUILD"
-
-SDL3_LIB=$(find "$SDL3_INSTALL" -name "libSDL3.so.0*" -type f | head -n 1)
-[ -n "$SDL3_LIB" ] || die "libSDL3.so.0 nicht gefunden"
-cp -L "$SDL3_LIB" "$SYSROOT_LIB/libSDL3.so.0"
-echo "== SDL3 kompiliert: $(stat -c%s "$SYSROOT_LIB/libSDL3.so.0") Bytes"
+    rm -rf "$SDL3_BUILD" "$SDL3_INSTALL"
+    mkdir -p "$SDL3_BUILD" "$SDL3_INSTALL"
+    cmake -S "$SDL3_SRC" -B "$SDL3_BUILD" \
+        -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+        -DCMAKE_C_COMPILER="$HOST_CC" \
+        -DCMAKE_CXX_COMPILER="$HOST_CXX" \
+        -DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35" \
+        -DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35" \
+        -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
+        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+        -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
+        -DSDL_INSTALL_TESTS=OFF -DSDL_WERROR=OFF -DSDL_UNIX_CONSOLE_BUILD=ON \
+        -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
+        -DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
+        -DCMAKE_INSTALL_PREFIX="$SDL3_INSTALL"
+    cmake --build "$SDL3_BUILD" -j "$JOBS"
+    cmake --install "$SDL3_BUILD"
+    SDL3_LIB=$(find "$SDL3_INSTALL" -name "libSDL3.so.0*" -type f | head -n 1)
+    [ -n "$SDL3_LIB" ] || die "libSDL3.so.0 nicht gefunden"
+    cp -L "$SDL3_LIB" "$SYSROOT_LIB/libSDL3.so.0"
+    echo "== SDL3 kompiliert: $(stat -c%s "$SYSROOT_LIB/libSDL3.so.0") Bytes"
 else
-echo "== libSDL3.so.0 bereits vorhanden"
+    echo "== libSDL3.so.0 bereits vorhanden"
 fi
 
 # ======================================================================
-# SDL2 mit KMSDRM + Pageflip-Patch
+# SDL2
 # ======================================================================
 SDL2_SRC=$WORK/SDL2-src
 SDL2_BUILD=$WORK/sdl2-build
 SDL2_INSTALL=$WORK/sdl2-install
 
 if [ -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
-if command -v aarch64-linux-gnu-readelf >/dev/null 2>&1 && \
-aarch64-linux-gnu-readelf -d "$SYSROOT_LIB/libSDL2-2.0.so.0" 2>/dev/null | grep -E -q "libX11|libpulse"; then
-echo "== Inkompatible sysroot libSDL2 (X11/Pulse) erkannt, loesche und baue sauber neu..."
-rm -f "$SYSROOT_LIB/libSDL2-2.0.so.0"
-fi
+    if command -v aarch64-linux-gnu-readelf >/dev/null 2>&1 && \
+       aarch64-linux-gnu-readelf -d "$SYSROOT_LIB/libSDL2-2.0.so.0" 2>/dev/null | grep -E -q "libX11|libpulse"; then
+        echo "== Inkompatible sysroot libSDL2 (X11/Pulse) erkannt, loesche und baue sauber neu..."
+        rm -f "$SYSROOT_LIB/libSDL2-2.0.so.0"
+    fi
 fi
 
 if [ ! -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
-echo "== SDL2 $SDL2_TAG: Quellcode holen und mit GCC bauen (shared)"
-rm -rf "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
-mkdir -p "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
+    echo "== SDL2 $SDL2_TAG: Quellcode holen und mit GCC bauen (shared)"
+    rm -rf "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
+    mkdir -p "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
+    curl -L -o "$WORK/sdl2.tar.gz" "$SDL2_ARCHIVE"
+    tar -xzf "$WORK/sdl2.tar.gz" -C "$SDL2_SRC" --strip-components=1
 
-curl -L -o "$WORK/sdl2.tar.gz" "$SDL2_ARCHIVE"
-tar -xzf "$WORK/sdl2.tar.gz" -C "$SDL2_SRC" --strip-components=1
-
-echo "== SDL2 KMSDRM Pageflip-Patch fuer Mali-G31 anwenden"
-python3 - "$SDL2_SRC/src/video/kmsdrm/SDL_kmsdrmopengles.c" <<'PATCH_EOF'
-import sys, re
+    echo "== SDL2 KMSDRM Pageflip-Patch fuer Mali-G31 anwenden"
+    python3 - "$SDL2_SRC/src/video/kmsdrm/SDL_kmsdrmopengles.c" <<'PATCH_EOF'
+import sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
-old = (
-    '    ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_id,\n'
-    'fb_info->fb_id, flip_flags, &windata->waiting_for_flip);\n'
-    'if (ret == 0) {\n'
-    'windata->waiting_for_flip = SDL_TRUE;\n'
-    '} else {\n'
-    'SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not queue pageflip: %d", ret);\n'
-    '}'
-)
-new = (
-    '    ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_id,\n'
-    'fb_info->fb_id, flip_flags, &windata->waiting_for_flip);\n'
-    'if (ret != 0 && (flip_flags & DRM_MODE_PAGE_FLIP_ASYNC)) {\n'
-    'viddata->async_pageflip_support = SDL_FALSE;\n'
-    'flip_flags &= ~DRM_MODE_PAGE_FLIP_ASYNC;\n'
-    'ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_id,\n'
-    'fb_info->fb_id, flip_flags, &windata->waiting_for_flip);\n'
-    'if (ret == 0) {\n'
-    'SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,\n'
-    '"Async pageflip rejected by the driver; using synchronous flips.");\n'
-    '}\n'
-    '}\n'
-    'if (ret == 0) {\n'
-    'windata->waiting_for_flip = SDL_TRUE;\n'
-    '} else {\n'
-    'SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not queue pageflip: %d", ret);\n'
-    '}'
-)
+old = '''    ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_id,
+                                  fb_info->fb_id, flip_flags, &windata->waiting_for_flip);
+    if (ret == 0) {
+        windata->waiting_for_flip = SDL_TRUE;
+    } else {
+        SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not queue pageflip: %d", ret);
+    }'''
+new = '''    ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_id,
+                                  fb_info->fb_id, flip_flags, &windata->waiting_for_flip);
+    if (ret != 0 && (flip_flags & DRM_MODE_PAGE_FLIP_ASYNC)) {
+        viddata->async_pageflip_support = SDL_FALSE;
+        flip_flags &= ~DRM_MODE_PAGE_FLIP_ASYNC;
+        ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_id,
+                                      fb_info->fb_id, flip_flags, &windata->waiting_for_flip);
+        if (ret == 0) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
+                        "Async pageflip rejected by the driver; using synchronous flips.");
+        }
+    }
+    if (ret == 0) {
+        windata->waiting_for_flip = SDL_TRUE;
+    } else {
+        SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not queue pageflip: %d", ret);
+    }'''
 if old not in text:
+    import re
     pattern = re.compile(
-        r'(ret = KMSDRM_drmModePageFlip\(viddata->drm_fd, dispdata->crtc->crtc_id,\s*'
-        r'\s*fb_info->fb_id, flip_flags, &windata->waiting_for_flip\);\s*'
-        r'\s*if \(ret == 0\) \{\s*'
-        r'\s*windata->waiting_for_flip = SDL_TRUE;\s*'
-        r'\s*\} else \{\s*'
-        r'\s*SDL_LogError\(SDL_LOG_CATEGORY_VIDEO, "Could not queue pageflip: %d", ret\);\s*'
-        r'\s*\})'
-    )
+        r'(ret = KMSDRM_drmModePageFlip\(viddata->drm_fd, dispdata->crtc->crtc_id,\s*\n'
+        r'\s*fb_info->fb_id, flip_flags, &windata->waiting_for_flip\);\s*\n'
+        r'\s*if \(ret == 0\) \{\s*\n'
+        r'\s*windata->waiting_for_flip = SDL_TRUE;\s*\n'
+        r'\s*\} else \{\s*\n'
+        r'\s*SDL_LogError\(SDL_LOG_CATEGORY_VIDEO, "Could not queue pageflip: %d", ret\);\s*\n'
+        r'\s*\})')
     match = pattern.search(text)
     if not match:
         print("FEHLER: Pageflip-Code nicht gefunden", file=sys.stderr)
@@ -385,61 +394,55 @@ with open(path, 'w') as f:
 print("SDL2 KMSDRM Pageflip-Patch angewendet")
 PATCH_EOF
 
-cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
--DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
--DCMAKE_C_COMPILER="$HOST_CC" \
--DCMAKE_CXX_COMPILER="$HOST_CXX" \
--DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
--DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
--DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
--DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
--DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
--DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
--DCMAKE_BUILD_TYPE=Release \
--DSDL_SHARED=ON -DSDL_STATIC=OFF \
--DSDL_TESTS=OFF \
--DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
--DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
--DCMAKE_INSTALL_PREFIX="$SDL2_INSTALL"
+    cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
+        -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+        -DCMAKE_C_COMPILER="$HOST_CC" \
+        -DCMAKE_CXX_COMPILER="$HOST_CXX" \
+        -DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35" \
+        -DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35" \
+        -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
+        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+        -DSDL_TESTS=OFF \
+        -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
+        -DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
+        -DCMAKE_INSTALL_PREFIX="$SDL2_INSTALL"
+    cmake --build "$SDL2_BUILD" -j "$JOBS"
+    cmake --install "$SDL2_BUILD"
 
-cmake --build "$SDL2_BUILD" -j "$JOBS"
-cmake --install "$SDL2_BUILD"
-
-SDL2_LIB=$(find "$SDL2_INSTALL" -name "libSDL2-2.0.so.0*" -type f | head -n 1)
-[ -n "$SDL2_LIB" ] || die "libSDL2-2.0.so.0 nicht gefunden"
-cp -L "$SDL2_LIB" "$SYSROOT_LIB/libSDL2-2.0.so.0"
-echo "== SDL2 nach sysroot kopiert: $(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0") Bytes"
+    SDL2_LIB=$(find "$SDL2_INSTALL" -name "libSDL2-2.0.so.0*" -type f | head -n 1)
+    [ -n "$SDL2_LIB" ] || die "libSDL2-2.0.so.0 nicht gefunden"
+    cp -L "$SDL2_LIB" "$SYSROOT_LIB/libSDL2-2.0.so.0"
+    echo "== SDL2 nach sysroot kopiert: $(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0") Bytes"
 else
-echo "== libSDL2-2.0.so.0 bereits in sysroot"
+    echo "== libSDL2-2.0.so.0 bereits in sysroot"
 fi
 
 if [ ! -d "$SDL2_INSTALL/include/SDL2" ]; then
-echo "== SDL2-Header fehlen, SDL2 neu bauen ..."
-rm -rf "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
-mkdir -p "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
-
-curl -L -o "$WORK/sdl2.tar.gz" "$SDL2_ARCHIVE"
-tar -xzf "$WORK/sdl2.tar.gz" -C "$SDL2_SRC" --strip-components=1
-
-cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
--DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
--DCMAKE_C_COMPILER="$HOST_CC" \
--DCMAKE_CXX_COMPILER="$HOST_CXX" \
--DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
--DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
--DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
--DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
--DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
--DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
--DCMAKE_BUILD_TYPE=Release \
--DSDL_SHARED=ON -DSDL_STATIC=OFF \
--DSDL_TESTS=OFF \
--DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
--DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
--DCMAKE_INSTALL_PREFIX="$SDL2_INSTALL"
-
-cmake --build "$SDL2_BUILD" -j "$JOBS"
-cmake --install "$SDL2_BUILD"
+    echo "== SDL2-Header fehlen, SDL2 neu bauen ..."
+    rm -rf "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
+    mkdir -p "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
+    curl -L -o "$WORK/sdl2.tar.gz" "$SDL2_ARCHIVE"
+    tar -xzf "$WORK/sdl2.tar.gz" -C "$SDL2_SRC" --strip-components=1
+    cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
+        -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+        -DCMAKE_C_COMPILER="$HOST_CC" \
+        -DCMAKE_CXX_COMPILER="$HOST_CXX" \
+        -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
+        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+        -DSDL_TESTS=OFF \
+        -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
+        -DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
+        -DCMAKE_INSTALL_PREFIX="$SDL2_INSTALL"
+    cmake --build "$SDL2_BUILD" -j "$JOBS"
+    cmake --install "$SDL2_BUILD"
 fi
 
 export SDL2_INCLUDE="$SDL2_INSTALL/include"
@@ -453,68 +456,65 @@ echo "== SDL2_LIB_DIR=$SDL2_LIB_DIR"
 # Upstream klonen + Knulli-Patch + OpenCE-Dateien
 # ======================================================================
 if [ ! -d "$SRC/.git" ]; then
-echo "== Klone Upstream in $SRC ..."
-git init -q "$SRC"
-git -C "$SRC" remote add origin "$UPSTREAM_URL"
+    echo "== Klone Upstream in $SRC ..."
+    git init -q "$SRC"
+    git -C "$SRC" remote add origin "$UPSTREAM_URL"
 fi
-
 if ! git -C "$SRC" cat-file -e "$UPSTREAM_COMMIT^{commit}" 2> /dev/null; then
-echo "== fetching $UPSTREAM_COMMIT"
-git -C "$SRC" fetch -q --depth 1 origin "$UPSTREAM_COMMIT" ||
-git -C "$SRC" fetch -q origin
+    echo "== fetching $UPSTREAM_COMMIT"
+    git -C "$SRC" fetch -q --depth 1 origin "$UPSTREAM_COMMIT" ||
+        git -C "$SRC" fetch -q origin
 fi
-
 git -C "$SRC" cat-file -e "$UPSTREAM_COMMIT^{commit}" 2> /dev/null ||
-die "commit $UPSTREAM_COMMIT not in $UPSTREAM_URL"
+    die "commit $UPSTREAM_COMMIT not in $UPSTREAM_URL"
 
 tree_is_patched() {
-[ "$(git -C "$SRC" rev-parse HEAD 2> /dev/null || true)" = "$UPSTREAM_COMMIT" ] &&
-cmp -s <(git -C "$SRC" diff HEAD | grep -v '^index ') <(grep -v '^index ' "$PATCH")
+    [ "$(git -C "$SRC" rev-parse HEAD 2> /dev/null || true)" = "$UPSTREAM_COMMIT" ] &&
+        cmp -s <(git -C "$SRC" diff HEAD | grep -v '^index ') <(grep -v '^index ' "$PATCH")
 }
-
 if ! tree_is_patched; then
-echo ""
-echo "== Setze Upstream auf $UPSTREAM_COMMIT zurueck ..."
-git -C "$SRC" checkout -q --force --detach "$UPSTREAM_COMMIT"
-git -C "$SRC" reset -q --hard
-git -C "$SRC" clean -q -fd -e work -e dist -e rej
+    echo ""
+    echo "== Setze Upstream auf $UPSTREAM_COMMIT zurueck ..."
+    git -C "$SRC" checkout -q --force --detach "$UPSTREAM_COMMIT"
+    git -C "$SRC" reset -q --hard
+    git -C "$SRC" clean -q -fd -e work -e dist -e rej
 
-fetch_opence_files
+    fetch_opence_files
 
-echo ""
-echo "== Pruefe und wende Knulli-Patch an ..."
-if ! git -C "$SRC" apply --check "$PATCH" 2>&1; then
-die "Knulli-Patch kann auf $UPSTREAM_COMMIT NICHT sauber angewendet werden."
-fi
-git -C "$SRC" apply "$PATCH"
-git -C "$SRC" apply --summary "$PATCH" | awk '$1 == "create" { print $4 }' | xargs -r git -C "$SRC" add -N --
-echo "== Knulli-Patch angewendet."
+    echo ""
+    echo "== Pruefe und wende Knulli-Patch an ..."
+    if ! git -C "$SRC" apply --check "$PATCH" 2>&1; then
+        die "Knulli-Patch kann auf $UPSTREAM_COMMIT NICHT sauber angewendet werden."
+    fi
+    git -C "$SRC" apply "$PATCH"
+    git -C "$SRC" apply --summary "$PATCH" | awk '$1 == "create" { print $4 }' | xargs -r git -C "$SRC" add -N --
+    echo "== Knulli-Patch angewendet."
 
-echo ""
-echo "== Kopiere menu_functions.c und port_settings_shim.c (NACH dem Patch) ..."
-if [ -f "$HERE/patches/settings_only_menu_functions.c" ]; then
-cp "$HERE/patches/settings_only_menu_functions.c" \
-"$SRC/port/linux/game/menu_functions.c"
-echo "   + menu_functions.c (settings-only)"
-else
-die "patches/settings_only_menu_functions.c fehlt."
-fi
+    echo ""
+    echo "== Kopiere menu_functions.c und port_settings_shim.c (NACH dem Patch) ..."
+    if [ -f "$HERE/patches/settings_only_menu_functions.c" ]; then
+        cp "$HERE/patches/settings_only_menu_functions.c" \
+           "$SRC/port/linux/game/menu_functions.c"
+        echo "   + menu_functions.c (settings-only)"
+    else
+        die "patches/settings_only_menu_functions.c fehlt."
+    fi
 
-if [ -f "$HERE/patches/port_settings_shim.c" ]; then
-cp "$HERE/patches/port_settings_shim.c" \
-"$SRC/port/linux/game/port_settings_shim.c"
-echo "   + port_settings_shim.c"
-else
-die "patches/port_settings_shim.c fehlt."
-fi
+    if [ -f "$HERE/patches/port_settings_shim.c" ]; then
+        cp "$HERE/patches/port_settings_shim.c" \
+           "$SRC/port/linux/game/port_settings_shim.c"
+        echo "   + port_settings_shim.c"
+    else
+        die "patches/port_settings_shim.c fehlt."
+    fi
 
-echo ""
-echo "== Fuege menu_files.c Forward-Deklarationen hinzu ..."
-python3 - "$SRC/port/linux/src/menu_files.c" <<'PYEOF'
+    echo ""
+    echo "== Fuege menu_files.c Forward-Deklarationen hinzu ..."
+    python3 - "$SRC/port/linux/src/menu_files.c" <<'PYEOF'
 import sys, os
 path = sys.argv[1]
 if not os.path.exists(path):
-    print("   [WARN] %s nicht gefunden." % path)
+    print(f"   [WARN] {path} nicht gefunden.")
     sys.exit(0)
 with open(path) as f:
     text = f.read()
@@ -522,7 +522,7 @@ if "extern void config_folder" in text and "extern void xgpu_gl_texture_deleted"
     print("   + menu_files.c: Forward-Deklarationen bereits vorhanden.")
     sys.exit(0)
 decl = (
-    "/* Forward-Deklarationen fuer Host-Funktionen, die menu_files.c\n"
+    "/* Fix v5: Forward-Deklarationen fuer Host-Funktionen, die menu_files.c\n"
     "   aufruft, deren Header im Guest-Build aber nicht eingebunden wird. */\n"
     "#ifdef HALO_ARM64_GUEST\n"
     "#ifndef MENU_FILES_HOST_FUNCS_DECLARED\n"
@@ -538,38 +538,38 @@ with open(path, "w") as f:
 print("   + menu_files.c: Forward-Deklarationen eingefuegt.")
 PYEOF
 
-echo ""
-echo "== Setze Menue-Hooks und Build-Registrierung ..."
-if [ -f "$HERE/patches/patch_settings_only.py" ]; then
-python3 "$HERE/patches/patch_settings_only.py" "$SRC" "$HERE/patches"
-else
-die "patches/patch_settings_only.py fehlt."
-fi
+    echo ""
+    echo "== Setze Menue-Hooks und Build-Registrierung ..."
+    if [ -f "$HERE/patches/patch_settings_only.py" ]; then
+        python3 "$HERE/patches/patch_settings_only.py" "$SRC" "$HERE/patches"
+    else
+        die "patches/patch_settings_only.py fehlt."
+    fi
 
-echo ""
-echo "== Patch android_build.py (Expat/Zlib/HALO_ARM64_GUEST) ..."
-if [ -f "$HERE/patches/patch_android_build_hybrid.py" ]; then
-python3 "$HERE/patches/patch_android_build_hybrid.py" "$SRC"
-else
-die "patches/patch_android_build_hybrid.py fehlt."
-fi
+    echo ""
+    echo "== Patch android_build.py (Expat/Zlib/HALO_ARM64_GUEST) ..."
+    if [ -f "$HERE/patches/patch_android_build_hybrid.py" ]; then
+        python3 "$HERE/patches/patch_android_build_hybrid.py" "$SRC"
+    else
+        die "patches/patch_android_build_hybrid.py fehlt."
+    fi
 
-echo ""
-echo "== Fuege fehlende C-Funktionen hinzu ..."
-if [ -f "$HERE/patches/patch_missing_functions.py" ]; then
-python3 "$HERE/patches/patch_missing_functions.py" "$SRC"
-else
-die "patches/patch_missing_functions.py fehlt."
-fi
+    echo ""
+    echo "== Fuege fehlende C-Funktionen hinzu ..."
+    if [ -f "$HERE/patches/patch_missing_functions.py" ]; then
+        python3 "$HERE/patches/patch_missing_functions.py" "$SRC"
+    else
+        die "patches/patch_missing_functions.py fehlt."
+    fi
 
-echo ""
-echo "== Kopiere guest_host_stubs.c nach port/linux/src/ ..."
-if [ -f "$HERE/patches/guest_host_stubs.c" ]; then
-cp "$HERE/patches/guest_host_stubs.c" "$SRC/port/linux/src/guest_host_stubs.c"
-echo "   + guest_host_stubs.c"
-else
-die "patches/guest_host_stubs.c fehlt."
-fi
+    echo ""
+    echo "== Kopiere guest_host_stubs.c nach port/linux/src/ ..."
+    if [ -f "$HERE/patches/guest_host_stubs.c" ]; then
+        cp "$HERE/patches/guest_host_stubs.c" "$SRC/port/linux/src/guest_host_stubs.c"
+        echo "   + guest_host_stubs.c"
+    else
+        die "patches/guest_host_stubs.c fehlt."
+    fi
 fi
 
 # ======================================================================
@@ -580,28 +580,27 @@ PGO_EXTRA_ARGS=""
 LTO_FLAG="--lto=full"
 
 if [ "$PGO_MODE" = "use" ]; then
-LOCAL_PGO="$HERE/pgo/halo_linux.profdata"
-PGO_LINUX_URL="https://raw.githubusercontent.com/cybersecurity/halo-ce-universal/main/pgo/halo_linux.profdata"
-PGO_FALLBACK_URL="https://raw.githubusercontent.com/Andiweli/HaloCE-Android-AAOS/main/pgo/halo_linux.profdata"
-
-if [ -f "$LOCAL_PGO" ]; then
-echo "== PGO: use (lokales Linux-Profil)"
-PGO_FLAG="--pgo=use"; PGO_EXTRA_ARGS="--pgo-profile $LOCAL_PGO"
-elif curl -fsSL --retry 2 --connect-timeout 30 -o "$WORK/halo_linux.profdata" "$PGO_LINUX_URL" 2>/dev/null; then
-echo "== PGO: use (Upstream-Linux-Profil)"
-PGO_FLAG="--pgo=use"; PGO_EXTRA_ARGS="--pgo-profile $WORK/halo_linux.profdata"
-elif curl -fsSL --retry 2 --connect-timeout 30 -o "$WORK/halo_linux.profdata" "$PGO_FALLBACK_URL" 2>/dev/null; then
-echo "== PGO: use (Fallback)"
-PGO_FLAG="--pgo=use"; PGO_EXTRA_ARGS="--pgo-profile $WORK/halo_linux.profdata"
-else
-echo "== PGO: kein Profil gefunden, --pgo=off"
-PGO_FLAG="--pgo=off"
-fi
+    LOCAL_PGO="$HERE/pgo/halo_linux.profdata"
+    PGO_LINUX_URL="https://raw.githubusercontent.com/cybersecurity/halo-ce-universal/main/pgo/halo_linux.profdata"
+    PGO_FALLBACK_URL="https://raw.githubusercontent.com/Andiweli/HaloCE-Android-AAOS/main/pgo/halo_linux.profdata"
+    if [ -f "$LOCAL_PGO" ]; then
+        echo "== PGO: use (lokales Linux-Profil)"
+        PGO_FLAG="--pgo=use"; PGO_EXTRA_ARGS="--pgo-profile $LOCAL_PGO"
+    elif curl -fsSL --retry 2 --connect-timeout 30 -o "$WORK/halo_linux.profdata" "$PGO_LINUX_URL" 2>/dev/null; then
+        echo "== PGO: use (Upstream-Linux-Profil)"
+        PGO_FLAG="--pgo=use"; PGO_EXTRA_ARGS="--pgo-profile $WORK/halo_linux.profdata"
+    elif curl -fsSL --retry 2 --connect-timeout 30 -o "$WORK/halo_linux.profdata" "$PGO_FALLBACK_URL" 2>/dev/null; then
+        echo "== PGO: use (Fallback)"
+        PGO_FLAG="--pgo=use"; PGO_EXTRA_ARGS="--pgo-profile $WORK/halo_linux.profdata"
+    else
+        echo "== PGO: kein Profil gefunden, --pgo=off"
+        PGO_FLAG="--pgo=off"
+    fi
 elif [ "$PGO_MODE" = "off" ]; then
-echo "== PGO: aus"
+    echo "== PGO: aus"
 elif [ "$PGO_MODE" = "train" ]; then
-echo "== PGO: Trainings-Build (kein LTO)"
-LTO_FLAG="--lto=off"
+    echo "== PGO: Trainings-Build (kein LTO)"
+    LTO_FLAG="--lto=off"
 fi
 
 # ======================================================================
@@ -612,103 +611,92 @@ import sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
-
-wait_old = (
-    '\tif (milliseconds == INFINITE)\n'
-    '\t\t{\n'
-    '\t\t\tpthread_cond_wait(&handle->condition, &handle->lock);\n'
-    '\t\t}\n'
-    '\t\telse if (pthread_cond_timedwait(&handle->condition, &handle->lock, &deadline) == ETIMEDOUT)\n'
-    '\t\t{\n'
-    '\t\t\tif (!handle_try_acquire(handle))\n'
-    '\t\t\t\tresult = WAIT_TIMEOUT;\n'
-    '\t\t\tbreak;\n'
-    '\t\t}'
-)
-wait_new = (
-    '\tif (alertable && platform_run_apcs())\n'
-    '\t\t{\n'
-    '\t\t\tpthread_mutex_unlock(&handle->lock);\n'
-    '\t\t\treturn WAIT_IO_COMPLETION;\n'
-    '\t\t}\n'
-    '\t\tif (milliseconds == INFINITE)\n'
-    '\t\t{\n'
-    '\t\t\tstruct timespec short_wait;\n'
-    '\t\t\tclock_gettime(CLOCK_REALTIME, &short_wait);\n'
-    '\t\t\tshort_wait.tv_nsec += 10000000;\n'
-    '\t\t\tif (short_wait.tv_nsec >= 1000000000L)\n'
-    '\t\t\t{\n'
-    '\t\t\t\tshort_wait.tv_sec++;\n'
-    '\t\t\t\tshort_wait.tv_nsec -= 1000000000L;\n'
-    '\t\t\t}\n'
-    '\t\t\tpthread_cond_timedwait(&handle->condition, &handle->lock, &short_wait);\n'
-    '\t\t}\n'
-    '\t\telse if (pthread_cond_timedwait(&handle->condition, &handle->lock, &deadline) == ETIMEDOUT)\n'
-    '\t\t{\n'
-    '\t\t\tif (alertable && platform_run_apcs())\n'
-    '\t\t\t{\n'
-    '\t\t\t\tpthread_mutex_unlock(&handle->lock);\n'
-    '\t\t\t\treturn WAIT_IO_COMPLETION;\n'
-    '\t\t\t}\n'
-    '\t\t\tif (!handle_try_acquire(handle))\n'
-    '\t\t\t\tresult = WAIT_TIMEOUT;\n'
-    '\t\t\tbreak;\n'
-    '\t\t}'
-)
+wait_old = '''\tif (milliseconds == INFINITE)
+\t\t{
+\t\t\tpthread_cond_wait(&handle->condition, &handle->lock);
+\t\t}
+\t\telse if (pthread_cond_timedwait(&handle->condition, &handle->lock, &deadline) == ETIMEDOUT)
+\t\t{
+\t\t\tif (!handle_try_acquire(handle))
+\t\t\t\tresult = WAIT_TIMEOUT;
+\t\t\tbreak;
+\t\t}'''
+wait_new = '''\tif (alertable && platform_run_apcs())
+\t\t{
+\t\t\tpthread_mutex_unlock(&handle->lock);
+\t\t\treturn WAIT_IO_COMPLETION;
+\t\t}
+\t\tif (milliseconds == INFINITE)
+\t\t{
+\t\t\tstruct timespec short_wait;
+\t\t\tclock_gettime(CLOCK_REALTIME, &short_wait);
+\t\t\tshort_wait.tv_nsec += 10000000;
+\t\t\tif (short_wait.tv_nsec >= 1000000000L)
+\t\t\t{
+\t\t\t\tshort_wait.tv_sec++;
+\t\t\t\tshort_wait.tv_nsec -= 1000000000L;
+\t\t\t}
+\t\t\tpthread_cond_timedwait(&handle->condition, &handle->lock, &short_wait);
+\t\t}
+\t\telse if (pthread_cond_timedwait(&handle->condition, &handle->lock, &deadline) == ETIMEDOUT)
+\t\t{
+\t\t\tif (alertable && platform_run_apcs())
+\t\t\t{
+\t\t\t\tpthread_mutex_unlock(&handle->lock);
+\t\t\t\treturn WAIT_IO_COMPLETION;
+\t\t\t}
+\t\t\tif (!handle_try_acquire(handle))
+\t\t\t\tresult = WAIT_TIMEOUT;
+\t\t\tbreak;
+\t\t}'''
 if wait_old not in text:
     print("WARNUNG: WaitForSingleObjectEx-Muster nicht gefunden.")
 else:
     text = text.replace(wait_old, wait_new, 1)
-
-sleep_old = (
-    '\tif (milliseconds == INFINITE)\n'
-    '\t{\n'
-    '\t\tfor (;;)\n'
-    '\t\t\tpause();\n'
-    '\t}\n'
-    '\tduration.tv_sec = milliseconds / 1000;\n'
-    '\tduration.tv_nsec = (long)(milliseconds % 1000) * 1000000L;\n'
-    '\twhile (nanosleep(&duration, &duration) == -1 && errno == EINTR)\n'
-    '\t\t;\n'
-    '\tif (alertable && platform_run_apcs())\n'
-    '\t\treturn WAIT_IO_COMPLETION;\n'
-    '\treturn 0;'
-)
-sleep_new = (
-    '\tif (milliseconds == INFINITE)\n'
-    '\t{\n'
-    '\t\tfor (;;)\n'
-    '\t\t{\n'
-    '\t\t\tif (alertable && platform_run_apcs())\n'
-    '\t\t\t\treturn WAIT_IO_COMPLETION;\n'
-    '\t\t\tpause();\n'
-    '\t\t}\n'
-    '\t}\n'
-    '\tduration.tv_sec = milliseconds / 1000;\n'
-    '\tduration.tv_nsec = (long)(milliseconds % 1000) * 1000000L;\n'
-    '\twhile (duration.tv_sec > 0 || duration.tv_nsec > 0)\n'
-    '\t{\n'
-    '\t\tstruct timespec step;\n'
-    '\t\tstep.tv_sec = duration.tv_sec > 0 ? 1 : 0;\n'
-    '\t\tstep.tv_nsec = duration.tv_sec > 0 ? 0 : (duration.tv_nsec > 10000000L ? 10000000L : duration.tv_nsec);\n'
-    '\t\tif (nanosleep(&step, NULL) == -1 && errno != EINTR)\n'
-    '\t\t\tbreak;\n'
-    '\t\tif (step.tv_sec == 0 && step.tv_nsec == 10000000L)\n'
-    '\t\t\tduration.tv_nsec -= 10000000L;\n'
-    '\t\telse if (step.tv_sec == 1)\n'
-    '\t\t\tduration.tv_sec--;\n'
-    '\t\telse\n'
-    '\t\t\tduration.tv_nsec = 0;\n'
-    '\t\tif (alertable && platform_run_apcs())\n'
-    '\t\t\treturn WAIT_IO_COMPLETION;\n'
-    '\t}\n'
-    '\treturn 0;'
-)
+sleep_old = '''\tif (milliseconds == INFINITE)
+\t{
+\t\tfor (;;)
+\t\t\tpause();
+\t}
+\tduration.tv_sec = milliseconds / 1000;
+\tduration.tv_nsec = (long)(milliseconds % 1000) * 1000000L;
+\twhile (nanosleep(&duration, &duration) == -1 && errno == EINTR)
+\t\t;
+\tif (alertable && platform_run_apcs())
+\t\treturn WAIT_IO_COMPLETION;
+\treturn 0;'''
+sleep_new = '''\tif (milliseconds == INFINITE)
+\t{
+\t\tfor (;;)
+\t\t{
+\t\t\tif (alertable && platform_run_apcs())
+\t\t\t\treturn WAIT_IO_COMPLETION;
+\t\t\tpause();
+\t\t}
+\t}
+\tduration.tv_sec = milliseconds / 1000;
+\tduration.tv_nsec = (long)(milliseconds % 1000) * 1000000L;
+\twhile (duration.tv_sec > 0 || duration.tv_nsec > 0)
+\t{
+\t\tstruct timespec step;
+\t\tstep.tv_sec = duration.tv_sec > 0 ? 1 : 0;
+\t\tstep.tv_nsec = duration.tv_sec > 0 ? 0 : (duration.tv_nsec > 10000000L ? 10000000L : duration.tv_nsec);
+\t\tif (nanosleep(&step, NULL) == -1 && errno != EINTR)
+\t\t\tbreak;
+\t\tif (step.tv_sec == 0 && step.tv_nsec == 10000000L)
+\t\t\tduration.tv_nsec -= 10000000L;
+\t\telse if (step.tv_sec == 1)
+\t\t\tduration.tv_sec--;
+\t\telse
+\t\t\tduration.tv_nsec = 0;
+\t\tif (alertable && platform_run_apcs())
+\t\t\treturn WAIT_IO_COMPLETION;
+\t}
+\treturn 0;'''
 if sleep_old not in text:
     print("WARNUNG: SleepEx-Muster nicht gefunden.")
 else:
     text = text.replace(sleep_old, sleep_new, 1)
-
 with open(path, 'w') as f:
     f.write(text)
 print("xbox_kernel.c geprueft")
@@ -722,31 +710,25 @@ import sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
-
 old_mcpu = '"-mcpu=cortex-a53"'
-new_mcpu = '"-mcpu=cortex-a35",\n"-mtune=cortex-a35"'
+new_mcpu = '"-mcpu=cortex-a35",\n    "-mtune=cortex-a35"'
 if text.count(old_mcpu) > 0:
     text = text.replace(old_mcpu, new_mcpu)
     print("android_build.py: mcpu=cortex-a53 -> cortex-a35")
-
-old_flags = '"-ffp-contract=off",\n"-O2",'
-new_flags = (
-    '"-ffp-contract=off",\n'
-    '"-O3",\n'
-    '"-fomit-frame-pointer",\n'
-    '"-funroll-loops",\n'
-    '"-fno-math-errno",\n'
-    '"-fno-trapping-math",\n'
-    '"-fmerge-all-constants",\n'
-    '"-fno-strict-aliasing",'
-)
+old_flags = '"-ffp-contract=off",\n    "-O2",'
+new_flags = '''"-ffp-contract=off",
+    "-O3",
+    "-fomit-frame-pointer",
+    "-funroll-loops",
+    "-fno-math-errno",
+    "-fno-trapping-math",
+    "-fmerge-all-constants",
+    "-fno-strict-aliasing",'''
 if old_flags in text:
     text = text.replace(old_flags, new_flags, 1)
     print("android_build.py: O2 -> O3 + Flags")
-
 if '"-fno-omit-frame-pointer"' in text:
     text = text.replace('    "-fno-omit-frame-pointer",\n', '')
-
 with open(path, 'w') as f:
     f.write(text)
 PYEOF
@@ -760,75 +742,136 @@ if '"-DHALO_ANDROID"' in text:
     sys.exit(0)
 anchor = '"-DHALO_RELEASE"'
 if anchor in text:
-    text = text.replace(anchor, '"-DHALO_ANDROID",\n"-DHALO_RELEASE"', 1)
-with open(path, 'w') as f:
-    f.write(text)
-print("android_build.py: -DHALO_ANDROID")
+    text = text.replace(anchor, '"-DHALO_ANDROID",\n    "-DHALO_RELEASE"', 1)
+    with open(path, 'w') as f:
+        f.write(text)
+    print("android_build.py: -DHALO_ANDROID")
 PYEOF
 
-# ======================================================================
-# clang-Builtin-Shim: gibt den kompletten Resource-Include-Pfad zurueck
-# ======================================================================
+# ----------------------------------------------------------------------
+# Fix v15: clang-Builtin-Shim - ROBUSTE Variante
+#
+# Der Guest-Build (arm64_32) darf clangs volles Resource-Include-
+# Verzeichnis NICHT ueber -isystem einbinden. Es enthaelt clangs
+# __stddef_size_t.h, das mit musls alltypes.h kollidiert.
+#
+# Diese Fassung:
+#   1. fuegt die Funktion _clang_builtin_shim() immer ein, unabhaengig
+#      von einem bestimmten Anchor,
+#   2. ersetzt JEDEN Aufruf von _clang_resource_include(...) durch
+#      _clang_builtin_shim(guest_cc),
+#   3. entfernt literale "-isystem", "<...>/lib/clang/<ver>/include"-
+#      Eintraege aus dem Quelltext,
+#   4. prueft am Ende, dass kein solcher Pfad mehr uebrig ist.
+#
+# Der Shim-Ordner enthaelt nur arm_neon.h, arm_vector_types.h,
+# arm_acle.h, arm_fp16.h, arm_bf16.h.
+# ----------------------------------------------------------------------
 python3 - "$SRC/tools/android_build.py" <<'PYEOF'
 import re, sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
 
-new_fn = (
-    'def _clang_builtin_shim(cc: str) -> list:\n'
-    '    try:\n'
-    '        result = subprocess.run([cc, "-print-resource-dir"],\n'
-    '                                capture_output=True, text=True, check=True)\n'
-    '    except (subprocess.CalledProcessError, FileNotFoundError, OSError):\n'
-    '        return []\n'
-    '    include = Path(result.stdout.strip()) / "include"\n'
-    '    if not include.is_dir():\n'
-    '        return []\n'
-    '    return ["-isystem", str(include)]\n'
+# --- 1. Shim-Funktion einfuegen (idempotent) --------------------------
+if "_clang_builtin_shim" not in text:
+    lines = text.split("\n")
+    insert_at = 0
+    for i, line in enumerate(lines):
+        if re.match(r"^(import |from \S+ import )", line):
+            insert_at = i + 1
+    shim_fn = '''
+def _clang_builtin_shim(cc):
+    """Gibt ["-isystem", <shim>] zurueck, wobei <shim> nur die
+    ARM-spezifischen Builtin-Header enthaelt (arm_neon.h,
+    arm_vector_types.h, arm_acle.h, arm_fp16.h, arm_bf16.h).
+
+    WICHTIG: clangs volles Resource-Include-Verzeichnis
+    (z.B. /usr/lib/llvm-22/lib/clang/22/include) darf hier NICHT
+    eingebunden werden. Es enthaelt clangs __stddef_size_t.h, das
+    mit musls alltypes.h im arm64_32-Guest-Build kollidiert und
+    'typedef redefinition with different types' ausloest.
+    """
+    import shutil
+    try:
+        result = subprocess.run([cc, "-print-resource-dir"],
+                                capture_output=True, text=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return []
+    include = Path(result.stdout.strip()) / "include"
+    if not include.is_dir():
+        return []
+    shim = BUILD / "guest" / "clang_builtin_shim"
+    shim.mkdir(parents=True, exist_ok=True)
+    for name in ("arm_neon.h", "arm_vector_types.h", "arm_acle.h",
+                 "arm_fp16.h", "arm_bf16.h"):
+        source = include / name
+        if not source.is_file():
+            continue
+        target = shim / name
+        if target.exists() or target.is_symlink():
+            try:
+                target.unlink()
+            except OSError:
+                pass
+        try:
+            target.symlink_to(source)
+        except OSError:
+            shutil.copy2(source, target)
+    return ["-isystem", str(shim)]
+'''
+    lines.insert(insert_at, shim_fn)
+    text = "\n".join(lines)
+    print("clang-Builtin-Shim: Funktion _clang_builtin_shim() eingefuegt.")
+
+# --- 2. Alte Aufrufe ersetzen ----------------------------------------
+before = text
+text = re.sub(r"_clang_resource_include\s*\(\s*guest_cc\s*\)",
+              "_clang_builtin_shim(guest_cc)", text)
+text = re.sub(r"_clang_resource_include\s*\(\s*cc\s*\)",
+              "_clang_builtin_shim(cc)", text)
+if text != before:
+    print("clang-Builtin-Shim: Aufrufe ersetzt.")
+
+# --- 3. Literale -isystem-Eintraege auf clang-Ressource entfernen ----
+#     Muster: "-isystem", "<...>/lib/clang/<ver>/include"
+before = text
+text = re.sub(
+    r'"-isystem"\s*,\s*"[^"]*/lib/clang/[^"]*/include"\s*,?\s*\n',
+    "",
+    text,
 )
+if text != before:
+    print("clang-Builtin-Shim: literal -isystem auf clang-Ressource entfernt.")
 
-old_pattern = re.compile(
-    r'def _clang_builtin_shim\(cc: str\) -> list:.*?(?=\ndef |\nclass |\Z)',
-    re.DOTALL,
-)
-if old_pattern.search(text):
-    text = old_pattern.sub(new_fn, text, count=1)
-    print("clang-Builtin-Shim: alter Patch ueberschrieben (kompletter Include-Pfad)")
-else:
-    anchor = (
-        '    for sdk in (Path.home() / "Android/Sdk", Path("/opt/android-sdk")):\n'
-        '        if (sdk / "ndk").is_dir():\n'
-        '            versions = sorted((sdk / "ndk").iterdir())\n'
-        '            if versions:\n'
-        '                return versions[-1]\n'
-        '    return None\n'
-    )
-    if anchor in text:
-        text = text.replace(anchor, anchor + "\n" + new_fn, 1)
-        print("clang-Builtin-Shim: neu eingefuegt (kompletter Include-Pfad)")
-    else:
-        print("WARNUNG: Anker fuer _clang_builtin_shim nicht gefunden.")
+# --- 4. Sanity-Check -------------------------------------------------
+bad = []
+for line in text.split("\n"):
+    s = line.strip()
+    if s.startswith("#"):
+        continue
+    if "/lib/clang/" in line and "/include" in line:
+        # Zeilen, die nur in einem Docstring stehen, ignorieren wir nicht
+        # pauschal - aber wir listen sie auf, damit der Benutzer sie sieht.
+        bad.append(line)
 
-text = text.replace(
-    "_clang_resource_include(guest_cc)",
-    "_clang_builtin_shim(guest_cc)",
-)
-
-if "guest_abi = " in text and "_clang_builtin_shim(guest_cc)" not in text:
-    text = re.sub(
-        r'(guest_abi\s*=\s*"[^"]*"\s*\.join\(\s*\n?\s*GUEST_ABI_FLAGS\b)',
-        r'\1\n+ _clang_builtin_shim(guest_cc)',
-        text,
-        count=1,
-    )
-
-with open(path, 'w') as f:
+with open(path, "w") as f:
     f.write(text)
+
+if bad:
+    print("FEHLER: android_build.py enthaelt weiterhin clang-Resource-Pfade:")
+    for line in bad[:8]:
+        print("  " + line)
+    print("Diese Zeilen verursachen die size_t-Kollision im Guest-Build.")
+    print("Bitte patch_android_build_hybrid.py oder das 'Fix v22'-Skript")
+    print("entsprechend anpassen, damit der Resource-Pfad dort nicht mehr")
+    print("in die Compile-Flags geschrieben wird.")
+    sys.exit(1)
+print("clang-Builtin-Shim: robuster Patch angewendet, keine Resource-Pfade mehr.")
 PYEOF
 
 if [ "$PGO_MODE" = "train" ]; then
-python3 - "$SRC/tools/android_build.py" <<'PYEOF'
+    python3 - "$SRC/tools/android_build.py" <<'PYEOF'
 import sys
 path = sys.argv[1]
 with open(path) as f:
@@ -837,57 +880,51 @@ if "-fprofile-instr-generate" in text:
     sys.exit(0)
 for old in ('"-O3",', '"-O3"'):
     if old in text:
-        text = text.replace(old, old.replace('"-O3"', '"-O3",\n"-fprofile-instr-generate"'), 1)
-with open(path, 'w') as f:
-    f.write(text)
-print("android_build.py: -fprofile-instr-generate")
-sys.exit(0)
+        text = text.replace(old, old.replace('"-O3"', '"-O3",\n    "-fprofile-instr-generate"'), 1)
+        with open(path, 'w') as f:
+            f.write(text)
+        print("android_build.py: -fprofile-instr-generate")
+        sys.exit(0)
 PYEOF
-
-python3 - "$SRC/tools/android_build.py" <<'PYEOF'
+    python3 - "$SRC/tools/android_build.py" <<'PYEOF'
 import sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
 if "guest_profile_runtime" in text:
     sys.exit(0)
-old = (
-    '    n.rule(\n'
-    '        name="android_guest_link",\n'
-    '        command=(f"$android_ndk_bin/ld.lld -m aarch64linux -static -nostdlib -T {linker_script} "\n'
-    '                 f"-Map $out.map -o $out @$out.rsp {libguestc} "\n'
-    '                 "$$($android_host_cc -print-libgcc-file-name)"),'
-)
-new = (
-    '    guest_profile_runtime = ""\n'
-    '    for _cc_candidate in (guest_cc, str(ndk_bin / "clang")):\n'
-    '        if not _cc_candidate:\n'
-    '            continue\n'
-    '        try:\n'
-    '            _rd = subprocess.run([_cc_candidate, "-print-resource-dir"],\n'
-    '                                 capture_output=True, text=True, check=True).stdout.strip()\n'
-    '        except Exception:\n'
-    '            continue\n'
-    '        for _name in ("libclang_rt.profile-aarch64-android.a", "libclang_rt.profile-aarch64.a"):\n'
-    '            _candidate = Path(_rd) / "lib" / "linux" / _name\n'
-    '            if _candidate.is_file():\n'
-    '                guest_profile_runtime = str(_candidate)\n'
-    '                print(f"== profile runtime: {guest_profile_runtime}")\n'
-    '                break\n'
-    '        if guest_profile_runtime:\n'
-    '            break\n'
-    '\n'
-    '    n.rule(\n'
-    '        name="android_guest_link",\n'
-    '        command=(f"$android_ndk_bin/ld.lld -m aarch64linux -static -nostdlib -T {linker_script} "\n'
-    '                 f"-Map $out.map -o $out @$out.rsp {libguestc} {guest_profile_runtime} "\n'
-    '                 "$$($android_host_cc -print-libgcc-file-name)"),'
-)
+old = '''    n.rule(
+        name="android_guest_link",
+        command=(f"$android_ndk_bin/ld.lld -m aarch64linux -static -nostdlib -T {linker_script} "
+                 f"-Map $out.map -o $out @$out.rsp {libguestc} "
+                 "$$($android_host_cc -print-libgcc-file-name)"),'''
+new = '''    guest_profile_runtime = ""
+    for _cc_candidate in (guest_cc, str(ndk_bin / "clang")):
+        if not _cc_candidate:
+            continue
+        try:
+            _rd = subprocess.run([_cc_candidate, "-print-resource-dir"],
+                                 capture_output=True, text=True, check=True).stdout.strip()
+        except Exception:
+            continue
+        for _name in ("libclang_rt.profile-aarch64-android.a", "libclang_rt.profile-aarch64.a"):
+            _candidate = Path(_rd) / "lib" / "linux" / _name
+            if _candidate.is_file():
+                guest_profile_runtime = str(_candidate)
+                print(f"== profile runtime: {guest_profile_runtime}")
+                break
+        if guest_profile_runtime:
+            break
+    n.rule(
+        name="android_guest_link",
+        command=(f"$android_ndk_bin/ld.lld -m aarch64linux -static -nostdlib -T {linker_script} "
+                 f"-Map $out.map -o $out @$out.rsp {libguestc} {guest_profile_runtime} "
+                 "$$($android_host_cc -print-libgcc-file-name)"),'''
 if old in text:
     text = text.replace(old, new, 1)
-with open(path, 'w') as f:
-    f.write(text)
-print("android_build.py: Profiling-Runtime zum Link")
+    with open(path, 'w') as f:
+        f.write(text)
+    print("android_build.py: Profiling-Runtime zum Link")
 PYEOF
 fi
 
@@ -901,16 +938,14 @@ with open(path) as f:
     text = f.read()
 if 'OPTIMISATION = "-O3"' not in text:
     text = text.replace('OPTIMISATION = "-O2"', 'OPTIMISATION = "-O3"')
-old_abi = '"-ffp-contract=off",\nOPTIMISATION,'
-new_abi = (
-    '"-ffp-contract=off",\n'
-    '"-funroll-loops",\n'
-    '"-fno-math-errno",\n'
-    '"-fno-trapping-math",\n'
-    '"-fmerge-all-constants",\n'
-    '"-fno-strict-aliasing",\n'
-    'OPTIMISATION,'
-)
+old_abi = '"-ffp-contract=off",\n    OPTIMISATION,'
+new_abi = '''"-ffp-contract=off",
+    "-funroll-loops",
+    "-fno-math-errno",
+    "-fno-trapping-math",
+    "-fmerge-all-constants",
+    "-fno-strict-aliasing",
+    OPTIMISATION,'''
 if old_abi in text:
     text = text.replace(old_abi, new_abi, 1)
 with open(path, "w") as f:
@@ -924,7 +959,7 @@ PYEOF
 echo ""
 echo "== Kopiere port/knulli in den Quellbaum ..."
 if [ ! -d "$HERE/port/knulli" ]; then
-die "port/knulli/ existiert nicht im Repo"
+    die "port/knulli/ existiert nicht im Repo"
 fi
 rm -rf "$SRC/port/knulli"
 cp -a "$HERE/port/knulli" "$SRC/port/knulli"
@@ -934,14 +969,15 @@ chmod +x "$SRC/port/knulli/build.sh" 2>/dev/null || true
 # ======================================================================
 # DIAGNOSE: Logging in host_glthread.c einfuegen
 # ======================================================================
+# Diesen Block nach dem Test wieder entfernen.
 if [ -f "$HERE/patches/patch_gl_init_order.py" ]; then
-echo ""
-echo "== DIAGNOSE: Logging in host_glthread.c einfuegen ..."
-python3 "$HERE/patches/patch_gl_init_order.py" "$SRC" || \
-echo "WARNUNG: patch_gl_init_order.py fehlgeschlagen."
+    echo ""
+    echo "== DIAGNOSE: Logging in host_glthread.c einfuegen ..."
+    python3 "$HERE/patches/patch_gl_init_order.py" "$SRC" || \
+        echo "WARNUNG: patch_gl_init_order.py fehlgeschlagen."
 else
-echo ""
-echo "WARNUNG: patches/patch_gl_init_order.py fehlt - Diagnose uebersprungen!"
+    echo ""
+    echo "WARNUNG: patches/patch_gl_init_order.py fehlt - Diagnose uebersprungen!"
 fi
 
 # ======================================================================
@@ -950,26 +986,26 @@ fi
 echo ""
 echo "== Wende restliche Patch-Skripte an ..."
 for patch_script in \
-patch_opence_menu_cache_hooks.py \
-patch_memory_pools.py patch_neon_math.py \
-patch_vita_optimizations.py patch_button_remap.py \
-patch_index_extent_neon.py patch_fps_overlay.py \
-patch_draw_framebuffer_bound.py patch_mali_subdata.py \
-patch_shader_prewarm.py patch_aggressive_culling.py \
-patch_state_batching.py patch_texture_prewarm.py \
-patch_settings_menu.py patch_config_defaults.py \
-patch_credits.py patch_forward_declarations.py \
-patch_config_changes.py patch_terminal_buffer.py; do
-if [ -f "$HERE/patches/$patch_script" ]; then
-echo "== $patch_script"
-if ! python3 "$HERE/patches/$patch_script" "$SRC"; then
-echo "WARNUNG: $patch_script fehlgeschlagen"
-fi
-fi
+        patch_opence_menu_cache_hooks.py \
+        patch_memory_pools.py patch_neon_math.py \
+        patch_vita_optimizations.py patch_button_remap.py \
+        patch_index_extent_neon.py patch_fps_overlay.py \
+        patch_draw_framebuffer_bound.py patch_mali_subdata.py \
+        patch_shader_prewarm.py patch_aggressive_culling.py \
+        patch_state_batching.py patch_texture_prewarm.py \
+        patch_settings_menu.py patch_config_defaults.py \
+        patch_credits.py patch_forward_declarations.py \
+        patch_config_changes.py patch_terminal_buffer.py; do
+    if [ -f "$HERE/patches/$patch_script" ]; then
+        echo "== $patch_script"
+        if ! python3 "$HERE/patches/$patch_script" "$SRC"; then
+            echo "WARNUNG: $patch_script fehlgeschlagen"
+        fi
+    fi
 done
 
 if [ -f "$SRC/port/linux/src/d3d8_gl.c" ]; then
-python3 - "$SRC/port/linux/src/d3d8_gl.c" <<'PYEOF'
+    python3 - "$SRC/port/linux/src/d3d8_gl.c" <<'PYEOF'
 import re, sys
 path = sys.argv[1]
 with open(path) as f:
@@ -989,7 +1025,7 @@ PYEOF
 fi
 
 echo ""
-echo "== Regeneriere die In-Game-Settings-Menues ..."
+echo "== Regeneriere die In-Game-Settings-Menus ..."
 python3 - "$SRC" <<'PYEOF'
 import os, sys
 src = sys.argv[1]
@@ -997,7 +1033,7 @@ sys.path.insert(0, os.path.join(src, "tools"))
 try:
     import port_settings
 except ImportError as e:
-    print("  HINWEIS: port_settings.py nicht importierbar (%s)." % e)
+    print(f"  HINWEIS: port_settings.py nicht importierbar ({e}).")
     sys.exit(0)
 if not hasattr(port_settings, "settings_files"):
     sys.exit(0)
@@ -1009,13 +1045,13 @@ for name, lines in files.items():
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         f.write("\n".join(lines))
-    print("  geschrieben: %s" % name)
+    print(f"  geschrieben: {name}")
 PYEOF
 
 if [ -f "$HERE/patches/patch_credits_xml.py" ]; then
-echo ""
-echo "== Credits-Wasserzeichen in Menue-XMLs ..."
-python3 "$HERE/patches/patch_credits_xml.py" "$SRC"
+    echo ""
+    echo "== Credits-Wasserzeichen in Menue-XMLs ..."
+    python3 "$HERE/patches/patch_credits_xml.py" "$SRC"
 fi
 
 # ======================================================================
@@ -1024,27 +1060,24 @@ fi
 echo ""
 echo "== Verifiziere Patch-Ergebnisse ..."
 verification_failed=0
-
 check_patch() {
-local file="$1" pattern="$2" name="$3"
-if grep -q -- "$pattern" "$SRC/$file" 2>/dev/null; then
-echo "   OK: $name"
-else
-echo "   FEHLT: $name ($file)"
-verification_failed=1
-fi
+    local file="$1" pattern="$2" name="$3"
+    if grep -q -- "$pattern" "$SRC/$file" 2>/dev/null; then
+        echo "   OK: $name"
+    else
+        echo "   FEHLT: $name ($file)"
+        verification_failed=1
+    fi
 }
-
 check_file() {
-local file="$1" name="$2"
-if [ -f "$SRC/$file" ]; then
-echo "   OK: $name"
-else
-echo "   FEHLT: $name ($file)"
-verification_failed=1
-fi
+    local file="$1" name="$2"
+    if [ -f "$SRC/$file" ]; then
+        echo "   OK: $name"
+    else
+        echo "   FEHLT: $name ($file)"
+        verification_failed=1
+    fi
 }
-
 check_patch "source/cseries/cseries.h"          "HALO_DEBUG_ALLOCATOR"          "cseries.h Debug-Allocator"
 check_patch "source/effects/decals.c"           "static __thread long surface_queue" "decals.c __thread"
 check_patch "source/math/matrix_math.c"         "vmulq_n_f32"                   "matrix_math.c NEON"
@@ -1073,6 +1106,7 @@ check_patch "tools/android_build.py"            '"-DHALO_ANDROID"'              
 check_patch "tools/android_build.py"            '"-DHALO_ARM64_GUEST=1"'        "android_build.py HALO_ARM64_GUEST"
 check_patch "tools/android_build.py"            'EXPAT_DIR = Path'              "android_build.py EXPAT_DIR"
 check_patch "tools/android_build.py"            'ZLIB_DIR = Path'               "android_build.py ZLIB_DIR"
+check_patch "tools/android_build.py"            '_clang_builtin_shim'           "android_build.py clang-Builtin-Shim"
 check_patch "source/main/main.c"                "St0len-One"                    "main.c Credits"
 check_file  "port/linux/include/halo_menus.h"                                   "halo_menus.h"
 check_file  "port/linux/src/menu_files.c"                                       "menu_files.c"
@@ -1093,25 +1127,23 @@ check_patch "source/cache/cache_files.c"        "menu_tags_loaded"              
 check_patch "port/linux/src/menu_files.c"       "MENU_FILES_HOST_FUNCS_DECLARED" "menu_files.c Forward-Deklarationen"
 
 if [ -f "$HERE/patches/patch_gl_init_order.py" ]; then
-check_patch "port/knulli/host/host_glthread.c" "DIAG: sync-create ENTER" "host_glthread.c DIAG-Logs eingefuegt"
+    check_patch "port/knulli/host/host_glthread.c" "DIAG: sync-create ENTER" "host_glthread.c DIAG-Logs eingefuegt"
 fi
 
 if grep -q "settings_only: game data dispatcher" \
-"$SRC/source/interface/ui_widget_game_data_input_functions.c" 2>/dev/null; then
-echo "   OK: ui_widget_game_data_input_functions.c Dispatcher"
+    "$SRC/source/interface/ui_widget_game_data_input_functions.c" 2>/dev/null; then
+    echo "   OK: ui_widget_game_data_input_functions.c Dispatcher"
 else
-echo "   HINWEIS: ui_widget_game_data_input_functions.c Dispatcher fehlt (nicht kritisch)."
+    echo "   HINWEIS: ui_widget_game_data_input_functions.c Dispatcher fehlt (nicht kritisch)."
 fi
 
 if [ -f "$SRC/tools/port_settings.py" ]; then
-check_patch "tools/port_settings.py" "display.fast_shaders"  "port_settings.py Video-Rows"
+    check_patch "tools/port_settings.py" "display.fast_shaders"  "port_settings.py Video-Rows"
 fi
-
 if [ "$verification_failed" -ne 0 ]; then
-echo ""
-echo "== Verifikation meldete Fehler, fahre trotzdem fort."
+    echo ""
+    echo "== Verifikation meldete Fehler, fahre trotzdem fort."
 fi
-
 echo "== Verifikation abgeschlossen."
 
 # ======================================================================
@@ -1125,30 +1157,29 @@ echo "== CPATH=$CPATH"
 # Stamp
 # ======================================================================
 stamp=$({
-cat "$PATCH"
-for p in patch_opence_menu_cache_hooks.py \
-patch_memory_pools.py patch_neon_math.py \
-patch_vita_optimizations.py patch_button_remap.py \
-patch_index_extent_neon.py patch_fps_overlay.py \
-patch_draw_framebuffer_bound.py patch_mali_subdata.py \
-patch_shader_prewarm.py patch_aggressive_culling.py \
-patch_state_batching.py patch_texture_prewarm.py \
-patch_settings_menu.py patch_config_defaults.py \
-patch_credits.py patch_credits_xml.py \
-patch_forward_declarations.py patch_settings_only.py \
-patch_android_build_hybrid.py patch_missing_functions.py \
-patch_config_changes.py patch_terminal_buffer.py \
-patch_gl_init_order.py \
-settings_only_menu_functions.c port_settings_shim.c \
-guest_host_stubs.c; do
-cat "$HERE/patches/$p" 2>/dev/null || true
-done
-[ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
-echo "pgo-mode=$PGO_MODE"
-echo "gcc9-host-dynamic=v22-arm-neon-header-in-resource-dir"
-(cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
+    cat "$PATCH"
+    for p in patch_opence_menu_cache_hooks.py \
+             patch_memory_pools.py patch_neon_math.py \
+             patch_vita_optimizations.py patch_button_remap.py \
+             patch_index_extent_neon.py patch_fps_overlay.py \
+             patch_draw_framebuffer_bound.py patch_mali_subdata.py \
+             patch_shader_prewarm.py patch_aggressive_culling.py \
+             patch_state_batching.py patch_texture_prewarm.py \
+             patch_settings_menu.py patch_config_defaults.py \
+             patch_credits.py patch_credits_xml.py \
+             patch_forward_declarations.py patch_settings_only.py \
+             patch_android_build_hybrid.py patch_missing_functions.py \
+             patch_config_changes.py patch_terminal_buffer.py \
+             patch_gl_init_order.py \
+             settings_only_menu_functions.c port_settings_shim.c \
+             guest_host_stubs.c; do
+        cat "$HERE/patches/$p" 2>/dev/null || true
+    done
+    [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
+    echo "pgo-mode=$PGO_MODE"
+    echo "gcc9-host-dynamic=v15-clang-shim-robust"
+    (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
-
 echo "$stamp" > "$SRC/.port-stamp"
 
 # ======================================================================
@@ -1159,83 +1190,31 @@ cd "$SRC"
 
 echo "== Konfiguriere mit $LTO_FLAG $PGO_FLAG $PGO_EXTRA_ARGS ..."
 python3 configure.py --release "$LTO_FLAG" "$PGO_FLAG" $PGO_EXTRA_ARGS \
---android-ndk "$ANDROID_NDK" --android-guest-cc "$GUEST_CC"
+    --android-ndk "$ANDROID_NDK" --android-guest-cc "$GUEST_CC"
 
-# ======================================================================
-# Fix v22: arm_neon.h in das Resource-Include-Verzeichnis des GUEST_CC
 # ----------------------------------------------------------------------
-# Der Guest-Compile nutzt:
-#   -isystem $(clang -print-resource-dir)/include
-# Im clang-22-Resource-Verzeichnis des Runners fehlt arm_neon.h fuer
-# --target=arm64_32-apple-watchos. Wir kopieren die Header aus dem
-# NDK-clang (der sie fuer aarch64 garantiert enthält) hinein.
-# ======================================================================
-echo "== Fix v22: stelle arm_neon.h im clang-Resource-Verzeichnis bereit ..."
-
-RES_INC=""
-RES_INC=$("$GUEST_CC" -print-resource-dir 2>/dev/null || true)
-if [ -n "$RES_INC" ]; then
-  RES_INC="$RES_INC/include"
-fi
-
-if [ -z "$RES_INC" ] || [ ! -d "$RES_INC" ]; then
-  echo "  WARNUNG: Resource-Include-Verzeichnis des GUEST_CC nicht gefunden."
-else
-  echo "  Resource-Include: $RES_INC"
-  if [ -f "$RES_INC/arm_neon.h" ]; then
-    echo "  OK: arm_neon.h ist bereits vorhanden."
-  else
-    echo "  arm_neon.h fehlt, suche Quelle ..."
-    SRC_INC=""
-
-    # Quelle 1: NDK-clang-Resource-Verzeichnis
-    NDK_CLANG="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
-    if [ -x "$NDK_CLANG" ]; then
-      NDK_RES=$("$NDK_CLANG" -print-resource-dir 2>/dev/null || true)
-      if [ -n "$NDK_RES" ] && [ -f "$NDK_RES/include/arm_neon.h" ]; then
-        SRC_INC="$NDK_RES/include"
-        echo "  Quelle (NDK-clang): $SRC_INC"
-      fi
-    fi
-
-    # Quelle 2: andere installierte System-clang-Versionen
-    if [ -z "$SRC_INC" ]; then
-      for cand in /usr/lib/llvm-*/lib/clang/*/include /usr/lib/clang/*/include; do
-        if [ -f "$cand/arm_neon.h" ]; then
-          SRC_INC="$cand"
-          echo "  Quelle (System-clang): $SRC_INC"
-          break
+# Fix v15 (Post-Configure): Sicherheitsnetz fuer build.ninja
+#
+# Falls configure.py (oder ein spaeterer Patch) den clang-Resource-Pfad
+# trotzdem in die Guest-Compile-Zeilen schreibt, entfernen wir ihn hier
+# hart aus build.ninja. Der Shim in build/guest/clang_builtin_shim/
+# liefert bereits arm_neon.h und Co., dieser Pfad ist daher redundant
+# und schaedlich.
+# ----------------------------------------------------------------------
+if [ -f build.ninja ]; then
+    if grep -qE '[-]isystem [^ ]*/lib/clang/[^ ]*/include' build.ninja 2>/dev/null; then
+        echo "== WARNUNG: clang-Resource-Pfad in build.ninja gefunden, entferne ihn"
+        echo "   (Shim build/guest/clang_builtin_shim liefert die ARM-Header)"
+        sed -i -E 's|[-]isystem [^ ]*/lib/clang/[^ ]*/include||g' build.ninja
+        if grep -qE '[-]isystem [^ ]*/lib/clang/[^ ]*/include' build.ninja 2>/dev/null; then
+            echo "FEHLER: clang-Resource-Pfad konnte nicht aus build.ninja entfernt werden"
+            grep -E '[-]isystem [^ ]*/lib/clang/[^ ]*/include' build.ninja | head -3
+            exit 1
         fi
-      done
-    fi
-
-    # Quelle 3: NDK-Sysroot
-    if [ -z "$SRC_INC" ]; then
-      for cand in "$ANDROID_NDK"/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/*/include; do
-        if [ -f "$cand/arm_neon.h" ]; then
-          SRC_INC="$cand"
-          echo "  Quelle (NDK-lib/clang): $SRC_INC"
-          break
-        fi
-      done
-    fi
-
-    if [ -n "$SRC_INC" ]; then
-      cp -a "$SRC_INC"/*.h "$RES_INC/" 2>/dev/null || true
-      COPIED=$(ls -1 "$RES_INC"/*.h 2>/dev/null | wc -l)
-      echo "  kopiert: $COPIED Header nach $RES_INC"
+        echo "== Entfernt."
     else
-      echo "  FEHLER: keine Quelle mit arm_neon.h gefunden."
-      ls -la "$RES_INC" 2>/dev/null | head -20 || true
+        echo "== build.ninja: kein clang-Resource-Pfad, OK"
     fi
-
-    # Finale Verifikation
-    if [ -f "$RES_INC/arm_neon.h" ]; then
-      echo "  OK: arm_neon.h ist jetzt verfuegbar."
-    else
-      echo "  FEHLER: arm_neon.h weiterhin nicht vorhanden." >&2
-    fi
-  fi
 fi
 
 echo "== Baue Guest-ELF (halo_guest.elf) ..."
@@ -1250,62 +1229,78 @@ bash "$SRC/port/knulli/build.sh"
 echo "== copying the build into $DIST"
 rm -rf "$DIST"
 mkdir -p "$DIST"
-
 if [ -f "$SRC/build/knulli/halo" ]; then
-cp "$SRC/build/knulli/halo" "$DIST/halo"
-chmod +x "$DIST/halo" 2>/dev/null || true
+    cp "$SRC/build/knulli/halo" "$DIST/halo"
+    chmod +x "$DIST/halo" 2>/dev/null || true
 else
-echo "FEHLER: Host-Binary ($SRC/build/knulli/halo) wurde nicht gebaut!" >&2
-exit 1
+    echo "FEHLER: Host-Binary ($SRC/build/knulli/halo) wurde nicht gebaut!" >&2
+    exit 1
 fi
-
 for candidate in \
-"$SRC/build/knulli/halo_guest.elf" \
-"$SRC/build/android/halo_guest.elf"; do
-if [ -f "$candidate" ]; then
-cp "$candidate" "$DIST/halo_guest.elf"
-echo "== halo_guest.elf aus $candidate kopiert"
-break
-fi
+    "$SRC/build/knulli/halo_guest.elf" \
+    "$SRC/build/android/halo_guest.elf"; do
+    if [ -f "$candidate" ]; then
+        cp "$candidate" "$DIST/halo_guest.elf"
+        echo "== halo_guest.elf aus $candidate kopiert"
+        break
+    fi
 done
-
 [ -f "$SRC/port/knulli/Halo.sh" ] && cp "$SRC/port/knulli/Halo.sh" "$DIST/Halo.sh"
 [ -f "$SRC/port/knulli/halo_extract.py" ] && cp "$SRC/port/knulli/halo_extract.py" "$DIST/halo_extract.py"
 [ -f "$SRC/port/knulli/halo_screen.py" ] && cp "$SRC/port/knulli/halo_screen.py" "$DIST/halo_screen.py"
 [ -f "$SRC/port/knulli/sdl_mapping.py" ] && cp "$SRC/port/knulli/sdl_mapping.py" "$DIST/sdl_mapping.py"
-
 if [ -d "$SRC/build/knulli/libs.aarch64" ]; then
-mkdir -p "$DIST/libs.aarch64"
-cp -a "$SRC/build/knulli/libs.aarch64/." "$DIST/libs.aarch64/"
+    mkdir -p "$DIST/libs.aarch64"
+    cp -a "$SRC/build/knulli/libs.aarch64/." "$DIST/libs.aarch64/"
 fi
-
 chmod +x "$DIST/Halo.sh" 2>/dev/null || true
 
 if [ -f "$DIST/halo_guest.elf" ]; then
-GUEST_SIZE=$(stat -c%s "$DIST/halo_guest.elf")
-GUEST_MB=$((GUEST_SIZE / 1048576))
-echo "== halo_guest.elf: $GUEST_SIZE Bytes (~${GUEST_MB} MB)"
+    GUEST_SIZE=$(stat -c%s "$DIST/halo_guest.elf")
+    GUEST_MB=$((GUEST_SIZE / 1048576))
+    echo "== halo_guest.elf: $GUEST_SIZE Bytes (~${GUEST_MB} MB)"
 else
-echo "== halo_guest.elf: FEHLT (Build nicht komplett)"
+    echo "== halo_guest.elf: FEHLT (Build nicht komplett)"
 fi
 
 if [ -f "$DIST/halo" ]; then
-HOST_SIZE=$(stat -c%s "$DIST/halo")
-echo "== halo: $HOST_SIZE Bytes"
-command -v file > /dev/null 2>&1 && file "$DIST/halo" || true
-echo "== halo BuildID:"
-readelf -n "$DIST/halo" 2>/dev/null | grep -A2 "Build ID" | tail -1 || true
+    HOST_SIZE=$(stat -c%s "$DIST/halo")
+    echo "== halo: $HOST_SIZE Bytes"
+    command -v file > /dev/null 2>&1 && file "$DIST/halo" || true
+    echo "== halo BuildID:"
+    readelf -n "$DIST/halo" 2>/dev/null | grep -A2 "Build ID" | tail -1 || true
 fi
 
 cat <<'RELEASE'
+
 --------------------------------------------------------------------
-BUILD v22 - arm_neon.h im clang-Resource-Verzeichnis bereitgestellt
+BUILD v15 - clang-Builtin-Shim robust + Multiarch libdrm/libgbm
 --------------------------------------------------------------------
+Was gegenueber v14 neu ist:
+  - Der Guest-Build bindet clangs volle Resource-Include-Verzeichnis
+    NICHT mehr ueber -isystem ein. Stattdessen wird ein Shim-Ordner
+    mit nur den ARM-Headern (arm_neon.h etc.) verwendet. Damit ist
+    die size_t-Kollision zwischen clangs __stddef_size_t.h und musls
+    alltypes.h behoben.
+  - Nach configure.py wird build.ninja geprueft und ein etwaiger
+    -isystem /usr/lib/llvm-22/lib/clang/22/include entfernt. So kann
+    auch ein spaeterer Patch (patch_android_build_hybrid.py,
+    'Fix v22') den Guest-Build nicht mehr kaputt machen.
+
 Installation auf M9 Pro:
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
 2. dist/halo_guest.elf    nach /roms/ports/halo-ce/halo_guest.elf
 3. dist/halo              nach /roms/ports/halo-ce/halo
 4. dist/libs.aarch64/     nach /roms/ports/halo-ce/libs.aarch64/
+
+WICHTIG: Der neue Build hat eine ANDERE BuildID als der vorherige!
+Vor dem Start pruefen:
+  readelf -n /roms/ports/halo-ce/halo | grep -i build
+Falls die BuildID gleich bleibt, wurde nicht deployt.
+
+Auf dem M9 pruefen, ob libmali.so.0 in NEEDED steht:
+  readelf -d /roms/ports/halo-ce/halo | grep NEEDED
+  → "libmali.so.0" MUSS in der Liste sein.
 
 FERTIG.
 --------------------------------------------------------------------
