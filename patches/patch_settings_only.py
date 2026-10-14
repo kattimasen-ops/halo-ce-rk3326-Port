@@ -82,7 +82,6 @@ def patch_event_dispatcher(base_dir):
 
     # Falls die Datei schon eine falsche Version hat: den leeren Bereich
     # "< 0x8000" entfernen und durch korrekte v6-Version ersetzen.
-    # Wir prüfen auf "< 0x8000" und ersetzen die gesamte if-Bedingung.
     bad_pattern = re.compile(
         r"if\s*\(\s*function_index\s*>=\s*PC_MENU_FUNCTION_BASE\s*&&\s*function_index\s*<\s*0x8000\s*\)\s*\{"
         r"(.*?)\}"
@@ -249,6 +248,17 @@ def patch_game_data_dispatcher(base_dir):
     print("[OK] ui_widget_game_data_input_functions.c gepatcht (v6).")
 
 def patch_cache_files(base_dir):
+    try:
+        import patch_opence_menu_cache_hooks
+        patch_opence_menu_cache_hooks.apply_patch(base_dir)
+        return
+    except Exception:
+        pass
+    script = os.path.join(os.path.dirname(__file__), "patch_opence_menu_cache_hooks.py")
+    if os.path.exists(script):
+        import subprocess
+        subprocess.run([sys.executable, script, base_dir], check=False)
+        return
     file_path = os.path.join(base_dir, "source", "cache", "cache_files.c")
     if not os.path.exists(file_path):
         file_path = os.path.join(base_dir, "cache_files.c")
@@ -257,17 +267,24 @@ def patch_cache_files(base_dir):
     create_backup(file_path)
     content = read_file_content(file_path)
     if "menu_tags_loaded" not in content:
-        decl = ("\nextern void menu_tags_loaded(void);\n"
-                "extern void menu_tags_unloaded(void);\n")
-        content = decl + content
+        content = (
+            "/* port: opence-menu-cache */\n"
+            "static long global_tag_count;\n"
+            "void *cache_files_tag_instances(long *count) { if (count) *count = cache_file_globals.tags_loaded ? global_tag_count : 0; return cache_file_globals.tags_loaded ? global_tag_instances : 0; }\n"
+            "void cache_files_set_tag_instances(void *instances, long count) { global_tag_instances = instances; global_tag_count = count; }\n"
+        ) + content
+        content = content.replace(
+            "absolute_index < cache_file_globals.tag_header->tag_count",
+            "absolute_index < global_tag_count",
+        )
         content = re.sub(
-            r"(cache_file_load\s*\([^)]*\)\s*\{)",
-            r"\1\n    menu_tags_loaded();", content, count=1)
+            r"(cache_file_globals\.tags_loaded\s*=\s*TRUE;)",
+            r"global_tag_count = cache_file_globals.tag_header->tag_count; \1 { extern void menu_tags_loaded(char const *m); menu_tags_loaded(cache_file_globals.header.name); }", content, count=1)
         content = re.sub(
-            r"(cache_file_unload\s*\([^)]*\)\s*\{)",
-            r"\1\n    menu_tags_unloaded();", content, count=1)
+            r"(cache_file_globals\.tags_loaded\s*=\s*FALSE;)",
+            r"{ extern void menu_tags_unloaded(void); menu_tags_unloaded(); } global_tag_instances = NULL; global_tag_count = 0; \1", content, count=1)
         write_file_content(file_path, content)
-        print("[OK] cache_files.c gepatcht.")
+        print("[OK] cache_files.c gepatcht mit echtem map_name-Hook.")
 
 def patch_buildsystem_and_shim(root_dir, patches_dir):
     shim_src = os.path.join(patches_dir, "port_settings_shim.c")
