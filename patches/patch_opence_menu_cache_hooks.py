@@ -75,13 +75,17 @@ def apply_patch(src_root):
         '\t\textern void menu_tags_unloaded(void);\n'
         '\t\tmenu_tags_unloaded();\n'
         '\t}\n'
+        '\tglobal_tag_instances = NULL;\n'
+        '\tglobal_tag_count = 0;\n'
     ) + anchor
     if anchor in text:
         text = text.replace(anchor, add, 1)
 
-    # 5. scenario_tags_load: menu_tags_loaded nach tags_loaded = TRUE
+    # 5. scenario_tags_load: global_tag_count setzen und menu_tags_loaded nach tags_loaded = TRUE
     anchor = '\t\t\tcache_file_globals.tags_loaded = TRUE;\n'
-    add = anchor + (
+    add = (
+        '\t\t\tglobal_tag_count = cache_file_globals.tag_header->tag_count;\n'
+        + anchor +
         '\t\t\t/* ' + MARKER + ': Menü-Tags an die Tag-Tabelle anhängen */\n'
         '\t\t\t{\n'
         '\t\t\t\textern void menu_tags_loaded(char const *map_name);\n'
