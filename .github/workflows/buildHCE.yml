@@ -87,8 +87,6 @@ jobs:
           echo "== aarch64 als zweite Architektur aktivieren"
           dpkg --add-architecture arm64
 
-          # amd64-Quellen auf amd64 beschraenken, sonst meckert apt beim
-          # Mischen der Architekturen
           if [ -f /etc/apt/sources.list ]; then
             cp /etc/apt/sources.list /etc/apt/sources.list.amd64-backup
             sed -i -E 's/^deb (\[[^]]*\] )?http/deb [arch=amd64] http/' /etc/apt/sources.list
@@ -209,14 +207,6 @@ jobs:
           echo "== Vorher:"
           ls -la "$SYSROOT_LIB" || true
 
-          # Die vorgefertigte libSDL2-2.0.so.0 kann ohne KMSDRM-Backend
-          # gebaut worden sein (kmsdrm not available zur Laufzeit). Sie
-          # wird entfernt, damit build.sh SDL2 aus dem Quellcode neu baut
-          # und dabei den KMSDRM-Backend aktiviert; libdrm, gbm und udev
-          # sind im Container vorhanden.
-          #
-          # SDL3 wird NICHT neu gebaut: der Host linkt nicht gegen SDL3,
-          # die Bibliothek ist nur Beigabe.
           if [ -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
             rm -f "$SYSROOT_LIB/libSDL2-2.0.so.0"
             echo "  libSDL2-2.0.so.0 entfernt (wird mit KMSDRM neu gebaut)"
@@ -255,6 +245,47 @@ jobs:
           set -e
           chmod +x build.sh
           bash build.sh 2>&1 | tee build.log
+
+      - name: "Gepatchte Quelldateien zum Pruefen bereitstellen"
+        if: always()
+        run: |
+          set +e
+          WORKSRC=""
+          for candidate in \
+              "$GITHUB_WORKSPACE/work/halo-ce-universal" \
+              "$GITHUB_WORKSPACE/../work/halo-ce-universal"; do
+            if [ -d "$candidate" ]; then
+              WORKSRC="$candidate"
+              break
+            fi
+          done
+          if [ -z "$WORKSRC" ]; then
+            WORKSRC=$(find "$GITHUB_WORKSPACE" -maxdepth 5 -type d -name "halo-ce-universal" 2>/dev/null | head -n 1)
+          fi
+          echo "WORKSRC=$WORKSRC"
+          mkdir -p rej/patched
+          if [ -n "$WORKSRC" ] && [ -d "$WORKSRC" ]; then
+            for f in \
+                port/linux/src/d3d8_gl.c \
+                port/android/host/host_gl.c \
+                port/android/host/host_glthread.c \
+                port/android/host/host_loader.c \
+                port/linux/src/port_config.c \
+                port/linux/src/xbox_textures.c \
+                port/linux/src/xgpu.h \
+                port/linux/src/gl.h ; do
+              if [ -f "$WORKSRC/$f" ]; then
+                target="rej/patched/$(echo "$f" | tr / _)"
+                cp "$WORKSRC/$f" "$target"
+                echo "  kopiert: $f -> $target"
+              else
+                echo "  fehlt: $f"
+              fi
+            done
+          else
+            echo "  WORKSRC nicht gefunden, nichts kopiert"
+          fi
+          ls -la rej/patched/ 2>/dev/null || true
 
       - name: "SDL2-Backends verifizieren"
         if: always()
