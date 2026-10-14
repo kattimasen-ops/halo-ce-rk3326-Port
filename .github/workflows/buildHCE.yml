@@ -9,6 +9,7 @@ on:
       - '*.md'
       - 'README.md'
       - 'llms.txt'
+      - 'patched-source/**'
 
 jobs:
   build:
@@ -16,6 +17,8 @@ jobs:
     runs-on: ubuntu-22.04
     container: ubuntu:20.04
     timeout-minutes: 180
+    permissions:
+      contents: write
     defaults:
       run:
         shell: bash
@@ -245,6 +248,135 @@ jobs:
           set -e
           chmod +x build.sh
           bash build.sh 2>&1 | tee build.log
+
+      - name: "Gepatchten Quellbaum + OpenCE + SDL in den Repo-Branch pushen"
+        if: always()
+        env:
+          DEST_BRANCH: build-artifacts
+          OPEN_CE_URL: https://github.com/OpenCommunityEdition/OpenCE.git
+        run: |
+          set +e
+
+          # ---- Arbeitsort des gepatchten Quellbaums finden ----
+          WORKSRC=""
+          for candidate in \
+              "$GITHUB_WORKSPACE/work/halo-ce-universal" \
+              "$GITHUB_WORKSPACE/../work/halo-ce-universal"; do
+            if [ -d "$candidate" ]; then
+              WORKSRC="$candidate"
+              break
+            fi
+          done
+          if [ -z "$WORKSRC" ]; then
+            WORKSRC=$(find "$GITHUB_WORKSPACE" -maxdepth 5 -type d -name "halo-ce-universal" 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$WORKSRC" ] || [ ! -d "$WORKSRC" ]; then
+            echo "WORKSRC nicht gefunden - ueberspringe Push."
+            exit 0
+          fi
+          echo "WORKSRC=$WORKSRC"
+
+          # ---- OpenCE frisch klonen (Original-Stand) ----
+          OPEN_CE_DIR="$GITHUB_WORKSPACE/work/opence-push"
+          OPEN_CE_COMMIT="unbekannt"
+          rm -rf "$OPEN_CE_DIR"
+          if git clone --depth 1 "$OPEN_CE_URL" "$OPEN_CE_DIR" > /dev/null 2>&1; then
+            OPEN_CE_COMMIT=$(git -C "$OPEN_CE_DIR" rev-parse HEAD)
+            rm -rf "$OPEN_CE_DIR/.git"
+            echo "OpenCE geklont: $OPEN_CE_COMMIT"
+          else
+            echo "WARNUNG: OpenCE konnte nicht geklont werden."
+          fi
+
+          # ---- In den Zielbranch wechseln ----
+          cd "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$DEST_BRANCH" 2>/dev/null || true
+          git checkout -B "$DEST_BRANCH"
+          git rm -rf . > /dev/null 2>&1 || true
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} + 2>/dev/null || true
+
+          # ---- Quellbaum nach patched-source/ kopieren ----
+          mkdir -p patched-source
+          tar -C "$WORKSRC" \
+              --exclude='./build' \
+              --exclude='./.git' \
+              --exclude='./work' \
+              --exclude='./dist' \
+              --exclude='./rej' \
+              --exclude='./__pycache__' \
+              --exclude='*.pyc' \
+              --exclude='*.o' \
+              --exclude='*.a' \
+              --exclude='*.d' \
+              -cf - . | tar -C patched-source -xf -
+
+          # ---- OpenCE dazu ----
+          if [ -d "$OPEN_CE_DIR" ] && [ -n "$(ls -A "$OPEN_CE_DIR" 2>/dev/null)" ]; then
+            mkdir -p patched-source/_external/OpenCE
+            tar -C "$OPEN_CE_DIR" \
+                --exclude='.git' \
+                --exclude='__pycache__' \
+                --exclude='*.pyc' \
+                -cf - . | tar -C patched-source/_external/OpenCE -xf -
+          fi
+
+          # ---- SDL2 dazu ----
+          if [ -d "$GITHUB_WORKSPACE/work/SDL2-src" ]; then
+            mkdir -p patched-source/_external/SDL2
+            tar -C "$GITHUB_WORKSPACE/work/SDL2-src" \
+                --exclude='.git' \
+                --exclude='build' \
+                -cf - . | tar -C patched-source/_external/SDL2 -xf -
+          fi
+
+          # ---- SDL3 dazu ----
+          for d in "$GITHUB_WORKSPACE"/work/SDL3-*; do
+            base=$(basename "$d")
+            case "$base" in
+              *-build|*-install) continue ;;
+            esac
+            if [ -d "$d" ]; then
+              mkdir -p patched-source/_external/SDL3
+              tar -C "$d" \
+                  --exclude='.git' \
+                  --exclude='build' \
+                  -cf - . | tar -C patched-source/_external/SDL3 -xf -
+              break
+            fi
+          done
+
+          # ---- Build-Info ----
+          cat > patched-source/_BUILD_INFO.txt <<EOF
+          Automatisch generiert vom Build-Workflow buildHCE.yml.
+          Repo:             $GITHUB_REPOSITORY
+          Run-ID:           $GITHUB_RUN_ID
+          Run-Nummer:       $GITHUB_RUN_NUMBER
+          Commit:           $GITHUB_SHA
+          Ref:              $GITHUB_REF
+          Datum:            $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          Upstream:         https://github.com/cybersecurity/halo-ce-universal.git @ $(tr -d '[:space:]' < UPSTREAM_COMMIT 2>/dev/null || echo unbekannt)
+          OpenCE:           $OPEN_CE_URL @ $OPEN_CE_COMMIT
+          PGO-Mode:         $PGO_MODE
+          SDL2-Version:     release-2.30.10
+          SDL3-Version:     release-3.2.10
+          EOF
+
+          # ---- Committen und pushen ----
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Keine Aenderungen - nichts zu committen."
+            exit 0
+          fi
+          git commit -m "build: patched sources @ ${GITHUB_SHA:0:7}" \
+                     -m "Automatisch erzeugt von buildHCE.yml (Run $GITHUB_RUN_ID)." \
+                     -m "[skip ci]"
+          if git push --force origin "$DEST_BRANCH"; then
+            echo "== Push nach $DEST_BRANCH abgeschlossen."
+          else
+            echo "WARNUNG: Push nach $DEST_BRANCH fehlgeschlagen."
+          fi
 
       - name: "Gepatchte Quelldateien zum Pruefen bereitstellen"
         if: always()
