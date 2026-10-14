@@ -139,7 +139,9 @@ static void host_signal_handler(int sig, siginfo_t *info, void *ucontext_ptr)
 	if (uc)
 		pc = (uintptr_t)uc->uc_mcontext.pc;
 #endif
-	host_logf(HOST_LOG_FATAL, "CRASH: signal %d (%s) at address %p, pc=%p",
+	__android_log_print(ANDROID_LOG_FATAL, "halo", "CRASH: signal %d (%s) at address %p, pc=%p",
+		sig, strsignal(sig), info ? info->si_addr : NULL, (void *)pc);
+	fprintf(stderr, "CRASH: signal %d (%s) at address %p, pc=%p\n",
 		sig, strsignal(sig), info ? info->si_addr : NULL, (void *)pc);
 	fflush(stderr);
 	_exit(128 + sig);
@@ -178,175 +180,151 @@ static void find_executable_root(void)
 		strcpy(executable_root, ".");
 		return;
 	}
-	executable_root[length] = '\0';
+	executable_root[length] = 0;
 	slash = strrchr(executable_root, '/');
-	if (slash)
-		*slash = '\0';
-	else
-		strcpy(executable_root, ".");
+	if (slash && slash != executable_root)
+		*slash = 0;
 }
 
 static int directory_has_maps(const char *root)
 {
-	char path[PATH_MAX];
-	struct stat state;
+	char path[PATH_MAX + 32];
+	struct stat information;
 
 	snprintf(path, sizeof(path), "%s/maps/ui.map", root);
-	return stat(path, &state) == 0 && S_ISREG(state.st_mode);
+	return stat(path, &information) == 0;
 }
 
+/* the columns of the 480-line picture for the framebuffer's shape: the
+first mode of fb0, for example "U:640x480p-59" */
 static int display_width(void)
 {
-	FILE *file = fopen("/sys/class/graphics/fb0/virtual_size", "r");
-	int width = 640;
+	FILE *modes = fopen("/sys/class/graphics/fb0/modes", "r");
+	int width = 0, height = 0, result = 640;
 
-	if (file)
+	if (modes)
 	{
-		int x = 0, y = 0;
+		char line[128];
 
-		if (fscanf(file, "%d,%d", &x, &y) == 2 && x > 0 && y > 0)
-			width = y == 480 ? x : (x * 480) / y;
-		fclose(file);
-	}
-	return width;
-}
-
-static void time_zone(char *buffer, size_t size)
-{
-	char link[PATH_MAX];
-	ssize_t length = readlink("/etc/localtime", link, sizeof(link) - 1);
-	const char *prefix = "zoneinfo/";
-	const char *found;
-
-	if (length > 0)
-	{
-		link[length] = '\0';
-		found = strstr(link, prefix);
-		if (found && snprintf(buffer, size, "%s", found + strlen(prefix)) < (int)size)
-			return;
-	}
-	snprintf(buffer, size, "UTC");
-}
-
-/* ---------- config */
-
-static int config_sample_seconds(const char *path, char *seconds, size_t size)
-{
-	FILE *file = fopen(path, "r");
-	toml_table_t *config;
-	toml_table_t *debug;
-	toml_value_t value;
-	char error[128];
-	int result = 0;
-
-	if (!file)
-		return 0;
-	config = toml_parse_file(file, error, sizeof(error));
-	fclose(file);
-	if (!config)
-		return 0;
-	debug = toml_table_in(config, "debug");
-	if (debug)
-	{
-		value = toml_string_in(debug, "sample");
-		if (value.ok)
+		if (fgets(line, sizeof(line), modes) && sscanf(strchr(line, ':') ? strchr(line, ':') + 1 : line,
+			"%dx%d", &width, &height) == 2 && width > 0 && height > 0)
 		{
-			snprintf(seconds, size, "%s", value.u.s);
-			free(value.u.s);
-			result = 1;
+			int longer = width > height ? width : height;
+			int shorter = width > height ? height : width;
+
+			result = (480 * longer / shorter) & ~1;
 		}
+		fclose(modes);
 	}
-	toml_free(config);
 	return result;
 }
 
-/* ---------- environment and boot block */
+/* ---------- the guest's environment */
 
-#define ENVIRONMENT_MAX 64
+#define ENVIRONMENT_MAXIMUM 64
 
 struct environment
 {
-	char *entries[ENVIRONMENT_MAX];
+	char *entries[ENVIRONMENT_MAXIMUM];
 	int count;
 };
 
 static void environment_set(struct environment *environment, const char *name, const char *value)
 {
-	size_t length = strlen(name) + 1 + strlen(value) + 1;
-	char *entry = malloc(length);
+	size_t length = strlen(name);
+	char *entry;
 	int index;
 
-	if (!entry)
-		return;
-	snprintf(entry, length, "%s=%s", name, value);
+	entry = malloc(length + strlen(value) + 2);
+	sprintf(entry, "%s=%s", name, value);
 	for (index = 0; index < environment->count; index++)
 	{
-		if (strncmp(environment->entries[index], name, strlen(name)) == 0 &&
-			environment->entries[index][strlen(name)] == '=')
+		if (!strncmp(environment->entries[index], name, length) && environment->entries[index][length] == '=')
 		{
 			free(environment->entries[index]);
 			environment->entries[index] = entry;
 			return;
 		}
 	}
-	if (environment->count < ENVIRONMENT_MAX)
+	if (environment->count < ENVIRONMENT_MAXIMUM)
 		environment->entries[environment->count++] = entry;
 	else
 		free(entry);
 }
 
+/* passes the host's HALO_ variables on to the guest: the settings the game
+also takes from the environment (port/linux/src/port_config.c) */
 static void environment_copy_halo(struct environment *environment)
 {
 	extern char **environ;
-	char **cursor;
+	char **entry;
 
-	for (cursor = environ; cursor && *cursor; cursor++)
+	for (entry = environ; *entry; entry++)
 	{
-		if (strncmp(*cursor, "HALO_", 5) == 0 ||
-			strncmp(*cursor, "MESA_", 5) == 0 ||
-			strncmp(*cursor, "SDL_", 4) == 0 ||
-			strncmp(*cursor, "TMPDIR=", 7) == 0)
-		{
-			const char *equals = strchr(*cursor, '=');
+		const char *equals = strchr(*entry, '=');
+		char name[128];
 
-			if (equals && environment->count < ENVIRONMENT_MAX)
-			{
-				size_t name_length = (size_t)(equals - *cursor);
-				char name[128];
-
-				if (name_length < sizeof(name))
-				{
-					memcpy(name, *cursor, name_length);
-					name[name_length] = '\0';
-					environment_set(environment, name, equals + 1);
-				}
-			}
-		}
+		if (strncmp(*entry, "HALO_", 5) || !equals || (size_t)(equals - *entry) >= sizeof(name))
+			continue;
+		memcpy(name, *entry, (size_t)(equals - *entry));
+		name[equals - *entry] = 0;
+		environment_set(environment, name, equals + 1);
 	}
 }
 
-static uint32_t make_boot(struct environment *environment)
+/* debug.sample_seconds from config.toml, as text for the sampler, or 0 */
+static int config_sample_seconds(const char *path, char *text, size_t size)
 {
-	size_t size = 64 * 1024;
-	char *memory = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	struct halo_guest_boot *boot;
-	uint32_t *argv;
-	uint32_t *environ_list;
-	char *strings;
+	toml_result_t result = toml_parse_file_ex(path);
+	int found = 0;
+
+	if (!result.ok)
+		return 0;
+	{
+		toml_datum_t seconds = toml_seek(result.toptab, "debug.sample_seconds");
+		double value = seconds.type == TOML_FP64 ? seconds.u.fp64 :
+			seconds.type == TOML_INT64 ? (double)seconds.u.int64 : 0.0;
+
+		if (value > 0.0)
+		{
+			snprintf(text, size, "%g", value);
+			found = 1;
+		}
+	}
+	toml_free(result);
+	return found;
+}
+
+/* POSIX TZ for the current local offset (the guest's musl has no zone
+database) */
+static void time_zone(char *buffer, size_t size)
+{
+	time_t now = time(NULL);
+	struct tm local;
+	long offset;
+
+	localtime_r(&now, &local);
+	offset = -local.tm_gmtoff;
+	snprintf(buffer, size, "<L>%s%ld:%02ld", offset < 0 ? "-" : "", labs(offset) / 3600, (labs(offset) / 60) % 60);
+}
+
+/* copies argv and the environment into guest memory */
+static uint32_t make_boot(const struct environment *environment)
+{
+	size_t size = 0x10000;
+	char *memory = host_low_map(size, PROT_READ | PROT_WRITE);
+	struct halo_guest_boot *boot = (struct halo_guest_boot *)memory;
+	uint32_t *argv = (uint32_t *)(memory + sizeof(*boot));
+	uint32_t *environ_list = argv + 2;
+	char *strings = (char *)(environ_list + ENVIRONMENT_MAXIMUM + 1);
 	int index;
 
-	if (memory == MAP_FAILED)
-		host_fatal("cannot map memory for the guest boot arguments");
-	boot = (struct halo_guest_boot *)memory;
-	argv = (uint32_t *)(boot + 1);
-	environ_list = argv + 2;
-	strings = (char *)(environ_list + environment->count + 1);
-
+	if (!memory)
+		host_fatal("cannot allocate the guest's environment");
 	strcpy(strings, "halo");
 	argv[0] = (uint32_t)(uintptr_t)strings;
 	argv[1] = 0;
-	strings += strlen("halo") + 1;
-
+	strings += strlen(strings) + 1;
 	for (index = 0; index < environment->count; index++)
 	{
 		size_t length = strlen(environment->entries[index]) + 1;
