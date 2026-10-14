@@ -130,65 +130,167 @@ int host_errno(void)
 	return errno;
 }
 
-/* ---------- crash diagnosis signal handlers */
+/* ---------- crash diagnosis signal handlers
+
+The handler uses only write(2) and dladdr, on a stack of its own
+(sigaltstack + SA_ONSTACK): it must survive while the process's own state
+is unknown, so no printf, no malloc, no lock, no lazy PLT binding. It
+writes the faulting address, the pc, the library the pc is in with its
+offset and the next symbol, and every general-purpose register, then exits
+with 128 + the signal number.
+
+A first version of this handler called fprintf/__android_log_print and
+died on a second SIGILL inside raise (libpthread), with x16 and x17 equal
+to 0xffffffffffffffff: a PLT entry used before it was resolved. This one
+writes with write(2) only. */
+
+static size_t write_string(char *out, const char *text)
+{
+	size_t length = 0;
+
+	while (text[length])
+	{
+		out[length] = text[length];
+		length++;
+	}
+	return length;
+}
+
+static size_t write_unsigned(char *out, unsigned long value)
+{
+	char digits[24];
+	size_t count = 0, i;
+
+	if (!value)
+	{
+		out[0] = '0';
+		return 1;
+	}
+	while (value)
+	{
+		digits[count++] = (char)('0' + (value % 10));
+		value /= 10;
+	}
+	for (i = 0; i < count; i++)
+		out[i] = digits[count - 1 - i];
+	return count;
+}
+
+static size_t write_hex(char *out, unsigned long value)
+{
+	static const char hex[] = "0123456789abcdef";
+	size_t i;
+
+	out[0] = '0';
+	out[1] = 'x';
+	for (i = 0; i < 16; i++)
+		out[2 + i] = hex[(value >> ((15 - i) * 4)) & 0xf];
+	return 18;
+}
+
+static size_t write_hex_padded(char *out, unsigned long value)
+{
+	static const char hex[] = "0123456789abcdef";
+	size_t i;
+
+	for (i = 0; i < 16; i++)
+		out[i] = hex[(value >> ((15 - i) * 4)) & 0xf];
+	return 16;
+}
 
 static void signal_handler(int sig, siginfo_t *info, void *ucontext_ptr)
 {
+	char buffer[1024];
+	size_t length = 0;
 	ucontext_t *uc = (ucontext_t *)ucontext_ptr;
-	uintptr_t pc = 0;
+	unsigned long pc = 0;
+	int i;
+
+	length += write_string(buffer + length, "CRASH: signal ");
+	length += write_unsigned(buffer + length, (unsigned long)sig);
+	length += write_string(buffer + length, " at ");
+	length += write_hex(buffer + length, (unsigned long)(info ? (uintptr_t)info->si_addr : 0));
+	length += write_string(buffer + length, " pc=");
 #if defined(__aarch64__)
 	if (uc)
-		pc = (uintptr_t)uc->uc_mcontext.pc;
+		pc = (unsigned long)uc->uc_mcontext.pc;
 #endif
-	__android_log_print(ANDROID_LOG_FATAL, "halo", "CRASH: signal %d (%s) at address %p, pc=%p",
-		sig, strsignal(sig), info ? info->si_addr : NULL, (void *)pc);
+	length += write_hex(buffer + length, pc);
+	length += write_string(buffer + length, "\n");
+	write(2, buffer, length);
 
-	/* welche Bibliothek enthaelt den PC */
 	if (pc)
 	{
 		Dl_info location;
 
+		length = 0;
 		if (dladdr((void *)pc, &location) && location.dli_fname)
 		{
-			uintptr_t base = (uintptr_t)location.dli_fbase;
-
-			__android_log_print(ANDROID_LOG_FATAL, "halo", "  in %s (base=%p, offset=0x%lx)",
-				location.dli_fname, (void *)base, (unsigned long)(pc - base));
+			length += write_string(buffer + length, "  in ");
+			length += write_string(buffer + length, location.dli_fname);
+			length += write_string(buffer + length, " offset=");
+			length += write_hex(buffer + length, pc - (unsigned long)location.dli_fbase);
 			if (location.dli_sname)
-				__android_log_print(ANDROID_LOG_FATAL, "halo", "  near symbol %s",
-					location.dli_sname);
+			{
+				length += write_string(buffer + length, " near ");
+				length += write_string(buffer + length, location.dli_sname);
+			}
+			length += write_string(buffer + length, "\n");
+			write(2, buffer, length);
 		}
 		else
 		{
-			__android_log_print(ANDROID_LOG_FATAL, "halo", "  (no library found for pc %p)", (void *)pc);
+			length += write_string(buffer + length, "  (no library for pc)\n");
+			write(2, buffer, length);
 		}
 	}
 
-	/* Register */
 	if (uc)
 	{
-		__android_log_print(ANDROID_LOG_FATAL, "halo",
-			"  regs: x0=%016lx x1=%016lx x2=%016lx x3=%016lx",
-			(unsigned long)uc->uc_mcontext.regs[0], (unsigned long)uc->uc_mcontext.regs[1],
-			(unsigned long)uc->uc_mcontext.regs[2], (unsigned long)uc->uc_mcontext.regs[3]);
-		__android_log_print(ANDROID_LOG_FATAL, "halo",
-			"  regs: x8=%016lx x16=%016lx x17=%016lx sp=%016lx",
-			(unsigned long)uc->uc_mcontext.regs[8], (unsigned long)uc->uc_mcontext.regs[16],
-			(unsigned long)uc->uc_mcontext.regs[17], (unsigned long)uc->uc_mcontext.sp);
+#if defined(__aarch64__)
+		for (i = 0; i < 31; i += 4)
+		{
+			int j;
+			int count = (31 - i) < 4 ? (31 - i) : 4;
+
+			length = 0;
+			length += write_string(buffer + length, "  regs:");
+			for (j = 0; j < count; j++)
+			{
+				length += write_string(buffer + length, " x");
+				length += write_unsigned(buffer + length, (unsigned long)(i + j));
+				length += write_string(buffer + length, "=");
+				length += write_hex_padded(buffer + length, (unsigned long)uc->uc_mcontext.regs[i + j]);
+			}
+			length += write_string(buffer + length, "\n");
+			write(2, buffer, length);
+		}
+		length = 0;
+		length += write_string(buffer + length, "  sp=");
+		length += write_hex_padded(buffer + length, (unsigned long)uc->uc_mcontext.sp);
+		length += write_string(buffer + length, "\n");
+		write(2, buffer, length);
+#endif
 	}
 
-	fprintf(stderr, "CRASH: signal %d (%s) at address %p, pc=%p\n",
-		sig, strsignal(sig), info ? info->si_addr : NULL, (void *)pc);
-	fflush(stderr);
 	_exit(128 + sig);
 }
+
+static char signal_stack[SIGSTKSZ * 4] __attribute__((aligned(16)));
 
 static void install_signal_handlers(void)
 {
 	struct sigaction sa;
+	stack_t ss;
+
+	ss.ss_sp = signal_stack;
+	ss.ss_size = sizeof(signal_stack);
+	ss.ss_flags = 0;
+	sigaltstack(&ss, NULL);
+
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_sigaction = signal_handler;
-	sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
 	sigaction(SIGSEGV, &sa, NULL);
 	sigaction(SIGILL, &sa, NULL);
 	sigaction(SIGBUS, &sa, NULL);
