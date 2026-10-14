@@ -9,6 +9,7 @@ v2-Änderungen:
 - Neue Funktion ui_widget_port_realloc_hint als Stub, falls vom
   Settings-Code aufgerufen.
 - Null-Pointer-Guards in config_text.
+- platform_audio_devices-Signatur exakt an menu_tags.c angepasst.
 */
 
 #include "cseries.h"
@@ -117,21 +118,14 @@ int platform_display_resolutions(long *widths, long *heights, int maximum)
 	return 1;
 }
 
-int platform_audio_devices(char *names, int maximum, int name_size)
+int platform_audio_devices(int recording, char (*names)[128], int maximum)
 {
-	const char *default_device = "Default Audio Device";
-	int length;
-
-	if (maximum <= 0 || name_size <= 0 || names == NULL)
+	(void)recording;
+	if (!names || maximum <= 0)
 		return 0;
 
-	length = (int)strlen(default_device) + 1;
-	if (length > name_size)
-		length = name_size;
-
-	memcpy(names, default_device, length - 1);
-	names[length - 1] = '\0';
-
+	strncpy(names[0], "Default Audio Device", 127);
+	names[0][127] = '\0';
 	return 1;
 }
 
