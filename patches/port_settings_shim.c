@@ -22,10 +22,12 @@ int config_text(char const *name, char *text, unsigned int size) {
         text[0] = 0;
         return 0;
     }
-    unsigned int length = (unsigned int)strlen(value);
-    if (length >= size) length = size - 1;
-    memcpy(text, value, length);
-    text[length] = 0;
+    {
+        unsigned int length = (unsigned int)strlen(value);
+        if (length >= size) length = size - 1;
+        memcpy(text, value, length);
+        text[length] = 0;
+    }
     return 1;
 }
 
