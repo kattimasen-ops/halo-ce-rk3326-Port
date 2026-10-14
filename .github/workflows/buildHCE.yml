@@ -80,6 +80,56 @@ jobs:
             libgbm-dev \
             libudev-dev
 
+      - name: "aarch64-libdrm und libgbm fuer den SDL-Link bereitstellen"
+        run: |
+          set -e
+
+          echo "== aarch64 als zweite Architektur aktivieren"
+          dpkg --add-architecture arm64
+
+          # amd64-Quellen auf amd64 beschraenken, sonst meckert apt beim
+          # Mischen der Architekturen
+          if [ -f /etc/apt/sources.list ]; then
+            cp /etc/apt/sources.list /etc/apt/sources.list.amd64-backup
+            sed -i -E 's/^deb (\[[^]]*\] )?http/deb [arch=amd64] http/' /etc/apt/sources.list
+          fi
+
+          mkdir -p /etc/apt/sources.list.d
+          cat > /etc/apt/sources.list.d/arm64.list << 'EOF'
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal main universe
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal-updates main universe
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal-security main universe
+          EOF
+
+          apt-get update
+
+          echo "== arm64-Laufzeitbibliotheken installieren"
+          apt-get install -y --no-install-recommends \
+            libdrm2:arm64 \
+            libgbm1:arm64 \
+            libwayland-server0:arm64 \
+            libexpat1:arm64
+
+          echo "== arm64-Libs in den Cross-Sysroot spiegeln"
+          mkdir -p /usr/aarch64-linux-gnu/lib
+
+          for pair in \
+              "libdrm.so.2:libdrm.so" \
+              "libgbm.so.1:libgbm.so"; do
+            target="/usr/lib/aarch64-linux-gnu/${pair%%:*}"
+            link="/usr/aarch64-linux-gnu/lib/${pair##*:}"
+            if [ -e "$target" ]; then
+              ln -sf "$target" "$link"
+              echo "  $link -> $target"
+            else
+              echo "  FEHLT: $target"
+              exit 1
+            fi
+          done
+
+          echo "== Cross-Sysroot:"
+          ls -la /usr/aarch64-linux-gnu/lib/ || true
+
       - name: "clang-22 installieren (fuer den Guest)"
         run: |
           set -e
@@ -115,7 +165,17 @@ jobs:
             if pkg-config --exists "$module"; then
               echo "  OK: $module $(pkg-config --modversion "$module")"
             else
-              echo "  FEHLT: $module (SDL2 wuerde KMSDRM still abschalten)"
+              echo "  FEHLT: $module"
+              exit 1
+            fi
+          done
+          echo ""
+          echo "== aarch64-Cross-Bibliotheken:"
+          for lib in libdrm.so libgbm.so; do
+            if [ -e "/usr/aarch64-linux-gnu/lib/$lib" ]; then
+              echo "  OK: /usr/aarch64-linux-gnu/lib/$lib -> $(readlink -f /usr/aarch64-linux-gnu/lib/$lib)"
+            else
+              echo "  FEHLT: /usr/aarch64-linux-gnu/lib/$lib"
               exit 1
             fi
           done
@@ -149,17 +209,18 @@ jobs:
           echo "== Vorher:"
           ls -la "$SYSROOT_LIB" || true
 
-          # Die vorgefertigte libSDL2-2.0.so.0 kann ohne KMSDRM gebaut sein.
-          # Sie wird entfernt, damit build.sh SDL2 aus dem Quellcode neu baut
-          # und dabei den KMSDRM-Backend aktiviert (dafuer sind libdrm, gbm
-          # und udev installiert worden).
+          # Die vorgefertigte libSDL2-2.0.so.0 kann ohne KMSDRM-Backend
+          # gebaut worden sein (kmsdrm not available zur Laufzeit). Sie
+          # wird entfernt, damit build.sh SDL2 aus dem Quellcode neu baut
+          # und dabei den KMSDRM-Backend aktiviert; libdrm, gbm und udev
+          # sind im Container vorhanden.
+          #
+          # SDL3 wird NICHT neu gebaut: der Host linkt nicht gegen SDL3,
+          # die Bibliothek ist nur Beigabe. Ein Neubau bringt nur
+          # zusaetzliche Fehlerquellen.
           if [ -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
             rm -f "$SYSROOT_LIB/libSDL2-2.0.so.0"
             echo "  libSDL2-2.0.so.0 entfernt (wird mit KMSDRM neu gebaut)"
-          fi
-          if [ -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
-            rm -f "$SYSROOT_LIB/libSDL3.so.0"
-            echo "  libSDL3.so.0 entfernt (wird neu gebaut)"
           fi
           echo "== Nachher:"
           ls -la "$SYSROOT_LIB" || true
@@ -171,7 +232,6 @@ jobs:
           mkdir -p "$SYSROOT_LIB"
           ls -la "$SYSROOT_LIB" || true
 
-          missing=0
           for lib in libdecor-0.so.0; do
             if ls "$SYSROOT_LIB/$lib"* > /dev/null 2>&1; then
               echo "  OK: $lib"
@@ -186,11 +246,6 @@ jobs:
               echo "  HINWEIS: $lib fehlt, build.sh baut sie aus dem Quellcode (erwartet)."
             fi
           done
-          if [ "$missing" -ne 0 ]; then
-            echo ""
-            echo "FEHLER: eine harte Voraussetzung fehlt."
-            exit 1
-          fi
 
       - name: "rej/-Ordner vorbereiten"
         run: mkdir -p rej
@@ -207,7 +262,7 @@ jobs:
         run: |
           set +e
           if [ ! -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
-            echo "libSDL2-2.0.so.0 fehlt in sysroot/ – Build hat sie nicht erzeugt."
+            echo "libSDL2-2.0.so.0 fehlt in sysroot/ - Build hat sie nicht erzeugt."
             exit 0
           fi
           size=$(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0")
@@ -233,26 +288,26 @@ jobs:
         run: |
           set +e
           {
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
             echo "BUILD-FEHLER-ANALYSE"
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
             echo "Datum: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "Repo: ${{ github.repository }}"
             echo "Commit: ${{ github.sha }}"
             echo ""
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
             echo "1. ALLE error:-Zeilen"
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
             grep -nE "error:|error :|fatal error:|FAILED:" build.log 2>/dev/null | head -500 || echo "(keine error-Zeilen)"
             echo ""
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
             echo "2. Letzte 500 Zeilen build.log"
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
             tail -n 500 build.log 2>/dev/null || echo "(kein build.log)"
             echo ""
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
             echo "3. Host-Binary-Info"
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
             if [ -f dist/halo ]; then
               file dist/halo 2>&1 || true
               ls -la dist/halo
@@ -260,14 +315,14 @@ jobs:
               echo "(dist/halo fehlt)"
             fi
             echo ""
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
             echo "4. Verwendeter Compiler"
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
             grep -E "Compiler|aarch64-linux-gnu-gcc|GCC" build.log 2>/dev/null | head -10 || true
             echo ""
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
             echo "ENDE DER FEHLERANALYSE"
-            echo "════════════════════════════════════════════════════════════"
+            echo "================================================================"
           } > build-error-analysis.txt
           cp build-error-analysis.txt rej/ 2>/dev/null || true
           cp build.log rej/ 2>/dev/null || true
@@ -303,9 +358,9 @@ jobs:
       - name: "Kurze Zusammenfassung"
         if: always()
         run: |
-          echo "════════════════════════════════════════════════════════════"
+          echo "================================================================"
           echo "  BUILD-ZUSAMMENFASSUNG"
-          echo "════════════════════════════════════════════════════════════"
+          echo "================================================================"
           if [ -f dist/halo_guest.elf ]; then
             echo "Guest-ELF: $(stat -c%s dist/halo_guest.elf) Bytes"
           else
@@ -319,4 +374,4 @@ jobs:
           if [ -f dist/libs.aarch64/libSDL2-2.0.so.0 ]; then
             echo "libSDL2-2.0.so.0: $(stat -c%s dist/libs.aarch64/libSDL2-2.0.so.0) Bytes"
           fi
-          echo "════════════════════════════════════════════════════════════"
+          echo "================================================================"
