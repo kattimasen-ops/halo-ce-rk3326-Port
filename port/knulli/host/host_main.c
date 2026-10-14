@@ -151,7 +151,7 @@ static void install_signal_handlers(void)
 {
 	struct sigaction sa;
 	memset(&sa, 0, sizeof(sa));
-	sa.sa_sigaction = host_signal_handler;
+	sa.sa_sigaction = signal_handler;
 	sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
 	sigaction(SIGSEGV, &sa, NULL);
 	sigaction(SIGILL, &sa, NULL);
@@ -439,7 +439,7 @@ int main(int argc, char *argv[])
 	setvbuf(stderr, NULL, _IOLBF, 0);
 	find_executable_root();
 	host_logf(HOST_LOG_INFO, "Halo for Knulli starting (%s)", executable_root);
-	host_install_signal_handlers();
+	install_signal_handlers();
 	if (host_native_thread_create(game_main, NULL, MAIN_STACK_SIZE) != 0)
 		host_fatal("cannot start the game thread");
 	/* the game ends the process itself (host_exit) */
