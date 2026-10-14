@@ -256,6 +256,7 @@ jobs:
           OPEN_CE_URL: https://github.com/OpenCommunityEdition/OpenCE.git
         run: |
           set +e
+          echo "== Schritt: Quellbaum ins Repo pushen =="
 
           # ---- Arbeitsort des gepatchten Quellbaums finden ----
           WORKSRC=""
@@ -288,14 +289,20 @@ jobs:
             echo "WARNUNG: OpenCE konnte nicht geklont werden."
           fi
 
-          # ---- In den Zielbranch wechseln ----
-          cd "$GITHUB_WORKSPACE"
-          git config user.name "github-actions[bot]"
+          # ---- In einem frischen Temp-Verzeichnis arbeiten ----
+          PUSH_DIR=$(mktemp -d)
+          cd "$PUSH_DIR"
+          echo "PUSH_DIR=$PUSH_DIR"
+
+          git init -q .
+          git remote add origin \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin "$DEST_BRANCH" 2>/dev/null || true
-          git checkout -B "$DEST_BRANCH"
+
+          git fetch --depth 1 origin "$DEST_BRANCH" 2>/dev/null || true
+          git checkout -B "$DEST_BRANCH" 2>/dev/null || git checkout --orphan "$DEST_BRANCH"
           git rm -rf . > /dev/null 2>&1 || true
-          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} + 2>/dev/null || true
 
           # ---- Quellbaum nach patched-source/ kopieren ----
           mkdir -p patched-source
@@ -311,6 +318,8 @@ jobs:
               --exclude='*.a' \
               --exclude='*.d' \
               -cf - . | tar -C patched-source -xf -
+          echo "== Quellbaum kopiert:"
+          ls patched-source/ | head -30
 
           # ---- OpenCE dazu ----
           if [ -d "$OPEN_CE_DIR" ] && [ -n "$(ls -A "$OPEN_CE_DIR" 2>/dev/null)" ]; then
@@ -320,15 +329,16 @@ jobs:
                 --exclude='__pycache__' \
                 --exclude='*.pyc' \
                 -cf - . | tar -C patched-source/_external/OpenCE -xf -
+            echo "== OpenCE kopiert."
           fi
 
           # ---- SDL2 dazu ----
           if [ -d "$GITHUB_WORKSPACE/work/SDL2-src" ]; then
             mkdir -p patched-source/_external/SDL2
             tar -C "$GITHUB_WORKSPACE/work/SDL2-src" \
-                --exclude='.git' \
-                --exclude='build' \
+                --exclude='.git' --exclude='build' \
                 -cf - . | tar -C patched-source/_external/SDL2 -xf -
+            echo "== SDL2 kopiert."
           fi
 
           # ---- SDL3 dazu ----
@@ -339,10 +349,9 @@ jobs:
             esac
             if [ -d "$d" ]; then
               mkdir -p patched-source/_external/SDL3
-              tar -C "$d" \
-                  --exclude='.git' \
-                  --exclude='build' \
+              tar -C "$d" --exclude='.git' --exclude='build' \
                   -cf - . | tar -C patched-source/_external/SDL3 -xf -
+              echo "== SDL3 kopiert aus $base"
               break
             fi
           done
@@ -356,7 +365,7 @@ jobs:
           Commit:           $GITHUB_SHA
           Ref:              $GITHUB_REF
           Datum:            $(date -u +%Y-%m-%dT%H:%M:%SZ)
-          Upstream:         https://github.com/cybersecurity/halo-ce-universal.git @ $(tr -d '[:space:]' < UPSTREAM_COMMIT 2>/dev/null || echo unbekannt)
+          Upstream:         https://github.com/cybersecurity/halo-ce-universal.git @ $(tr -d '[:space:]' < "$GITHUB_WORKSPACE/UPSTREAM_COMMIT" 2>/dev/null || echo unbekannt)
           OpenCE:           $OPEN_CE_URL @ $OPEN_CE_COMMIT
           PGO-Mode:         $PGO_MODE
           SDL2-Version:     release-2.30.10
@@ -367,16 +376,20 @@ jobs:
           git add -A
           if git diff --cached --quiet; then
             echo "Keine Aenderungen - nichts zu committen."
+            cd "$GITHUB_WORKSPACE"
+            rm -rf "$PUSH_DIR"
             exit 0
           fi
-          git commit -m "build: patched sources @ ${GITHUB_SHA:0:7}" \
-                     -m "Automatisch erzeugt von buildHCE.yml (Run $GITHUB_RUN_ID)." \
-                     -m "[skip ci]"
+          git commit -q -m "build: patched sources @ ${GITHUB_SHA:0:7}" \
+                         -m "Automatisch erzeugt von buildHCE.yml (Run $GITHUB_RUN_ID)." \
+                         -m "[skip ci]"
           if git push --force origin "$DEST_BRANCH"; then
             echo "== Push nach $DEST_BRANCH abgeschlossen."
           else
-            echo "WARNUNG: Push nach $DEST_BRANCH fehlgeschlagen."
+            echo "WARNUNG: Push nach $DEST_BRANCH fehlgeschlagen (Rechte? Branch-Protection?)."
           fi
+          cd "$GITHUB_WORKSPACE"
+          rm -rf "$PUSH_DIR"
 
       - name: "Gepatchte Quelldateien zum Pruefen bereitstellen"
         if: always()
