@@ -27,6 +27,7 @@ Paths, each overridable from the environment:
 #include "tomlc17.h"
 
 #include <android/log.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -141,6 +142,41 @@ static void signal_handler(int sig, siginfo_t *info, void *ucontext_ptr)
 #endif
 	__android_log_print(ANDROID_LOG_FATAL, "halo", "CRASH: signal %d (%s) at address %p, pc=%p",
 		sig, strsignal(sig), info ? info->si_addr : NULL, (void *)pc);
+
+	/* welche Bibliothek enthaelt den PC */
+	if (pc)
+	{
+		Dl_info location;
+
+		if (dladdr((void *)pc, &location) && location.dli_fname)
+		{
+			uintptr_t base = (uintptr_t)location.dli_fbase;
+
+			__android_log_print(ANDROID_LOG_FATAL, "halo", "  in %s (base=%p, offset=0x%lx)",
+				location.dli_fname, (void *)base, (unsigned long)(pc - base));
+			if (location.dli_sname)
+				__android_log_print(ANDROID_LOG_FATAL, "halo", "  near symbol %s",
+					location.dli_sname);
+		}
+		else
+		{
+			__android_log_print(ANDROID_LOG_FATAL, "halo", "  (no library found for pc %p)", (void *)pc);
+		}
+	}
+
+	/* Register */
+	if (uc)
+	{
+		__android_log_print(ANDROID_LOG_FATAL, "halo",
+			"  regs: x0=%016lx x1=%016lx x2=%016lx x3=%016lx",
+			(unsigned long)uc->uc_mcontext.regs[0], (unsigned long)uc->uc_mcontext.regs[1],
+			(unsigned long)uc->uc_mcontext.regs[2], (unsigned long)uc->uc_mcontext.regs[3]);
+		__android_log_print(ANDROID_LOG_FATAL, "halo",
+			"  regs: x8=%016lx x16=%016lx x17=%016lx sp=%016lx",
+			(unsigned long)uc->uc_mcontext.regs[8], (unsigned long)uc->uc_mcontext.regs[16],
+			(unsigned long)uc->uc_mcontext.regs[17], (unsigned long)uc->uc_mcontext.sp);
+	}
+
 	fprintf(stderr, "CRASH: signal %d (%s) at address %p, pc=%p\n",
 		sig, strsignal(sig), info ? info->si_addr : NULL, (void *)pc);
 	fflush(stderr);
