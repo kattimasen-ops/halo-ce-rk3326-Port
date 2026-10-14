@@ -17,7 +17,7 @@ PGO_MODE=${PGO_MODE:-use}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/cybersecurity/halo-ce-universal.git}
 UPSTREAM_COMMIT=$(tr -d '[:space:]' < "$HERE/UPSTREAM_COMMIT")
-PATCH=$HERE/patches/halo-ce-universal-knnuli.patch
+PATCH=$HERE/patches/halo-ce-universal-knulli.patch
 [ -f "$PATCH" ] || PATCH=$HERE/patches/halo-ce-universal-knulli.patch
 SDL3_TAG=release-3.2.10
 SDL2_TAG=release-2.30.10
@@ -229,8 +229,8 @@ if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
         -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_C_COMPILER="$HOST_CC" \
         -DCMAKE_CXX_COMPILER="$HOST_CXX" \
-        -DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -mno-outline-atomics" \
-        -DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -mno-outline-atomics" \
+        -DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35" \
+        -DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35" \
         -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -330,8 +330,8 @@ PATCH_EOF
         -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_C_COMPILER="$HOST_CC" \
         -DCMAKE_CXX_COMPILER="$HOST_CXX" \
-        -DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -mno-outline-atomics" \
-        -DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -mno-outline-atomics" \
+        -DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35" \
+        -DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35" \
         -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
