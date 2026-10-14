@@ -8,6 +8,8 @@ OUT=build/knulli
 OBJ=$OUT/obj
 mkdir -p "$OUT/lib" "$OUT/libs.aarch64" "$OUT/gl_include" "$OBJ"
 
+# Compiler: aus HOST_CC, das die aeussere build.sh exportiert. Nicht CC,
+# damit ein im Container gesetztes CC=gcc den Cross-GCC nicht ueberschreibt.
 CC=${HOST_CC:-aarch64-linux-gnu-gcc}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 SDL2_INCLUDE=${SDL2_INCLUDE:-/usr/include/SDL2}
@@ -80,6 +82,37 @@ link_library() {
 link_library "libSDL2*"  "libSDL2.so"    || exit 1
 link_library "libSDL3*"  "libSDL3.so"    || true
 link_library "libdecor*" "libdecor.so"   || true
+
+# ══════════════════════════════════════════════════════════════════════
+# libmali.so.0 Linker-Stub
+#
+# Der Host ruft glGetString, glGetIntegerv usw. aus libmali auf. Ohne
+# einen NEEDED-Eintrag "libmali.so.0" findet der dynamische Loader diese
+# Symbole beim Programmstart nicht: bei -fno-plt landete der Sprung auf
+# die Basisadresse des eigenen Moduls (ELF-Header), was SIGILL ausloeste.
+#
+# Die echte libmali wird zur Laufzeit aus /tmp/halo-mali per dlopen
+# geladen (share_initialize, host_glthread.c). Der Stub hier enthaelt
+# keinen Code und keine Symbole — er existiert nur, damit der Linker
+# den NEEDED-Eintrag in den Host-Binary schreibt.
+#
+# --no-as-needed in der Link-Zeile sorgt dafuer, dass der Stub trotz
+# fehlender Symbole als NEEDED eingetragen wird.
+# ══════════════════════════════════════════════════════════════════════
+if [ ! -f "$OUT/lib/libmali.so.0" ]; then
+    echo "== Erzeuge libmali.so.0 Linker-Stub in $OUT/lib/"
+    "$CC" -shared -fPIC -Wl,-soname,libmali.so.0 -o "$OUT/lib/libmali.so.0" -x c - <<'MALI_STUB_EOF'
+/*
+Linker-Stub fuer libmali.so.0. Kein Code, keine Symbole. Die echten
+GLES- und EGL-Funktionen werden zur Laufzeit aus der vom Benutzer
+installierten libmali in /tmp/halo-mali geladen. Dieser Stub dient
+nur dazu, dass der Linker den NEEDED-Eintrag libmali.so.0 in die
+Host-Binary aufnimmt, damit der dynamische Loader glGetString,
+glGetIntegerv und die uebrigen GL-Symbole ueberhaupt findet.
+*/
+MALI_STUB_EOF
+    ls -la "$OUT/lib/libmali.so.0"
+fi
 
 CFLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -fPIC -Wall -Wno-unused-function \
         -D_GNU_SOURCE -DEGL_NO_X11 -DMESA_EGL_NO_X11_HEADERS \
@@ -157,8 +190,9 @@ $CC $CFLAGS -o "$OUT/halo" $objects \
     -Wl,-rpath-link,"$OUT/lib" \
     -Wl,--allow-shlib-undefined \
     -Wl,--unresolved-symbols=ignore-all \
-    -Wl,--as-needed -Wl,--gc-sections \
-    -lSDL2 -lpthread -ldl -lm
+    -Wl,--as-needed -lSDL2 -lpthread -ldl -lm \
+    -Wl,--no-as-needed -l:libmali.so.0 \
+    -Wl,--gc-sections
 
 if [ ! -f "$OUT/halo" ]; then
     echo "FEHLER: $OUT/halo konnte nicht erstellt werden!" >&2
@@ -172,3 +206,19 @@ if command -v file > /dev/null 2>&1; then
     file "$OUT/halo"
 fi
 ls -lh "$OUT/halo"
+
+echo "== NEEDED-Eintraege in $OUT/halo:"
+if command -v readelf > /dev/null 2>&1; then
+    readelf -d "$OUT/halo" 2>/dev/null | grep NEEDED || true
+    echo "== Pruefe libmali.so.0:"
+    if readelf -d "$OUT/halo" 2>/dev/null | grep -q "libmali.so.0"; then
+        echo "  OK: libmali.so.0 ist in NEEDED"
+    else
+        echo "  FEHLER: libmali.so.0 fehlt in NEEDED"
+        echo "         Der Linker hat den Stub nicht eingetragen."
+        echo "         Pruefe die --no-as-needed-Option in der Link-Zeile."
+        exit 1
+    fi
+else
+    echo "  (readelf nicht verfuegbar)"
+fi
