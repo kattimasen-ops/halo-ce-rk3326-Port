@@ -10,10 +10,6 @@ on:
       - 'README.md'
       - 'llms.txt'
 
-# contents: write wird von dem optionalen "Quellbaum ins Repo pushen"-
-# Step gebraucht, der die gepatchten Quellen in den Branch build-artifacts
-# pusht. Ohne diese Berechtigung schlaegt der Push mit
-# "Invalid username or token" fehl.
 permissions:
   contents: write
 
@@ -35,6 +31,10 @@ jobs:
       PGO_MODE: use
       JOBS: "4"
       DEBIAN_FRONTEND: noninteractive
+      # NEU v18: pkg-config soll die selbst erzeugten aarch64-.pc-Dateien
+      # in $SYSROOT_LIB/pkgconfig finden. PKG_CONFIG_PATH ist additiv zu
+      # den Standardpfaden (amd64-libdrm.pc bleibt auffindbar).
+      PKG_CONFIG_PATH: ${{ github.workspace }}/sysroot/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig
 
     steps:
       - name: Checkout repo
@@ -123,8 +123,6 @@ jobs:
           mkdir -p /usr/aarch64-linux-gnu/lib
 
           # Symlinks, die der Cross-Linker (aarch64-linux-gnu-gcc) braucht.
-          # Ohne diese Symlinks findet SDL2s CMake libdrm, gbm, egl und
-          # GLESv2 nicht und schaltet KMSDRM ab.
           for pair in \
               "libdrm.so.2:libdrm.so" \
               "libgbm.so.1:libgbm.so" \
@@ -143,6 +141,93 @@ jobs:
 
           echo "== Cross-Sysroot:"
           ls -la /usr/aarch64-linux-gnu/lib/ || true
+
+          # ==================================================================
+          # NEU v18: pkg-config-Dateien fuer die aarch64-Zielarchitektur
+          # ==================================================================
+          # Die arm64-Pakete libdrm2:arm64 / libgbm1:arm64 / libegl1:arm64
+          # bringen unter Ubuntu 20.04 keine .pc-Dateien mit; die sind nur
+          # in den Dev-Paketen enthalten, die mit multiarch nicht parallel
+          # zum amd64-Dev-Paket installierbar sind.
+          #
+          # SDL2 2.30.10 prueft in cmake/sdlchecks.cmake:
+          #     pkg_check_modules(KMSDRM libdrm gbm egl)
+          # Faellt auch nur eines der drei durch, wird das gesamte KMSDRM-
+          # Backend still deaktiviert. Deshalb legen wir hier minimale
+          # .pc-Dateien an, die exakt auf die obigen Symlinks in
+          # /usr/aarch64-linux-gnu/lib zeigen. Header sind architektur-
+          # unabhaengig (aus /usr/include bzw. /usr/include/libdrm).
+          #
+          # PKG_CONFIG_PATH (siehe env-Block) enthaelt $SYSROOT_LIB/pkgconfig,
+          # damit sowohl der KMSDRM-Check-Step als auch SDL2s CMake diese
+          # Dateien finden.
+          PC_DIR="$SYSROOT_LIB/pkgconfig"
+          mkdir -p "$PC_DIR"
+
+          cat > "$PC_DIR/libdrm.pc" << 'PCEOF'
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=/usr/aarch64-linux-gnu/lib
+          includedir=/usr/include/libdrm
+
+          Name: libdrm
+          Description: Userspace interface to kernel DRM services
+          Version: 2.4.110
+          Libs: -L${libdir} -ldrm
+          Cflags: -I${includedir}
+          PCEOF
+
+          cat > "$PC_DIR/gbm.pc" << 'PCEOF'
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=/usr/aarch64-linux-gnu/lib
+          includedir=/usr/include
+
+          Name: gbm
+          Description: Graphics Buffer Manager
+          Version: 21.2.6
+          Libs: -L${libdir} -lgbm
+          Cflags: -I${includedir}
+          PCEOF
+
+          cat > "$PC_DIR/egl.pc" << 'PCEOF'
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=/usr/aarch64-linux-gnu/lib
+          includedir=/usr/include
+
+          Name: egl
+          Description: EGL library
+          Version: 1.5
+          Libs: -L${libdir} -lEGL
+          Cflags: -I${includedir}
+          PCEOF
+
+          cat > "$PC_DIR/libudev.pc" << 'PCEOF'
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=/usr/aarch64-linux-gnu/lib
+          includedir=/usr/include
+
+          Name: libudev
+          Description: libudev library
+          Version: 245
+          Libs: -L${libdir} -ludev
+          Cflags: -I${includedir}
+          PCEOF
+
+          echo "== aarch64 pkg-config-Dateien in $PC_DIR:"
+          ls -la "$PC_DIR"
+
+          echo "== pkg-config-Gegenprobe (arm64-Kontext):"
+          for m in libdrm gbm egl libudev; do
+            if pkg-config --exists "$m"; then
+              echo "  OK: $m -> $(pkg-config --modversion "$m")"
+            else
+              echo "  FEHLT: $m"
+              exit 1
+            fi
+          done
 
       - name: "clang-22 installieren (fuer den Guest)"
         run: |
@@ -175,9 +260,9 @@ jobs:
         run: |
           set -e
           echo "== pkg-config fuer SDL2s KMSDRM-Backend:"
-          # libdrm und gbm sind Pflicht. egl ist ebenfalls Pflicht: ohne
-          # EGL-Header/Lib baut SDL2 KMSDRM gar nicht erst.
-          for module in libdrm gbm libudev egl; do
+          # libdrm, gbm, egl und libudev werden alle geprueft. egl ist
+          # zwingend: ohne egl.pc schaltet SDL2 KMSDRM still ab.
+          for module in libdrm gbm egl libudev; do
             if pkg-config --exists "$module"; then
               echo "  OK: $module $(pkg-config --modversion "$module" 2>/dev/null || echo '?')"
             else
@@ -225,18 +310,11 @@ jobs:
           echo "== Vorher:"
           ls -la "$SYSROOT_LIB" || true
 
-          # SDL2 muss neu gebaut werden, damit der Mali-G31-Pageflip-Patch
-          # in libSDL2-2.0.so.0 landet. Ohne dieses Loeschen wuerde build.sh
-          # die alte, ungepatchte Version aus sysroot verwenden.
           if [ -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
             rm -f "$SYSROOT_LIB/libSDL2-2.0.so.0"
             echo "  libSDL2-2.0.so.0 entfernt (wird mit KMSDRM-Pageflip-Patch neu gebaut)"
           fi
 
-          # SDL3 muss ebenfalls neu gebaut werden, damit der SDL3-KMSDRM-
-          # Fix (drmModeGetConnectorTypeName) sicher enthalten ist. Der
-          # Host linkt nicht gegen SDL3, aber der Guest nutzt SDL3-Header
-          # und die shared lib wird als Beigabe mitgeliefert.
           if [ -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
             rm -f "$SYSROOT_LIB/libSDL3.so.0"
             echo "  libSDL3.so.0 entfernt (wird neu gebaut)"
@@ -266,6 +344,9 @@ jobs:
               echo "  HINWEIS: $lib fehlt, build.sh baut sie aus dem Quellcode (erwartet)."
             fi
           done
+
+          echo "== pkgconfig-Unterordner:"
+          ls -la "$SYSROOT_LIB/pkgconfig" || true
 
       - name: "rej/-Ordner vorbereiten"
         run: mkdir -p rej
@@ -429,13 +510,9 @@ jobs:
             fi
             echo ""
             echo "================================================================"
-            echo "6. android_build.py nach Shim-Patch (nur clang-relevante Zeilen)"
+            echo "6. pkg-config-Dateien im sysroot"
             echo "================================================================"
-            if [ -f rej/android_build_clang_lines.txt ]; then
-              cat rej/android_build_clang_lines.txt
-            else
-              echo "(rej/android_build_clang_lines.txt fehlt)"
-            fi
+            ls -la "$SYSROOT_LIB/pkgconfig" 2>/dev/null || echo "(kein pkgconfig-Ordner)"
             echo ""
             echo "================================================================"
             echo "ENDE DER FEHLERANALYSE"
