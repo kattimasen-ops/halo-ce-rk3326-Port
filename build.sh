@@ -2,8 +2,8 @@
 set -euo pipefail
 # ======================================================================
 # Halo CE Universal - M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
-# Fix v18: -I/usr/include/libdrm in CMAKE_C_FLAGS für SDL2/SDL3
-#          (xf86drm.h includiert <drm.h>, das in /usr/include/libdrm liegt)
+# Fix v19: Python-Syntaxfehler in re.sub() behoben
+#          (literaler Zeilenumbruch in r'...' durch \n ersetzt)
 # ======================================================================
 
 PGO_MODE=${PGO_MODE:-use}
@@ -232,7 +232,7 @@ path = sys.argv[1]
 text = open(path).read()
 pattern = re.compile(
     r'diff --git a/port/assets/menus/ce/'
-    r'main_menu\.settings_select\.player_setup\.player_profile_edit\.'
+    r'main_menu\.settings_select\.player_profile_edit\.'
     r'video_settings\.xml[^\n]*\n'
     r'(?:(?!diff --git ).)*',
     re.DOTALL,
@@ -273,12 +273,6 @@ curl -L -o "$WORK/sdl3.tar.gz" \
 tar -xzf "$WORK/sdl3.tar.gz" -C "$WORK"
 fi
 
-# SDL3 3.2.10 ruft drmModeGetConnectorTypeName auf. Die Funktion
-# wurde erst in libdrm 2.4.112 eingeführt; Ubuntu 20.04 hat
-# 2.4.110. Der SDL3-Header wird um eine extern-Deklaration ergänzt,
-# damit GCC den Header durchläuft. SDL3 lädt die Funktion zur
-# Laufzeit über SDL_KMSDRM_SYM_OPT und akzeptiert ein fehlendes
-# Symbol.
 echo "== SDL3 KMSDRM: libdrm-2.4.110-Kompatibilität anwenden"
 python3 - "$SDL3_SRC/src/video/kmsdrm/SDL_kmsdrmsym.h" <<'KMSDRM_EOF'
 import sys
@@ -803,6 +797,9 @@ with open(path, 'w') as f:
 print("android_build.py: -DHALO_ANDROID")
 PYEOF
 
+# ======================================================================
+# Fix v19: clang-Builtin-Shim (Python-Syntaxfehler behoben)
+# ======================================================================
 python3 - "$SRC/tools/android_build.py" <<'PYEOF'
 import re, sys
 path = sys.argv[1]
@@ -851,10 +848,15 @@ if anchor in text:
     text = text.replace(anchor, anchor + "\n" + new_fn, 1)
     text = text.replace("_clang_resource_include(guest_cc)", "_clang_builtin_shim(guest_cc)")
 
+# FIX v19: Der Regex enthielt einen literalen Zeilenumbruch in r'...'
+# Das ist in Python nicht erlaubt. Stattdessen \n als Escape-Sequenz.
 if "guest_abi = " in text and "_clang_builtin_shim(guest_cc)" not in text:
-    text = re.sub(r'(guest_abi\s*=\s*"[^"]*"\s*\.join\(\s*
-?\s*GUEST_ABI_FLAGS\b)',
-                  r'\1\n+ _clang_builtin_shim(guest_cc)', text, count=1)
+    text = re.sub(
+        r'(guest_abi\s*=\s*"[^"]*"\s*\.join\(\s*\n?\s*GUEST_ABI_FLAGS\b)',
+        r'\1\n+ _clang_builtin_shim(guest_cc)',
+        text,
+        count=1,
+    )
 
 print("clang-Builtin-Shim eingebaut")
 
@@ -1198,7 +1200,7 @@ cat "$HERE/patches/$p" 2>/dev/null || true
 done
 [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
 echo "pgo-mode=$PGO_MODE"
-echo "gcc9-host-dynamic=v18-libdrm-include-path"
+echo "gcc9-host-dynamic=v19-python-regex-newline-fix"
 (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 
@@ -1275,8 +1277,13 @@ fi
 
 cat <<'RELEASE'
 --------------------------------------------------------------------
-BUILD v18 - libdrm-Include-Pfad für SDL2/SDL3 KMSDRM
+BUILD v19 - Python re.sub() Syntax-Fix
 --------------------------------------------------------------------
+Der Python-Syntaxfehler "EOL while scanning string literal" ist behoben.
+Ursache: Ein regulärer Ausdruck in einem heredoc enthielt einen literalen
+Zeilenumbruch innerhalb eines Raw-Strings r'...'. Python erlaubt das nicht.
+Fix: \n als Escape-Sequenz statt als literaler Zeilenumbruch.
+
 Installation auf M9 Pro:
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
 2. dist/halo_guest.elf    nach /roms/ports/halo-ce/halo_guest.elf
