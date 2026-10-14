@@ -8,7 +8,7 @@ OUT=build/knulli
 OBJ=$OUT/obj
 mkdir -p "$OUT/lib" "$OUT/libs.aarch64" "$OUT/gl_include" "$OBJ"
 
-CC=${CC:-gcc}
+CC=${HOST_CC:-aarch64-linux-gnu-gcc}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 SDL2_INCLUDE=${SDL2_INCLUDE:-/usr/include/SDL2}
 SYSROOT_LIB=${SYSROOT_LIB:-/usr/lib}
