@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ══════════════════════════════════════════════════════════════════════
-# Halo CE Universal — M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
+# ======================================================================
+# Halo CE Universal - M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
+#
+# Fix v14 (Multiarch libdrm/libgbm):
+#  - Der Container bekommt ueber den Workflow aarch64-Versionen von
+#    libdrm.so und libgbm.so unter /usr/aarch64-linux-gnu/lib. Der
+#    SDL2-KMSDRM-Build findet sie dort.
+#  - build.sh prueft, dass diese aarch64-Symlinks vorhanden sind.
 #
 # Fix v13 (SDL3 KMSDRM auf libdrm 2.4.110):
 #  - SDL3 3.2.10 verlangt drmModeGetConnectorTypeName, das erst
 #    libdrm 2.4.112 einfuehrt. Ubuntu 20.04 hat 2.4.110. Der SDL3-Header
-#    bekommt eine extern-Deklaration, damit GCC durchlaeuft; SDL3 laedt
-#    die Funktion zur Laufzeit und akzeptiert ein fehlendes Symbol.
+#    bekommt eine extern-Deklaration, damit GCC durchlaeuft.
 #
 # Fix v12 (DIAGNOSE):
 #  - patch_gl_init_order.py wird VOR dem Build aufgerufen und fuegt
@@ -16,13 +21,14 @@ set -euo pipefail
 #
 # Fix v11: Dispatcher-Bereich in patch_settings_only.py korrigiert.
 # Fix v7:  -mno-outline-atomics entfernt, CMAKE_CXX_COMPILER gesetzt.
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 PGO_MODE=${PGO_MODE:-use}
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/cybersecurity/halo-ce-universal.git}
 UPSTREAM_COMMIT=$(tr -d '[:space:]' < "$HERE/UPSTREAM_COMMIT")
-PATCH=$HERE/patches/halo-ce-universal-knulli.patch
+PATCH=$HERE/patches/halo-ce-universal-knnuli.patch
+[ -f "$PATCH" ] || PATCH=$HERE/patches/halo-ce-universal-knulli.patch
 SDL3_TAG=release-3.2.10
 SDL2_TAG=release-2.30.10
 SDL2_ARCHIVE=https://github.com/libsdl-org/SDL/archive/refs/tags/$SDL2_TAG.tar.gz
@@ -54,11 +60,21 @@ ANDROID_NDK=$(cd "$ANDROID_NDK" && pwd)
 mkdir -p "$SYSROOT_LIB" 2>/dev/null || true
 SYSROOT_LIB=$(cd "$SYSROOT_LIB" && pwd)
 
-# Ohne diese Pakete deaktiviert SDL2/SDL3 den KMSDRM-Backend still und baut
+# Ohne diese Pakete deaktiviert SDL2 den KMSDRM-Backend still und baut
 # ohne Fensterunterstuetzung (kmsdrm not available zur Laufzeit).
 for module in libdrm gbm; do
     if ! pkg-config --exists "$module"; then
         die "pkg-config findet '$module' nicht. Installiere libdrm-dev und libgbm-dev."
+    fi
+done
+
+# Der Cross-Linker braucht aarch64-Versionen von libdrm und libgbm.
+# Die amd64-Dev-Pakete liefern die Header und die pkg-config-Dateien,
+# aber nicht die aarch64-.so-Dateien; die kommen ueber die Multiarch-
+# Einrichtung im Workflow.
+for lib in /usr/aarch64-linux-gnu/lib/libdrm.so /usr/aarch64-linux-gnu/lib/libgbm.so; do
+    if [ ! -e "$lib" ]; then
+        die "Cross-aarch64 $lib fehlt. Der Multiarch-Schritt im Workflow legt ihn an."
     fi
 done
 
@@ -96,7 +112,7 @@ REJ=$(cd "$REJ" && pwd)
 SRC=$WORK/halo-ce-universal
 OPENCE=$WORK/opence
 
-# ── OpenCE-Dateien holen ─────────────────────────────────────────────
+# -- OpenCE-Dateien holen ---------------------------------------------
 fetch_opence_files() {
     local opence_dir="$WORK/opence-source"
     local opence_tarball="$WORK/opence-main.tar.gz"
@@ -188,7 +204,7 @@ fetch_opence_files() {
     echo "== OpenCE-Dateien geholt."
 }
 
-# ── XML-Hunk aus dem Knulli-Patch entfernen (idempotent) ────────────
+# -- XML-Hunk aus dem Knulli-Patch entfernen (idempotent) ------------
 echo ""
 echo "== Entferne den video_settings.xml-Hunk aus dem Knulli-Patch ..."
 python3 - "$PATCH" <<'PYEOF'
@@ -210,9 +226,9 @@ open(path, 'w').write(new_text)
 print("  XML-Hunk entfernt; Patch ist jetzt %d Bytes kleiner." % (len(text) - len(new_text)))
 PYEOF
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # libdecor-0.so.0 (Stub fuer GLIBC 2.30 / ArkOS4Clone)
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 mkdir -p "$SYSROOT_LIB"
 if [ ! -f "$SYSROOT_LIB/libdecor-0.so.0" ] || readelf -s "$SYSROOT_LIB/libdecor-0.so.0" 2>/dev/null | grep -q "GLIBC_2\.3[2-9]"; then
     echo "== Kompiliere libdecor-0.so.0 Stub fuer Ubuntu 20.04 (GLIBC 2.31 / ArkOS4Clone) ..."
@@ -223,9 +239,9 @@ void libdecor_unref(void) {}
 DECOR_EOF
 fi
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # SDL3 (nur bauen, wenn .so fehlt)
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
     echo "== SDL3 $SDL3_TAG: kompiliere aus dem Quellcode (GCC, shared)"
     SDL3_SRC=$WORK/SDL3-${SDL3_TAG#release-}
@@ -295,9 +311,9 @@ else
     echo "== libSDL3.so.0 bereits vorhanden"
 fi
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # SDL2
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 SDL2_SRC=$WORK/SDL2-src
 SDL2_BUILD=$WORK/sdl2-build
 SDL2_INSTALL=$WORK/sdl2-install
@@ -427,9 +443,9 @@ echo "== SDL2_INCLUDE=$SDL2_INCLUDE"
 export SDL2_LIB_DIR="$SDL2_INSTALL/lib"
 echo "== SDL2_LIB_DIR=$SDL2_LIB_DIR"
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # Upstream klonen + Knulli-Patch + OpenCE-Dateien
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 if [ ! -d "$SRC/.git" ]; then
     echo "== Klone Upstream in $SRC ..."
     git init -q "$SRC"
@@ -547,9 +563,9 @@ PYEOF
     fi
 fi
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # PGO
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 PGO_FLAG="--pgo=off"
 PGO_EXTRA_ARGS=""
 LTO_FLAG="--lto=full"
@@ -578,9 +594,9 @@ elif [ "$PGO_MODE" = "train" ]; then
     LTO_FLAG="--lto=off"
 fi
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # Fix 1: APCs in xbox_kernel.c
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 python3 - "$SRC/port/linux/src/xbox_kernel.c" <<'PYEOF'
 import sys
 path = sys.argv[1]
@@ -677,9 +693,9 @@ with open(path, 'w') as f:
 print("xbox_kernel.c geprueft")
 PYEOF
 
-# ══════════════════════════════════════════════════════════════════════
-# Fix 2: android_build.py — Compiler-Flags
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
+# Fix 2: android_build.py - Compiler-Flags
+# ======================================================================
 python3 - "$SRC/tools/android_build.py" <<'PYEOF'
 import sys
 path = sys.argv[1]
@@ -830,9 +846,9 @@ if old in text:
 PYEOF
 fi
 
-# ══════════════════════════════════════════════════════════════════════
-# Fix 3: linux_build.py — nur Compiler-Flags
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
+# Fix 3: linux_build.py - nur Compiler-Flags
+# ======================================================================
 python3 - "$SRC/tools/linux_build.py" <<'PYEOF'
 import sys
 path = sys.argv[1]
@@ -855,22 +871,22 @@ with open(path, 'w') as f:
 print("linux_build.py geprueft")
 PYEOF
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # port/knulli kopieren
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 echo ""
-echo "== Kopiere port/knulli in den Quellbaum ..."
-if [ ! -d "$HERE/port/knulli" ]; then
-    die "port/knulli/ existiert nicht im Repo"
+echo "== Kopiere port/knnuli in den Quellbaum ..."
+if [ ! -d "$HERE/port/knnuli" ]; then
+    die "port/knnuli/ existiert nicht im Repo"
 fi
-rm -rf "$SRC/port/knulli"
-cp -a "$HERE/port/knulli" "$SRC/port/knulli"
-rm -rf "$SRC/port/knulli/__pycache__"
-chmod +x "$SRC/port/knulli/build.sh" 2>/dev/null || true
+rm -rf "$SRC/port/knnuli"
+cp -a "$HERE/port/knnuli" "$SRC/port/knnuli"
+rm -rf "$SRC/port/knnuli/__pycache__"
+chmod +x "$SRC/port/knnuli/build.sh" 2>/dev/null || true
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # DIAGNOSE: Logging in host_glthread.c einfuegen
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # Diesen Block nach dem Test wieder entfernen.
 if [ -f "$HERE/patches/patch_gl_init_order.py" ]; then
     echo ""
@@ -882,9 +898,9 @@ else
     echo "WARNUNG: patches/patch_gl_init_order.py fehlt - Diagnose uebersprungen!"
 fi
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # Restliche Python-Patches
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 echo ""
 echo "== Wende restliche Patch-Skripte an ..."
 for patch_script in \
@@ -956,9 +972,9 @@ if [ -f "$HERE/patches/patch_credits_xml.py" ]; then
     python3 "$HERE/patches/patch_credits_xml.py" "$SRC"
 fi
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # Verifikation
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 echo ""
 echo "== Verifiziere Patch-Ergebnisse ..."
 verification_failed=0
@@ -1027,9 +1043,8 @@ check_patch "source/cache/cache_files.c"        "cache_files_tag_instances"     
 check_patch "source/cache/cache_files.c"        "menu_tags_loaded"              "cache_files.c Menue-Hooks"
 check_patch "port/linux/src/menu_files.c"       "MENU_FILES_HOST_FUNCS_DECLARED" "menu_files.c Forward-Deklarationen"
 
-# Diagnose-Verifikation: prueft, dass die DIAG-Logs im host_glthread.c sitzen
 if [ -f "$HERE/patches/patch_gl_init_order.py" ]; then
-    check_patch "port/knulli/host/host_glthread.c" "DIAG: sync-create ENTER" "host_glthread.c DIAG-Logs eingefuegt"
+    check_patch "port/knnuli/host/host_glthread.c" "DIAG: sync-create ENTER" "host_glthread.c DIAG-Logs eingefuegt"
 fi
 
 if grep -q "settings_only: game data dispatcher" \
@@ -1048,16 +1063,16 @@ if [ "$verification_failed" -ne 0 ]; then
 fi
 echo "== Verifikation abgeschlossen."
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # CPATH
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 CPATH_GUEST="$SRC/port/third_party/expat/lib:$SRC/port/third_party/expat:$SRC/port/third_party/zlib"
 export CPATH="$CPATH_GUEST${CPATH:+:$CPATH}"
 echo "== CPATH=$CPATH"
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # Stamp
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 stamp=$({
     cat "$PATCH"
     for p in patch_opence_menu_cache_hooks.py \
@@ -1079,14 +1094,14 @@ stamp=$({
     done
     [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
     echo "pgo-mode=$PGO_MODE"
-    echo "gcc9-host-dynamic=v13-sdl3-kmsdrm-fix"
-    (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
+    echo "gcc9-host-dynamic=v14-multiarch-libdrm-gbm"
+    (cd "$HERE/port/knnuli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 echo "$stamp" > "$SRC/.port-stamp"
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # Build
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 export ANDROID_NDK SYSROOT_LIB SDL2_INCLUDE SDL2_LIB_DIR GUEST_CC HOST_CC JOBS
 cd "$SRC"
 
@@ -1097,24 +1112,24 @@ python3 configure.py --release "$LTO_FLAG" "$PGO_FLAG" $PGO_EXTRA_ARGS \
 echo "== Baue Guest-ELF (halo_guest.elf) ..."
 ninja -j "$JOBS" -k 0 build/android/halo_guest.elf || true
 
-echo "== Baue Host-Binary (halo, dynamisch, GCC 9) ueber port/knulli/build.sh ..."
-bash "$SRC/port/knulli/build.sh"
+echo "== Baue Host-Binary (halo, dynamisch, GCC 9) ueber port/knnuli/build.sh ..."
+bash "$SRC/port/knnuli/build.sh"
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # Distribution
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 echo "== copying the build into $DIST"
 rm -rf "$DIST"
 mkdir -p "$DIST"
-if [ -f "$SRC/build/knulli/halo" ]; then
-    cp "$SRC/build/knulli/halo" "$DIST/halo"
+if [ -f "$SRC/build/knnuli/halo" ]; then
+    cp "$SRC/build/knnuli/halo" "$DIST/halo"
     chmod +x "$DIST/halo" 2>/dev/null || true
 else
-    echo "FEHLER: Host-Binary ($SRC/build/knulli/halo) wurde nicht gebaut!" >&2
+    echo "FEHLER: Host-Binary ($SRC/build/knnuli/halo) wurde nicht gebaut!" >&2
     exit 1
 fi
 for candidate in \
-    "$SRC/build/knulli/halo_guest.elf" \
+    "$SRC/build/knnuli/halo_guest.elf" \
     "$SRC/build/android/halo_guest.elf"; do
     if [ -f "$candidate" ]; then
         cp "$candidate" "$DIST/halo_guest.elf"
@@ -1122,13 +1137,13 @@ for candidate in \
         break
     fi
 done
-[ -f "$SRC/port/knulli/Halo.sh" ] && cp "$SRC/port/knulli/Halo.sh" "$DIST/Halo.sh"
-[ -f "$SRC/port/knulli/halo_extract.py" ] && cp "$SRC/port/knulli/halo_extract.py" "$DIST/halo_extract.py"
-[ -f "$SRC/port/knulli/halo_screen.py" ] && cp "$SRC/port/knulli/halo_screen.py" "$DIST/halo_screen.py"
-[ -f "$SRC/port/knulli/sdl_mapping.py" ] && cp "$SRC/port/knulli/sdl_mapping.py" "$DIST/sdl_mapping.py"
-if [ -d "$SRC/build/knulli/libs.aarch64" ]; then
+[ -f "$SRC/port/knnuli/Halo.sh" ] && cp "$SRC/port/knnuli/Halo.sh" "$DIST/Halo.sh"
+[ -f "$SRC/port/knnuli/halo_extract.py" ] && cp "$SRC/port/knnuli/halo_extract.py" "$DIST/halo_extract.py"
+[ -f "$SRC/port/knnuli/halo_screen.py" ] && cp "$SRC/port/knnuli/halo_screen.py" "$DIST/halo_screen.py"
+[ -f "$SRC/port/knnuli/sdl_mapping.py" ] && cp "$SRC/port/knnuli/sdl_mapping.py" "$DIST/sdl_mapping.py"
+if [ -d "$SRC/build/knnuli/libs.aarch64" ]; then
     mkdir -p "$DIST/libs.aarch64"
-    cp -a "$SRC/build/knulli/libs.aarch64/." "$DIST/libs.aarch64/"
+    cp -a "$SRC/build/knnuli/libs.aarch64/." "$DIST/libs.aarch64/"
 fi
 chmod +x "$DIST/Halo.sh" 2>/dev/null || true
 
@@ -1150,9 +1165,9 @@ fi
 
 cat <<'RELEASE'
 
-────────────────────────────────────────────────────────────────────────
-BUILD v13 — SDL3 KMSDRM auf libdrm 2.4.110
-────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------
+BUILD v14 - Multiarch libdrm/libgbm fuer SDL-KMSDRM
+--------------------------------------------------------------------
 Installation auf M9 Pro:
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
 2. dist/halo_guest.elf    nach /roms/ports/halo-ce/halo_guest.elf
@@ -1165,5 +1180,5 @@ Vor dem Start pruefen:
 Falls die BuildID gleich bleibt, wurde nicht deployt.
 
 FERTIG.
-────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------
 RELEASE
