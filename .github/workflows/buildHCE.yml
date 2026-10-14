@@ -10,6 +10,13 @@ on:
       - 'README.md'
       - 'llms.txt'
 
+# contents: write wird von dem optionalen "Quellbaum ins Repo pushen"-
+# Step gebraucht, der die gepatchten Quellen in den Branch build-artifacts
+# pusht. Ohne diese Berechtigung schlaegt der Push mit
+# "Invalid username or token" fehl.
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build guest + host (arm64_32 + aarch64)
@@ -311,7 +318,7 @@ jobs:
           fi
           ls -la rej/patched/ 2>/dev/null || true
 
-      - name: "SDL2-Backends verifizieren"
+      - name: "SDL2-Backends und Patches verifizieren"
         if: always()
         run: |
           set +e
@@ -419,6 +426,15 @@ jobs:
               fi
             else
               echo "(libSDL2-2.0.so.0 fehlt)"
+            fi
+            echo ""
+            echo "================================================================"
+            echo "6. android_build.py nach Shim-Patch (nur clang-relevante Zeilen)"
+            echo "================================================================"
+            if [ -f rej/android_build_clang_lines.txt ]; then
+              cat rej/android_build_clang_lines.txt
+            else
+              echo "(rej/android_build_clang_lines.txt fehlt)"
             fi
             echo ""
             echo "================================================================"
