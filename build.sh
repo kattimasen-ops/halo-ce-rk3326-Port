@@ -2,8 +2,13 @@
 set -euo pipefail
 # ======================================================================
 # Halo CE Universal - M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
-# Fix v19: Python-Syntaxfehler in re.sub() behoben
-#          (literaler Zeilenumbruch in r'...' durch \n ersetzt)
+# Fix v20:
+#  - -I/usr/include/libdrm in allen cmake-Aufrufen (SDL2+SDL3)
+#  - CMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH statt ONLY
+#  - _clang_builtin_shim gibt kompletten Resource-Include-Pfad zurück
+#  - Keine literalen Newlines in Python r'...' Strings
+#  - .pc-Dateien mit includedir=/usr/include
+#  - Fallback: libdrm-Include-Pfad aus pkg-config extrahieren
 # ======================================================================
 
 PGO_MODE=${PGO_MODE:-use}
@@ -56,6 +61,24 @@ if [ ! -e "$lib" ]; then
 die "Cross-aarch64 $lib fehlt. Der Multiarch-Schritt im Workflow legt ihn an."
 fi
 done
+
+# ======================================================================
+# Fix v20: libdrm-Include-Pfad ermitteln
+# ======================================================================
+LIBDRM_INCLUDE="/usr/include/libdrm"
+if [ ! -d "$LIBDRM_INCLUDE" ]; then
+  echo "== /usr/include/libdrm existiert nicht, extrahiere Pfad aus pkg-config..."
+  LIBDRM_CFLAGS=$(pkg-config --cflags libdrm 2>/dev/null || true)
+  if [ -n "$LIBDRM_CFLAGS" ]; then
+    LIBDRM_INCLUDE=$(echo "$LIBDRM_CFLAGS" | grep -oP '(?<=-I)\S+' | head -1)
+    echo "   Gefunden: $LIBDRM_INCLUDE"
+  fi
+fi
+if [ ! -d "$LIBDRM_INCLUDE" ]; then
+  echo "WARNUNG: libdrm-Include-Verzeichnis nicht gefunden, verwende /usr/include"
+  LIBDRM_INCLUDE="/usr/include"
+fi
+echo "== LIBDRM_INCLUDE=$LIBDRM_INCLUDE"
 
 # ======================================================================
 # pkg-config für aarch64 konfigurieren
@@ -232,7 +255,7 @@ path = sys.argv[1]
 text = open(path).read()
 pattern = re.compile(
     r'diff --git a/port/assets/menus/ce/'
-    r'main_menu\.settings_select\.player_profile_edit\.'
+    r'main_menu\.settings_select\.player_setup\.player_profile_edit\.'
     r'video_settings\.xml[^\n]*\n'
     r'(?:(?!diff --git ).)*',
     re.DOTALL,
@@ -273,6 +296,12 @@ curl -L -o "$WORK/sdl3.tar.gz" \
 tar -xzf "$WORK/sdl3.tar.gz" -C "$WORK"
 fi
 
+# SDL3 3.2.10 ruft drmModeGetConnectorTypeName auf. Die Funktion
+# wurde erst in libdrm 2.4.112 eingeführt; Ubuntu 20.04 hat
+# 2.4.110. Der SDL3-Header wird um eine extern-Deklaration ergänzt,
+# damit GCC den Header durchläuft. SDL3 lädt die Funktion zur
+# Laufzeit über SDL_KMSDRM_SYM_OPT und akzeptiert ein fehlendes
+# Symbol.
 echo "== SDL3 KMSDRM: libdrm-2.4.110-Kompatibilität anwenden"
 python3 - "$SDL3_SRC/src/video/kmsdrm/SDL_kmsdrmsym.h" <<'KMSDRM_EOF'
 import sys
@@ -285,7 +314,7 @@ if "extern const char *drmModeGetConnectorTypeName" in text:
 decl = (
     "/* SDL3 on libdrm < 2.4.112: drmModeGetConnectorTypeName fehlt in den\n"
     "   libdrm-Headern von Ubuntu 20.04 (2.4.110). Diese Deklaration\n"
-    "   macht den Header für GCC gültig; SDL3 lädt das Symbol zur\n"
+    "   macht den Header fuer GCC gueltig; SDL3 laedt das Symbol zur\n"
     "   Laufzeit und akzeptiert ein fehlendes (SDL_KMSDRM_SYM_OPT). */\n"
     "extern const char *drmModeGetConnectorTypeName(uint32_t connector_type);\n"
     "\n"
@@ -303,8 +332,8 @@ cmake -S "$SDL3_SRC" -B "$SDL3_BUILD" \
 -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
 -DCMAKE_C_COMPILER="$HOST_CC" \
 -DCMAKE_CXX_COMPILER="$HOST_CXX" \
--DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I/usr/include/libdrm" \
--DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I/usr/include/libdrm" \
+-DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
+-DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
 -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
 -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
 -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -352,6 +381,7 @@ curl -L -o "$WORK/sdl2.tar.gz" "$SDL2_ARCHIVE"
 tar -xzf "$WORK/sdl2.tar.gz" -C "$SDL2_SRC" --strip-components=1
 
 echo "== SDL2 KMSDRM Pageflip-Patch für Mali-G31 anwenden"
+set +e
 python3 - "$SDL2_SRC/src/video/kmsdrm/SDL_kmsdrmopengles.c" <<'PATCH_EOF'
 import sys, re
 path = sys.argv[1]
@@ -406,13 +436,14 @@ with open(path, 'w') as f:
     f.write(text)
 print("SDL2 KMSDRM Pageflip-Patch angewendet")
 PATCH_EOF
+set -e
 
 cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
 -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
 -DCMAKE_C_COMPILER="$HOST_CC" \
 -DCMAKE_CXX_COMPILER="$HOST_CXX" \
--DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I/usr/include/libdrm" \
--DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I/usr/include/libdrm" \
+-DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
+-DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
 -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
 -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
 -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -447,8 +478,8 @@ cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
 -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
 -DCMAKE_C_COMPILER="$HOST_CC" \
 -DCMAKE_CXX_COMPILER="$HOST_CXX" \
--DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I/usr/include/libdrm" \
--DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I/usr/include/libdrm" \
+-DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
+-DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
 -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
 -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
 -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -798,7 +829,7 @@ print("android_build.py: -DHALO_ANDROID")
 PYEOF
 
 # ======================================================================
-# Fix v19: clang-Builtin-Shim (Python-Syntaxfehler behoben)
+# Fix v20: clang-Builtin-Shim (kompletter Resource-Include-Pfad)
 # ======================================================================
 python3 - "$SRC/tools/android_build.py" <<'PYEOF'
 import re, sys
@@ -820,7 +851,6 @@ anchor = (
 
 new_fn = (
     'def _clang_builtin_shim(cc: str) -> list:\n'
-    '    import shutil\n'
     '    try:\n'
     '        result = subprocess.run([cc, "-print-resource-dir"],\n'
     '                                capture_output=True, text=True, check=True)\n'
@@ -829,27 +859,13 @@ new_fn = (
     '    include = Path(result.stdout.strip()) / "include"\n'
     '    if not include.is_dir():\n'
     '        return []\n'
-    '    shim = BUILD / "guest" / "clang_builtin_shim"\n'
-    '    shim.mkdir(parents=True, exist_ok=True)\n'
-    '    for name in ("arm_neon.h", "arm_vector_types.h", "arm_acle.h", "arm_fp16.h", "arm_bf16.h"):\n'
-    '        source = include / name\n'
-    '        if not source.is_file():\n'
-    '            continue\n'
-    '        target = shim / name\n'
-    '        if target.exists() or target.is_symlink():\n'
-    '            try: target.unlink()\n'
-    '            except OSError: pass\n'
-    '            try: target.symlink_to(source)\n'
-    '            except OSError: shutil.copy2(source, target)\n'
-    '    return ["-isystem", str(shim)]\n'
+    '    return ["-isystem", str(include)]\n'
 )
 
 if anchor in text:
     text = text.replace(anchor, anchor + "\n" + new_fn, 1)
     text = text.replace("_clang_resource_include(guest_cc)", "_clang_builtin_shim(guest_cc)")
 
-# FIX v19: Der Regex enthielt einen literalen Zeilenumbruch in r'...'
-# Das ist in Python nicht erlaubt. Stattdessen \n als Escape-Sequenz.
 if "guest_abi = " in text and "_clang_builtin_shim(guest_cc)" not in text:
     text = re.sub(
         r'(guest_abi\s*=\s*"[^"]*"\s*\.join\(\s*\n?\s*GUEST_ABI_FLAGS\b)',
@@ -858,7 +874,7 @@ if "guest_abi = " in text and "_clang_builtin_shim(guest_cc)" not in text:
         count=1,
     )
 
-print("clang-Builtin-Shim eingebaut")
+print("clang-Builtin-Shim eingebaut (kompletter Resource-Include-Pfad)")
 
 with open(path, 'w') as f:
     f.write(text)
@@ -1200,7 +1216,7 @@ cat "$HERE/patches/$p" 2>/dev/null || true
 done
 [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
 echo "pgo-mode=$PGO_MODE"
-echo "gcc9-host-dynamic=v19-python-regex-newline-fix"
+echo "gcc9-host-dynamic=v20-libdrm-include-arm-neon-fix"
 (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 
@@ -1277,13 +1293,8 @@ fi
 
 cat <<'RELEASE'
 --------------------------------------------------------------------
-BUILD v19 - Python re.sub() Syntax-Fix
+BUILD v20 - libdrm-Include-Pfad + arm_neon.h Fix
 --------------------------------------------------------------------
-Der Python-Syntaxfehler "EOL while scanning string literal" ist behoben.
-Ursache: Ein regulärer Ausdruck in einem heredoc enthielt einen literalen
-Zeilenumbruch innerhalb eines Raw-Strings r'...'. Python erlaubt das nicht.
-Fix: \n als Escape-Sequenz statt als literaler Zeilenumbruch.
-
 Installation auf M9 Pro:
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
 2. dist/halo_guest.elf    nach /roms/ports/halo-ce/halo_guest.elf
