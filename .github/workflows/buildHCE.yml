@@ -9,7 +9,6 @@ on:
       - '*.md'
       - 'README.md'
       - 'llms.txt'
-      - 'patched-source/**'
 
 jobs:
   build:
@@ -17,8 +16,6 @@ jobs:
     runs-on: ubuntu-22.04
     container: ubuntu:20.04
     timeout-minutes: 180
-    permissions:
-      contents: write
     defaults:
       run:
         shell: bash
@@ -83,7 +80,7 @@ jobs:
             libgbm-dev \
             libudev-dev
 
-      - name: "aarch64-libdrm und libgbm fuer den SDL-Link bereitstellen"
+      - name: "aarch64-Multiarch: libdrm, libgbm, EGL, GLES fuer den SDL-Link bereitstellen"
         run: |
           set -e
 
@@ -105,18 +102,27 @@ jobs:
           apt-get update
 
           echo "== arm64-Laufzeitbibliotheken installieren"
+          # libegl1 und libgles2 sind zwingend, sonst deaktiviert SDL2 den
+          # KMSDRM-Backend still und baut ohne Fensterunterstuetzung.
           apt-get install -y --no-install-recommends \
             libdrm2:arm64 \
             libgbm1:arm64 \
             libwayland-server0:arm64 \
-            libexpat1:arm64
+            libexpat1:arm64 \
+            libegl1:arm64 \
+            libgles2:arm64
 
           echo "== arm64-Libs in den Cross-Sysroot spiegeln"
           mkdir -p /usr/aarch64-linux-gnu/lib
 
+          # Symlinks, die der Cross-Linker (aarch64-linux-gnu-gcc) braucht.
+          # Ohne diese Symlinks findet SDL2s CMake libdrm, gbm, egl und
+          # GLESv2 nicht und schaltet KMSDRM ab.
           for pair in \
               "libdrm.so.2:libdrm.so" \
-              "libgbm.so.1:libgbm.so"; do
+              "libgbm.so.1:libgbm.so" \
+              "libEGL.so.1:libEGL.so" \
+              "libGLESv2.so.2:libGLESv2.so"; do
             target="/usr/lib/aarch64-linux-gnu/${pair%%:*}"
             link="/usr/aarch64-linux-gnu/lib/${pair##*:}"
             if [ -e "$target" ]; then
@@ -162,9 +168,11 @@ jobs:
         run: |
           set -e
           echo "== pkg-config fuer SDL2s KMSDRM-Backend:"
-          for module in libdrm gbm libudev; do
+          # libdrm und gbm sind Pflicht. egl ist ebenfalls Pflicht: ohne
+          # EGL-Header/Lib baut SDL2 KMSDRM gar nicht erst.
+          for module in libdrm gbm libudev egl; do
             if pkg-config --exists "$module"; then
-              echo "  OK: $module $(pkg-config --modversion "$module")"
+              echo "  OK: $module $(pkg-config --modversion "$module" 2>/dev/null || echo '?')"
             else
               echo "  FEHLT: $module"
               exit 1
@@ -172,7 +180,7 @@ jobs:
           done
           echo ""
           echo "== aarch64-Cross-Bibliotheken:"
-          for lib in libdrm.so libgbm.so; do
+          for lib in libdrm.so libgbm.so libEGL.so libGLESv2.so; do
             if [ -e "/usr/aarch64-linux-gnu/lib/$lib" ]; then
               echo "  OK: /usr/aarch64-linux-gnu/lib/$lib -> $(readlink -f /usr/aarch64-linux-gnu/lib/$lib)"
             else
@@ -210,10 +218,23 @@ jobs:
           echo "== Vorher:"
           ls -la "$SYSROOT_LIB" || true
 
+          # SDL2 muss neu gebaut werden, damit der Mali-G31-Pageflip-Patch
+          # in libSDL2-2.0.so.0 landet. Ohne dieses Loeschen wuerde build.sh
+          # die alte, ungepatchte Version aus sysroot verwenden.
           if [ -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
             rm -f "$SYSROOT_LIB/libSDL2-2.0.so.0"
-            echo "  libSDL2-2.0.so.0 entfernt (wird mit KMSDRM neu gebaut)"
+            echo "  libSDL2-2.0.so.0 entfernt (wird mit KMSDRM-Pageflip-Patch neu gebaut)"
           fi
+
+          # SDL3 muss ebenfalls neu gebaut werden, damit der SDL3-KMSDRM-
+          # Fix (drmModeGetConnectorTypeName) sicher enthalten ist. Der
+          # Host linkt nicht gegen SDL3, aber der Guest nutzt SDL3-Header
+          # und die shared lib wird als Beigabe mitgeliefert.
+          if [ -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
+            rm -f "$SYSROOT_LIB/libSDL3.so.0"
+            echo "  libSDL3.so.0 entfernt (wird neu gebaut)"
+          fi
+
           echo "== Nachher:"
           ls -la "$SYSROOT_LIB" || true
 
@@ -248,148 +269,6 @@ jobs:
           set -e
           chmod +x build.sh
           bash build.sh 2>&1 | tee build.log
-
-      - name: "Gepatchten Quellbaum + OpenCE + SDL in den Repo-Branch pushen"
-        if: always()
-        env:
-          DEST_BRANCH: build-artifacts
-          OPEN_CE_URL: https://github.com/OpenCommunityEdition/OpenCE.git
-        run: |
-          set +e
-          echo "== Schritt: Quellbaum ins Repo pushen =="
-
-          # ---- Arbeitsort des gepatchten Quellbaums finden ----
-          WORKSRC=""
-          for candidate in \
-              "$GITHUB_WORKSPACE/work/halo-ce-universal" \
-              "$GITHUB_WORKSPACE/../work/halo-ce-universal"; do
-            if [ -d "$candidate" ]; then
-              WORKSRC="$candidate"
-              break
-            fi
-          done
-          if [ -z "$WORKSRC" ]; then
-            WORKSRC=$(find "$GITHUB_WORKSPACE" -maxdepth 5 -type d -name "halo-ce-universal" 2>/dev/null | head -n 1)
-          fi
-          if [ -z "$WORKSRC" ] || [ ! -d "$WORKSRC" ]; then
-            echo "WORKSRC nicht gefunden - ueberspringe Push."
-            exit 0
-          fi
-          echo "WORKSRC=$WORKSRC"
-
-          # ---- OpenCE frisch klonen (Original-Stand) ----
-          OPEN_CE_DIR="$GITHUB_WORKSPACE/work/opence-push"
-          OPEN_CE_COMMIT="unbekannt"
-          rm -rf "$OPEN_CE_DIR"
-          if git clone --depth 1 "$OPEN_CE_URL" "$OPEN_CE_DIR" > /dev/null 2>&1; then
-            OPEN_CE_COMMIT=$(git -C "$OPEN_CE_DIR" rev-parse HEAD)
-            rm -rf "$OPEN_CE_DIR/.git"
-            echo "OpenCE geklont: $OPEN_CE_COMMIT"
-          else
-            echo "WARNUNG: OpenCE konnte nicht geklont werden."
-          fi
-
-          # ---- In einem frischen Temp-Verzeichnis arbeiten ----
-          PUSH_DIR=$(mktemp -d)
-          cd "$PUSH_DIR"
-          echo "PUSH_DIR=$PUSH_DIR"
-
-          git init -q .
-          git remote add origin \
-            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git fetch --depth 1 origin "$DEST_BRANCH" 2>/dev/null || true
-          git checkout -B "$DEST_BRANCH" 2>/dev/null || git checkout --orphan "$DEST_BRANCH"
-          git rm -rf . > /dev/null 2>&1 || true
-
-          # ---- Quellbaum nach patched-source/ kopieren ----
-          mkdir -p patched-source
-          tar -C "$WORKSRC" \
-              --exclude='./build' \
-              --exclude='./.git' \
-              --exclude='./work' \
-              --exclude='./dist' \
-              --exclude='./rej' \
-              --exclude='./__pycache__' \
-              --exclude='*.pyc' \
-              --exclude='*.o' \
-              --exclude='*.a' \
-              --exclude='*.d' \
-              -cf - . | tar -C patched-source -xf -
-          echo "== Quellbaum kopiert:"
-          ls patched-source/ | head -30
-
-          # ---- OpenCE dazu ----
-          if [ -d "$OPEN_CE_DIR" ] && [ -n "$(ls -A "$OPEN_CE_DIR" 2>/dev/null)" ]; then
-            mkdir -p patched-source/_external/OpenCE
-            tar -C "$OPEN_CE_DIR" \
-                --exclude='.git' \
-                --exclude='__pycache__' \
-                --exclude='*.pyc' \
-                -cf - . | tar -C patched-source/_external/OpenCE -xf -
-            echo "== OpenCE kopiert."
-          fi
-
-          # ---- SDL2 dazu ----
-          if [ -d "$GITHUB_WORKSPACE/work/SDL2-src" ]; then
-            mkdir -p patched-source/_external/SDL2
-            tar -C "$GITHUB_WORKSPACE/work/SDL2-src" \
-                --exclude='.git' --exclude='build' \
-                -cf - . | tar -C patched-source/_external/SDL2 -xf -
-            echo "== SDL2 kopiert."
-          fi
-
-          # ---- SDL3 dazu ----
-          for d in "$GITHUB_WORKSPACE"/work/SDL3-*; do
-            base=$(basename "$d")
-            case "$base" in
-              *-build|*-install) continue ;;
-            esac
-            if [ -d "$d" ]; then
-              mkdir -p patched-source/_external/SDL3
-              tar -C "$d" --exclude='.git' --exclude='build' \
-                  -cf - . | tar -C patched-source/_external/SDL3 -xf -
-              echo "== SDL3 kopiert aus $base"
-              break
-            fi
-          done
-
-          # ---- Build-Info ----
-          cat > patched-source/_BUILD_INFO.txt <<EOF
-          Automatisch generiert vom Build-Workflow buildHCE.yml.
-          Repo:             $GITHUB_REPOSITORY
-          Run-ID:           $GITHUB_RUN_ID
-          Run-Nummer:       $GITHUB_RUN_NUMBER
-          Commit:           $GITHUB_SHA
-          Ref:              $GITHUB_REF
-          Datum:            $(date -u +%Y-%m-%dT%H:%M:%SZ)
-          Upstream:         https://github.com/cybersecurity/halo-ce-universal.git @ $(tr -d '[:space:]' < "$GITHUB_WORKSPACE/UPSTREAM_COMMIT" 2>/dev/null || echo unbekannt)
-          OpenCE:           $OPEN_CE_URL @ $OPEN_CE_COMMIT
-          PGO-Mode:         $PGO_MODE
-          SDL2-Version:     release-2.30.10
-          SDL3-Version:     release-3.2.10
-          EOF
-
-          # ---- Committen und pushen ----
-          git add -A
-          if git diff --cached --quiet; then
-            echo "Keine Aenderungen - nichts zu committen."
-            cd "$GITHUB_WORKSPACE"
-            rm -rf "$PUSH_DIR"
-            exit 0
-          fi
-          git commit -q -m "build: patched sources @ ${GITHUB_SHA:0:7}" \
-                         -m "Automatisch erzeugt von buildHCE.yml (Run $GITHUB_RUN_ID)." \
-                         -m "[skip ci]"
-          if git push --force origin "$DEST_BRANCH"; then
-            echo "== Push nach $DEST_BRANCH abgeschlossen."
-          else
-            echo "WARNUNG: Push nach $DEST_BRANCH fehlgeschlagen (Rechte? Branch-Protection?)."
-          fi
-          cd "$GITHUB_WORKSPACE"
-          rm -rf "$PUSH_DIR"
 
       - name: "Gepatchte Quelldateien zum Pruefen bereitstellen"
         if: always()
@@ -449,13 +328,43 @@ jobs:
               echo "  OK: KMSDRM ist enthalten"
             else
               echo "  FEHLT: KMSDRM nicht im SDL2-Binary"
-              echo "  (SDL2 wurde ohne libdrm/gbm gebaut)"
+              echo "  (SDL2 wurde ohne libdrm/gbm/egl gebaut)"
+            fi
+            echo ""
+            echo "== Mali-G31-Pageflip-Patch im SDL2-Binary:"
+            if aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -q "Async pageflip rejected"; then
+              echo "  OK: Pageflip-Patch ist kompiliert"
+            else
+              echo "  FEHLT: Pageflip-Patch nicht im Binary"
+              echo "  (SDL2 wurde ohne den Mali-G31-Patch gebaut)"
             fi
           fi
           echo ""
           echo "== SDL2 dynamisch benoetigte Bibliotheken:"
           if command -v aarch64-linux-gnu-readelf > /dev/null 2>&1; then
             aarch64-linux-gnu-readelf -d "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep NEEDED || true
+          fi
+
+      - name: "Host-Binary: libmali.so.0 in NEEDED verifizieren"
+        if: always()
+        run: |
+          set +e
+          if [ ! -f dist/halo ]; then
+            echo "dist/halo fehlt - Build ist nicht bis zum Host-Link gekommen."
+            exit 0
+          fi
+          echo "== NEEDED-Eintraege in dist/halo:"
+          if command -v aarch64-linux-gnu-readelf > /dev/null 2>&1; then
+            aarch64-linux-gnu-readelf -d dist/halo | grep NEEDED || true
+            echo ""
+            if aarch64-linux-gnu-readelf -d dist/halo | grep -q "libmali.so.0"; then
+              echo "  OK: libmali.so.0 ist in NEEDED"
+            else
+              echo "  FEHLER: libmali.so.0 fehlt in NEEDED"
+              echo "  Der Host wird zur Laufzeit mit SIGILL bei glGetString crashen."
+            fi
+          else
+            echo "  (readelf nicht verfuegbar)"
           fi
 
       - name: "Fehleranalyse sammeln"
@@ -486,6 +395,10 @@ jobs:
             if [ -f dist/halo ]; then
               file dist/halo 2>&1 || true
               ls -la dist/halo
+              if command -v aarch64-linux-gnu-readelf > /dev/null 2>&1; then
+                echo "--- NEEDED ---"
+                aarch64-linux-gnu-readelf -d dist/halo | grep NEEDED || true
+              fi
             else
               echo "(dist/halo fehlt)"
             fi
@@ -494,6 +407,19 @@ jobs:
             echo "4. Verwendeter Compiler"
             echo "================================================================"
             grep -E "Compiler|aarch64-linux-gnu-gcc|GCC" build.log 2>/dev/null | head -10 || true
+            echo ""
+            echo "================================================================"
+            echo "5. SDL2-Backends und Patches"
+            echo "================================================================"
+            if [ -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
+              echo "libSDL2-2.0.so.0: $(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0") Bytes"
+              if command -v aarch64-linux-gnu-strings > /dev/null 2>&1; then
+                aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -i "kmsdrm" | head -5 || echo "  (kein KMSDRM-String)"
+                aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep "Async pageflip rejected" | head -1 || echo "  (kein Pageflip-Patch-String)"
+              fi
+            else
+              echo "(libSDL2-2.0.so.0 fehlt)"
+            fi
             echo ""
             echo "================================================================"
             echo "ENDE DER FEHLERANALYSE"
