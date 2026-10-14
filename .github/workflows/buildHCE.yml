@@ -216,8 +216,7 @@ jobs:
           # sind im Container vorhanden.
           #
           # SDL3 wird NICHT neu gebaut: der Host linkt nicht gegen SDL3,
-          # die Bibliothek ist nur Beigabe. Ein Neubau bringt nur
-          # zusaetzliche Fehlerquellen.
+          # die Bibliothek ist nur Beigabe.
           if [ -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
             rm -f "$SYSROOT_LIB/libSDL2-2.0.so.0"
             echo "  libSDL2-2.0.so.0 entfernt (wird mit KMSDRM neu gebaut)"
