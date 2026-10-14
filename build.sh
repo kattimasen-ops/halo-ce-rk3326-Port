@@ -46,13 +46,17 @@ need "$GUEST_CC" "install clang-22 from apt.llvm.org, or set GUEST_CC"
 [ -d "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64" ] || die "ANDROID_NDK=$ANDROID_NDK is not an Android NDK"
 ANDROID_NDK=$(cd "$ANDROID_NDK" && pwd)
 [ -n "${SYSROOT_LIB:-}" ] || die "set SYSROOT_LIB to the folder with the runtime libraries"
-[ -d "$SYSROOT_LIB" ] || die "SYSROOT_LIB=$SYSROOT_LIB is not a folder"
+mkdir -p "$SYSROOT_LIB" 2>/dev/null || true
 SYSROOT_LIB=$(cd "$SYSROOT_LIB" && pwd)
 
-for library in libdecor-0.so.0; do
-    compgen -G "$SYSROOT_LIB/$library*" > /dev/null ||
-        die "no $library* in SYSROOT_LIB=$SYSROOT_LIB"
-done
+# libdecor-0.so.0 Stub erzeugen falls noch nicht vorhanden
+if [ ! -f "$SYSROOT_LIB/libdecor-0.so.0" ]; then
+    echo "== Erzeuge libdecor-0.so.0 Stub fuer ARM64 ..."
+    $HOST_CC -shared -fPIC -Wl,-soname,libdecor-0.so.0 -o "$SYSROOT_LIB/libdecor-0.so.0" -x c - <<'DECOR_EOF' || true
+void libdecor_new(void) {}
+void libdecor_unref(void) {}
+DECOR_EOF
+fi
 
 if ! printf '%s' "$UPSTREAM_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
     die "UPSTREAM_COMMIT='$UPSTREAM_COMMIT' ist kein 40-stelliger Hex-Hash"
@@ -194,6 +198,19 @@ print("  XML-Hunk entfernt; Patch ist jetzt %d Bytes kleiner." % (len(text) - le
 PYEOF
 
 # ══════════════════════════════════════════════════════════════════════
+# libdecor-0.so.0 (Stub fuer GLIBC 2.31 / ArkOS)
+# ══════════════════════════════════════════════════════════════════════
+mkdir -p "$SYSROOT_LIB"
+if [ ! -f "$SYSROOT_LIB/libdecor-0.so.0" ] || readelf -s "$SYSROOT_LIB/libdecor-0.so.0" 2>/dev/null | grep -q "GLIBC_2\.3[2-9]"; then
+    echo "== Kompiliere libdecor-0.so.0 Stub fuer Ubuntu 20.04 (GLIBC 2.31 / ArkOS) ..."
+    $HOST_CC -shared -fPIC -Wl,-soname,libdecor-0.so.0 -o "$SYSROOT_LIB/libdecor-0.so.0" -x c - <<'DECOR_EOF' || true
+/* libdecor dummy stub for ArkOS / KMSDRM where Wayland is not used */
+void libdecor_new(void) {}
+void libdecor_unref(void) {}
+DECOR_EOF
+fi
+
+# ══════════════════════════════════════════════════════════════════════
 # SDL3 (nur bauen, wenn .so fehlt)
 # ══════════════════════════════════════════════════════════════════════
 if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
@@ -212,6 +229,8 @@ if [ ! -f "$SYSROOT_LIB/libSDL3.so.0" ]; then
         -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_C_COMPILER="$HOST_CC" \
         -DCMAKE_CXX_COMPILER="$HOST_CXX" \
+        -DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -mno-outline-atomics" \
+        -DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -mno-outline-atomics" \
         -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -239,6 +258,14 @@ fi
 SDL2_SRC=$WORK/SDL2-src
 SDL2_BUILD=$WORK/sdl2-build
 SDL2_INSTALL=$WORK/sdl2-install
+
+if [ -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
+    if command -v aarch64-linux-gnu-readelf >/dev/null 2>&1 && \
+       aarch64-linux-gnu-readelf -d "$SYSROOT_LIB/libSDL2-2.0.so.0" 2>/dev/null | grep -E -q "libX11|libpulse"; then
+        echo "== Inkompatible sysroot libSDL2 (X11/Pulse) erkannt, loesche und baue sauber neu..."
+        rm -f "$SYSROOT_LIB/libSDL2-2.0.so.0"
+    fi
+fi
 
 if [ ! -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
     echo "== SDL2 $SDL2_TAG: Quellcode holen und mit GCC bauen (shared)"
@@ -303,6 +330,8 @@ PATCH_EOF
         -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_C_COMPILER="$HOST_CC" \
         -DCMAKE_CXX_COMPILER="$HOST_CXX" \
+        -DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -mno-outline-atomics" \
+        -DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -mno-outline-atomics" \
         -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -547,7 +576,7 @@ wait_new = '''\tif (alertable && platform_run_apcs())
 \t\t\t{
 \t\t\t\tpthread_mutex_unlock(&handle->lock);
 \t\t\t\treturn WAIT_IO_COMPLETION;
-\t\t\t}
+\t\t}
 \t\t\tif (!handle_try_acquire(handle))
 \t\t\t\tresult = WAIT_TIMEOUT;
 \t\t\tbreak;
@@ -816,6 +845,7 @@ fi
 echo ""
 echo "== Wende restliche Patch-Skripte an ..."
 for patch_script in \
+        patch_opence_menu_cache_hooks.py \
         patch_memory_pools.py patch_neon_math.py \
         patch_vita_optimizations.py patch_button_remap.py \
         patch_index_extent_neon.py patch_fps_overlay.py \
@@ -987,7 +1017,8 @@ echo "== CPATH=$CPATH"
 # ══════════════════════════════════════════════════════════════════════
 stamp=$({
     cat "$PATCH"
-    for p in patch_memory_pools.py patch_neon_math.py \
+    for p in patch_opence_menu_cache_hooks.py \
+             patch_memory_pools.py patch_neon_math.py \
              patch_vita_optimizations.py patch_button_remap.py \
              patch_index_extent_neon.py patch_fps_overlay.py \
              patch_draw_framebuffer_bound.py patch_mali_subdata.py \
@@ -1024,7 +1055,7 @@ echo "== Baue Guest-ELF (halo_guest.elf) ..."
 ninja -j "$JOBS" -k 0 build/android/halo_guest.elf || true
 
 echo "== Baue Host-Binary (halo, dynamisch, GCC 9) ueber port/knulli/build.sh ..."
-bash "$SRC/port/knulli/build.sh" || true
+bash "$SRC/port/knulli/build.sh"
 
 # ══════════════════════════════════════════════════════════════════════
 # Distribution
@@ -1034,6 +1065,10 @@ rm -rf "$DIST"
 mkdir -p "$DIST"
 if [ -f "$SRC/build/knulli/halo" ]; then
     cp "$SRC/build/knulli/halo" "$DIST/halo"
+    chmod +x "$DIST/halo" 2>/dev/null || true
+else
+    echo "FEHLER: Host-Binary ($SRC/build/knulli/halo) wurde nicht gebaut!" >&2
+    exit 1
 fi
 for candidate in \
     "$SRC/build/knulli/halo_guest.elf" \
