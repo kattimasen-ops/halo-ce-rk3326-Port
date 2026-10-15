@@ -8,8 +8,6 @@ OUT=build/knulli
 OBJ=$OUT/obj
 mkdir -p "$OUT/lib" "$OUT/libs.aarch64" "$OUT/gl_include" "$OBJ"
 
-# Compiler: aus HOST_CC, das die aeussere build.sh exportiert. Nicht CC,
-# damit ein im Container gesetztes CC=gcc den Cross-GCC nicht ueberschreibt.
 CC=${HOST_CC:-aarch64-linux-gnu-gcc}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 SDL2_INCLUDE=${SDL2_INCLUDE:-/usr/include/SDL2}
@@ -40,19 +38,6 @@ fi
 
 ninja -j "$JOBS" build/android/halo_guest.elf build/android/host/host_import_table.c
 
-# ======================================================================
-# v24: C_INCLUDE_PATH fuer den Host-Build loeschen.
-# ======================================================================
-# Der Top-Level-build.sh (v24) exportiert C_INCLUDE_PATH auf einen
-# clang-Shim mit arm_neon.h und Co., damit der Guest-Build (clang-22)
-# unter -nostdinc diesen Header findet. GCC respektiert C_INCLUDE_PATH
-# ebenfalls - der Host-Build wuerde also clangs arm_neon.h einlesen und
-# an den clang-spezifischen Builtin-Attributen scheitern
-# (__clang_arm_builtin_alias etc.).
-#
-# Guest-Build oben (ninja) hat C_INCLUDE_PATH gebraucht. Ab hier nur
-# noch Host-Code mit aarch64-linux-gnu-gcc, also weg damit.
-# ======================================================================
 unset C_INCLUDE_PATH
 unset CPLUS_INCLUDE_PATH
 
@@ -99,38 +84,29 @@ link_library "libSDL2*"  "libSDL2.so"    || exit 1
 link_library "libSDL3*"  "libSDL3.so"    || true
 link_library "libdecor*" "libdecor.so"   || true
 
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 # libmali.so.0 Linker-Stub
-#
-# Der Host ruft glGetString, glGetIntegerv usw. aus libmali auf. Ohne
-# einen NEEDED-Eintrag "libmali.so.0" findet der dynamische Loader diese
-# Symbole beim Programmstart nicht: bei -fno-plt landete der Sprung auf
-# die Basisadresse des eigenen Moduls (ELF-Header), was SIGILL ausloeste.
-#
-# Die echte libmali wird zur Laufzeit aus /tmp/halo-mali per dlopen
-# geladen (share_initialize, host_glthread.c). Der Stub hier enthaelt
-# keinen Code und keine Symbole — er existiert nur, damit der Linker
-# den NEEDED-Eintrag in den Host-Binary schreibt.
-#
-# --no-as-needed in der Link-Zeile sorgt dafuer, dass der Stub trotz
-# fehlender Symbole als NEEDED eingetragen wird.
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 if [ ! -f "$OUT/lib/libmali.so.0" ]; then
     echo "== Erzeuge libmali.so.0 Linker-Stub in $OUT/lib/"
     "$CC" -shared -fPIC -Wl,-soname,libmali.so.0 -o "$OUT/lib/libmali.so.0" -x c - <<'MALI_STUB_EOF'
 /*
 Linker-Stub fuer libmali.so.0. Kein Code, keine Symbole. Die echten
 GLES- und EGL-Funktionen werden zur Laufzeit aus der vom Benutzer
-installierten libmali in /tmp/halo-mali geladen. Dieser Stub dient
-nur dazu, dass der Linker den NEEDED-Eintrag libmali.so.0 in die
-Host-Binary aufnimmt, damit der dynamische Loader glGetString,
-glGetIntegerv und die uebrigen GL-Symbole ueberhaupt findet.
+installierten libmali in /tmp/halo-mali geladen.
 */
 MALI_STUB_EOF
     ls -la "$OUT/lib/libmali.so.0"
 fi
 
-CFLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -fPIC -Wall -Wno-unused-function \
+# ======================================================================
+# WICHTIG: -mno-outline-atomics verhindert SIGILL auf Cortex-A35.
+# Ohne diesen Flag emittiert GCC LSE-Atomics (ARMv8.1), die der A35
+# nicht unterstuetzt. Der Host-Crash bei glGetString war eine direkte
+# Folge dieser Instruktionen.
+# ======================================================================
+CFLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -mno-outline-atomics -fPIC \
+        -Wall -Wno-unused-function \
         -D_GNU_SOURCE -DEGL_NO_X11 -DMESA_EGL_NO_X11_HEADERS \
         -DHALO_ANDROID \
         -fomit-frame-pointer -ffunction-sections -fdata-sections \
