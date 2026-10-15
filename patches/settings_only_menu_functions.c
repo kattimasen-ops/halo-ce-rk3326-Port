@@ -1,6 +1,12 @@
 /*
-SETTINGS_ONLY_MENU_FUNCTIONS.C — v7 (Xbox-Struktur + Kompatibilitäts-Makros)
-v7: Alle Copy-Paste-Artefakte aus v6 entfernt.
+SETTINGS_ONLY_MENU_FUNCTIONS.C — v8 (ILP32-korrekt, ABI-sicher)
+
+Änderungen gegenüber v7:
+- struct widget_instance verwendet jetzt int32_t/uint32_t statt long/Zeiger.
+  Dadurch ist die Struktur unter ILP32 (Guest) und LP64 (Host) identisch
+  groß (72 Bytes) und alle Offsets stimmen überein.
+- Alle Zugriffe auf die Struktur sind ABI-sicher.
+- _Static_asserts verifizieren die Größe zur Compile-Zeit.
 */
 #include "cseries.h"
 #include "input/input.h"
@@ -12,6 +18,7 @@ v7: Alle Copy-Paste-Artefakte aus v6 entfernt.
 #include "halo_menus.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <xtl.h>
 
 /* ---------- externs ---------- */
@@ -29,66 +36,90 @@ char const *pc_menu_game_data_input_name(long function_index);
 void ui_widget_port_go_back(struct widget_instance *widget);
 
 /* ══════════════════════════════════════════════════════════════════════
-   WICHTIG: IDENTISCH zur Xbox-Port-Basis
+   WIDGET-STRUKTUR — ILP32/LP64-ABI-SICHER
+   
+   Der Guest wird als ILP32 kompiliert (arm64_32): long = 4 Bytes,
+   Zeiger = 4 Bytes. Der Host ist LP64: long = 8 Bytes, Zeiger = 8 Bytes.
+   Damit die Struktur in beiden ABIs identisch ist, verwenden wir
+   ausschließlich int32_t/uint32_t.
+   
+   Größe: 72 Bytes (ILP32) = 72 Bytes (LP64)
    ══════════════════════════════════════════════════════════════════════ */
 struct widget_instance {
-    long definition_tag_index;
-    char const *name;
-    short local_player_index;
-    byte unknown0A[4];
-    short type;
-    boolean visible;
-    byte unknown11;
-    boolean disabled;
-    byte unknown13[9];
-    long unknown1C;
-    byte unknown20[12];
-    struct widget_instance *next;
-    struct widget_instance *parent;
-    struct widget_instance *child;
-    struct widget_instance *focused_child;
+    int32_t definition_tag_index;    /* war: long (4 Bytes ILP32, 8 Bytes LP64) */
+    uint32_t name;                   /* war: char const * (4 Bytes ILP32, 8 Bytes LP64) */
+    int16_t local_player_index;
+    uint8_t unknown0A[4];
+    int16_t type;
+    uint8_t visible;
+    uint8_t unknown11;
+    uint8_t disabled;
+    uint8_t unknown13[9];
+    int32_t unknown1C;               /* war: long */
+    uint8_t unknown20[12];
+    uint32_t next;                   /* war: struct widget_instance * */
+    uint32_t parent;                 /* war: struct widget_instance * */
+    uint32_t child;                  /* war: struct widget_instance * */
+    uint32_t focused_child;          /* war: struct widget_instance * */
     union {
-        short selected_index;
-        wchar_t *text;
-        long value;
+        int16_t selected_index;
+        uint32_t text;               /* war: wchar_t * */
+        int32_t value;               /* war: long */
     } data3C;
-    void *generated_list;
-    short generated_count;
+    uint32_t generated_list;         /* war: void * */
+    int16_t generated_count;
 };
+
+/* Compile-Zeit-Verifikation der Strukturgröße für ILP32 (Guest) */
+#ifdef HALO_ARM64_GUEST
+_Static_assert(sizeof(struct widget_instance) == 72,
+    "widget_instance muss unter ILP32 exakt 72 Bytes groß sein");
+_Static_assert(offsetof(struct widget_instance, data3C) == 56,
+    "data3C muss bei Offset 56 liegen");
+_Static_assert(offsetof(struct widget_instance, generated_list) == 64,
+    "generated_list muss bei Offset 64 liegen");
+#endif
 
 /* ── Kompatibilitäts-Makros ── */
 #define WIDGET_LIST_SELECTED(w)         ((w)->data3C.selected_index)
 #define WIDGET_LIST_ITEM_COUNT(w)       ((w)->generated_count)
-#define WIDGET_LIST_ITEMS(w)            ((w)->generated_list)
-#define WIDGET_TEXT(w)                  ((w)->data3C.text)
+#define WIDGET_LIST_ITEMS(w)            ((void *)(uintptr_t)(w)->generated_list)
+#define WIDGET_TEXT(w)                  ((wchar_t *)(uintptr_t)(w)->data3C.text)
 
 /* Side-Table für extended_description */
-struct widget_extra { struct widget_instance *list; struct widget_instance *extended_description; };
+struct widget_extra { uint32_t list; uint32_t extended_description; };
 static struct widget_extra extras[32] = { 0 };
 
 static struct widget_instance *get_extended_description(struct widget_instance *list) {
     int i;
     for (i = 0; i < 32; i++)
-        if (extras[i].list == list) return extras[i].extended_description;
+        if ((struct widget_instance *)(uintptr_t)extras[i].list == list)
+            return (struct widget_instance *)(uintptr_t)extras[i].extended_description;
     return NULL;
 }
 static void set_extended_description(struct widget_instance *list, struct widget_instance *desc) {
     int i, slot = -1;
     for (i = 0; i < 32; i++) {
-        if (extras[i].list == list) { extras[i].extended_description = desc; return; }
+        if ((struct widget_instance *)(uintptr_t)extras[i].list == list) {
+            extras[i].extended_description = (uint32_t)(uintptr_t)desc;
+            return;
+        }
         if (!extras[i].list && slot < 0) slot = i;
     }
-    if (slot >= 0) { extras[slot].list = list; extras[slot].extended_description = desc; }
+    if (slot >= 0) {
+        extras[slot].list = (uint32_t)(uintptr_t)list;
+        extras[slot].extended_description = (uint32_t)(uintptr_t)desc;
+    }
 }
 
 /* ---------- pc_menu_setting ---------- */
 #define MAXIMUM_SETTING_VALUES 64
 struct pc_menu_setting {
-    long definition_index;
-    char const *setting;
-    long value_count;
-    char const *values[MAXIMUM_SETTING_VALUES];
-    short loaded_index;
+    int32_t definition_index;
+    uint32_t setting;                /* war: char const * */
+    int32_t value_count;
+    uint32_t values[MAXIMUM_SETTING_VALUES]; /* war: char const * */
+    int16_t loaded_index;
 };
 struct pc_menu_setting *pc_menu_setting_get(long definition_index);
 
@@ -101,9 +132,12 @@ struct pc_menu_setting *pc_menu_setting_get(long definition_index);
 static struct widget_instance *descendant(struct widget_instance *widget, char const *name, long *nth) {
     struct widget_instance *child;
     if (!widget) return NULL;
-    for (child = widget->child; child; child = child->next) {
+    for (child = (struct widget_instance *)(uintptr_t)widget->child; child;
+         child = (struct widget_instance *)(uintptr_t)child->next)
+    {
         struct widget_instance *found;
-        if (!strcmp(child->name, name) && (*nth)-- == 0) return child;
+        char const *child_name = (char const *)(uintptr_t)child->name;
+        if (!strcmp(child_name, name) && (*nth)-- == 0) return child;
         found = descendant(child, name, nth);
         if (found) return found;
     }
@@ -120,7 +154,9 @@ static void text_set_length(struct widget_instance *text_box, wchar_t const *tex
     buf = WIDGET_TEXT(text_box);
     if (!buf) {
         buf = ui_widget_realloc(NULL, length * sizeof(wchar_t), __FILE__, __LINE__);
-        WIDGET_TEXT(text_box) = buf;
+        if (buf) {
+            text_box->data3C.text = (uint32_t)(uintptr_t)buf;
+        }
     }
     if (buf) { ustrncpy(buf, text, length - 1); buf[length - 1] = 0; }
 }
@@ -134,7 +170,8 @@ static void visible_set(struct widget_instance *widget, boolean visible) {
 }
 
 static struct widget_instance *screen_of(struct widget_instance *widget) {
-    while (widget && widget->parent) widget = widget->parent;
+    while (widget && widget->parent)
+        widget = (struct widget_instance *)(uintptr_t)widget->parent;
     return widget;
 }
 
@@ -146,20 +183,25 @@ static boolean text_is_number(char const *text, double *number) {
 }
 
 static boolean spinner_item(struct widget_instance const *widget) {
-    return widget->parent && widget->parent->definition_tag_index == widget->definition_tag_index;
+    return widget->parent &&
+        ((struct widget_instance *)(uintptr_t)widget->parent)->definition_tag_index == widget->definition_tag_index;
 }
 
 static short setting_value_index(struct pc_menu_setting const *setting, char const *current) {
     double current_number, value_number, distance = 0.0;
     short index, nearest = 0;
-    for (index = 0; index < setting->value_count; index++)
-        if (!_stricmp(setting->values[index], current)) return index;
+    for (index = 0; index < setting->value_count; index++) {
+        char const *value = (char const *)(uintptr_t)setting->values[index];
+        if (!_stricmp(value, current)) return index;
+    }
     if (!text_is_number(current, &current_number)) return 0;
-    for (index = 0; index < setting->value_count; index++)
-        if (text_is_number(setting->values[index], &value_number)) {
+    for (index = 0; index < setting->value_count; index++) {
+        char const *value = (char const *)(uintptr_t)setting->values[index];
+        if (text_is_number(value, &value_number)) {
             double gap = value_number > current_number ? value_number - current_number : current_number - value_number;
             if (index == 0 || gap < distance) { distance = gap; nearest = index; }
         }
+    }
     return nearest;
 }
 
@@ -244,7 +286,7 @@ static boolean setting_load(struct widget_instance *widget) {
     if (!widget) return FALSE;
     if (spinner_item(widget)) return TRUE;
     setting = pc_menu_setting_get(widget->definition_tag_index);
-    if (!setting || !setting_text(setting->setting, current, sizeof(current), FALSE)) return FALSE;
+    if (!setting || !setting_text((char const *)(uintptr_t)setting->setting, current, sizeof(current), FALSE)) return FALSE;
     setting->loaded_index = setting_value_index(setting, current);
     if (setting->loaded_index < (short)WIDGET_LIST_ITEM_COUNT(widget))
         WIDGET_LIST_SELECTED(widget) = setting->loaded_index;
@@ -259,7 +301,8 @@ static boolean setting_save(struct widget_instance *widget) {
     if (!setting || setting->loaded_index == NONE || WIDGET_LIST_SELECTED(widget) < 0 ||
         WIDGET_LIST_SELECTED(widget) >= setting->value_count) return FALSE;
     if (WIDGET_LIST_SELECTED(widget) == setting->loaded_index) return TRUE;
-    if (!config_write(setting->setting, setting->values[WIDGET_LIST_SELECTED(widget)])) return FALSE;
+    if (!config_write((char const *)(uintptr_t)setting->setting,
+                      (char const *)(uintptr_t)setting->values[WIDGET_LIST_SELECTED(widget)])) return FALSE;
     setting->loaded_index = WIDGET_LIST_SELECTED(widget);
     return TRUE;
 }
@@ -269,7 +312,9 @@ static void settings_each(struct widget_instance *widget,
                           boolean (*visit)(struct widget_instance *spinner, struct pc_menu_setting *setting)) {
     struct widget_instance *child;
     if (!widget) return;
-    for (child = widget->child; child; child = child->next) {
+    for (child = (struct widget_instance *)(uintptr_t)widget->child; child;
+         child = (struct widget_instance *)(uintptr_t)child->next)
+    {
         struct pc_menu_setting *setting = child->type == 2 && !spinner_item(child)
             ? pc_menu_setting_get(child->definition_tag_index) : NULL;
         if (setting) visit(child, setting);
@@ -280,25 +325,28 @@ static void settings_each(struct widget_instance *widget,
 static boolean setting_changed_save(struct widget_instance *spinner, struct pc_menu_setting *setting) {
     short index = WIDGET_LIST_SELECTED(spinner);
     if (index < 0 || index >= setting->value_count || index == setting->loaded_index) return TRUE;
-    if (!setting_write(setting->setting, setting->values[index])) return FALSE;
+    if (!setting_write((char const *)(uintptr_t)setting->setting,
+                       (char const *)(uintptr_t)setting->values[index])) return FALSE;
     setting->loaded_index = index;
     return TRUE;
 }
 
 static boolean setting_default_show(struct widget_instance *spinner, struct pc_menu_setting *setting) {
     char text[300];
-    if (setting_text(setting->setting, text, sizeof(text), TRUE))
+    if (setting_text((char const *)(uintptr_t)setting->setting, text, sizeof(text), TRUE))
         WIDGET_LIST_SELECTED(spinner) = setting_value_index(setting, text);
     return TRUE;
 }
 
 static void settings_help(struct widget_instance *list) {
     struct widget_instance *help = get_extended_description(list);
-    struct widget_instance *row = list ? list->focused_child : NULL;
+    struct widget_instance *row = list ? (struct widget_instance *)(uintptr_t)list->focused_child : NULL;
     short index = 0;
     if (!help) return;
-    if (row && row->child && row->child->type == 1 && strncmp(row->name, "button", 6)) {
-        short label = pc_menu_string_index(row->child->definition_tag_index);
+    if (row && row->child && ((struct widget_instance *)(uintptr_t)row->child)->type == 1 &&
+        strncmp((char const *)(uintptr_t)row->name, "button", 6))
+    {
+        short label = pc_menu_string_index(((struct widget_instance *)(uintptr_t)row->child)->definition_tag_index);
         if (label != NONE) index = label + 1;
     }
     help->data3C.value = index;
@@ -316,13 +364,19 @@ static void video_rows_show(struct widget_instance *list) {
     setting = pc_menu_setting_get(mode->definition_tag_index);
     if (!setting) return;
     index = WIDGET_LIST_SELECTED(mode);
-    shown = (index >= 0 && index < setting->value_count && !strcmp(setting->values[index], "windowed"))
+    shown = (index >= 0 && index < setting->value_count &&
+             !strcmp((char const *)(uintptr_t)setting->values[index], "windowed"))
         ? window_size : resolution;
     resolution->visible = (shown == resolution);
     window_size->visible = (shown == window_size);
-    if (list->focused_child == (shown == resolution ? window_size : resolution)) {
-        for (index = 0, child = list->child; child && child != shown; child = child->next) index++;
-        list->focused_child = shown;
+    if ((struct widget_instance *)(uintptr_t)list->focused_child ==
+        (shown == resolution ? window_size : resolution))
+    {
+        for (index = 0, child = (struct widget_instance *)(uintptr_t)list->child;
+             child && child != shown;
+             child = (struct widget_instance *)(uintptr_t)child->next)
+            index++;
+        list->focused_child = (uint32_t)(uintptr_t)shown;
         list->data3C.selected_index = index;
     }
 }
@@ -407,13 +461,13 @@ static boolean controls_save(void) {
 }
 
 static struct widget_instance *control_row(struct widget_instance *widget) {
-    for (; widget; widget = widget->parent)
-        if (!strncmp(widget->name, "op_command_", 11)) return widget;
+    for (; widget; widget = (struct widget_instance *)(uintptr_t)widget->parent)
+        if (!strncmp((char const *)(uintptr_t)widget->name, "op_command_", 11)) return widget;
     return NULL;
 }
 
 static short control_of_row(struct widget_instance *row, short group) {
-    short wanted = row ? (short)(atoi(row->name + 11) - 1) : NONE;
+    short wanted = row ? (short)(atoi((char const *)(uintptr_t)row->name + 11) - 1) : NONE;
     short control;
     for (control = 0; control < NUMBEROF(controls) && wanted >= 0; control++)
         if (controls[control].group == group && wanted-- == 0) return control;
@@ -430,11 +484,13 @@ static void controls_update(struct widget_instance *list) {
     struct widget_instance *row, *focused_row;
     if (!list) return;
     group = controls_group(list);
-    focused_row = control_row(list->focused_child);
-    for (row = list->child; row; row = row->next) {
+    focused_row = control_row((struct widget_instance *)(uintptr_t)list->focused_child);
+    for (row = (struct widget_instance *)(uintptr_t)list->child; row;
+         row = (struct widget_instance *)(uintptr_t)row->next)
+    {
         short control = control_of_row(row, group);
         short slot;
-        if (strncmp(row->name, "op_command_", 11)) continue;
+        if (strncmp((char const *)(uintptr_t)row->name, "op_command_", 11)) continue;
         row->visible = (control != NONE);
         if (control == NONE) continue;
         text_set(named(row, "command_label", 0), controls[control].label);
