@@ -48,17 +48,28 @@ ANDROID_NDK=$(cd "$ANDROID_NDK" && pwd)
 mkdir -p "$SYSROOT_LIB" 2>/dev/null || true
 SYSROOT_LIB=$(cd "$SYSROOT_LIB" && pwd)
 
-for module in libdrm gbm libudev; do
-if ! pkg-config --exists "$module"; then
-echo " FEHLT: $module"
-exit 1
-fi
+export PKG_CONFIG_PATH="$SYSROOT_LIB/pkgconfig:${PKG_CONFIG_PATH:-}:/usr/lib/aarch64-linux-gnu/pkgconfig"
+
+mkdir -p /usr/aarch64-linux-gnu/lib 2>/dev/null || true
+for pair in "libdrm.so.2:libdrm.so" "libgbm.so.1:libgbm.so" "libEGL.so.1:libEGL.so" "libGLESv2.so.2:libGLESv2.so"; do
+    target="/usr/lib/aarch64-linux-gnu/${pair%%:*}"
+    link="/usr/aarch64-linux-gnu/lib/${pair##*:}"
+    if [ ! -e "$link" ] && [ -e "$target" ]; then
+        ln -sf "$target" "$link" 2>/dev/null || true
+    fi
 done
 
-for lib in /usr/aarch64-linux-gnu/lib/libdrm.so /usr/aarch64-linux-gnu/lib/libgbm.so; do
-if [ ! -e "$lib" ]; then
-die "Cross-aarch64 $lib fehlt. Der Multiarch-Schritt im Workflow legt ihn an."
-fi
+for module in libdrm gbm egl libudev; do
+    if ! pkg-config --exists "$module"; then
+        echo " FEHLT im pkg-config: $module"
+        exit 1
+    fi
+done
+
+for lib in /usr/aarch64-linux-gnu/lib/libdrm.so /usr/aarch64-linux-gnu/lib/libgbm.so /usr/aarch64-linux-gnu/lib/libEGL.so /usr/aarch64-linux-gnu/lib/libGLESv2.so; do
+    if [ ! -e "$lib" ]; then
+        die "Cross-aarch64 $lib fehlt. Der Multiarch-Schritt im Workflow legt ihn an."
+    fi
 done
 
 # ======================================================================
@@ -304,37 +315,117 @@ SDL2_SRC=$WORK/SDL2-src
 SDL2_BUILD=$WORK/sdl2-build
 SDL2_INSTALL=$WORK/sdl2-install
 
-if [ -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
-if command -v aarch64-linux-gnu-readelf >/dev/null 2>&1 && \
-aarch64-linux-gnu-readelf -d "$SYSROOT_LIB/libSDL2-2.0.so.0" 2>/dev/null | grep -E -q "libX11|libpulse"; then
-echo "== Inkompatible sysroot libSDL2 (X11/Pulse) erkannt, loesche und baue sauber neu..."
-rm -f "$SYSROOT_LIB/libSDL2-2.0.so.0"
+REBUILD_SDL2=0
+if [ ! -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ] || [ ! -d "$SDL2_INSTALL/include/SDL2" ]; then
+    REBUILD_SDL2=1
+else
+    if command -v aarch64-linux-gnu-readelf >/dev/null 2>&1 && \
+       aarch64-linux-gnu-readelf -d "$SYSROOT_LIB/libSDL2-2.0.so.0" 2>/dev/null | grep -E -q "libX11|libpulse"; then
+        echo "== Inkompatible sysroot libSDL2 (X11/Pulse) erkannt, baue sauber neu..."
+        REBUILD_SDL2=1
+    fi
+    if command -v aarch64-linux-gnu-strings >/dev/null 2>&1; then
+        if ! aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -q "KMSDRM"; then
+            echo "== libSDL2 in sysroot enthaelt kein KMSDRM, baue sauber neu..."
+            REBUILD_SDL2=1
+        fi
+        if ! aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -q "Async pageflip rejected"; then
+            echo "== libSDL2 in sysroot enthaelt keinen Pageflip-Patch, baue sauber neu..."
+            REBUILD_SDL2=1
+        fi
+    fi
 fi
-fi
 
-if [ ! -f "$SYSROOT_LIB/libSDL2-2.0.so.0" ]; then
-echo "== SDL2 $SDL2_TAG: Quellcode holen und mit GCC bauen (shared)"
-rm -rf "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
-mkdir -p "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
+if [ "$REBUILD_SDL2" -eq 1 ]; then
+    echo "== SDL2 $SDL2_TAG: Quellcode holen und mit GCC bauen (KMSDRM + Mali-Pageflip)"
+    rm -rf "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
+    mkdir -p "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
+    curl -L -o "$WORK/sdl2.tar.gz" "$SDL2_ARCHIVE"
+    tar -xzf "$WORK/sdl2.tar.gz" -C "$SDL2_SRC" --strip-components=1
 
-curl -L -o "$WORK/sdl2.tar.gz" "$SDL2_ARCHIVE"
-tar -xzf "$WORK/sdl2.tar.gz" -C "$SDL2_SRC" --strip-components=1
+    echo "== SDL2 KMSDRM: CMake-Checks anpassen (KMSDRM + EGL + GLES erzwingen)"
+    python3 - "$SDL2_SRC/cmake/sdlchecks.cmake" <<'SDLCHECK_EOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
 
-echo "== SDL2 KMSDRM Pageflip-Patch fuer Mali-G31 anwenden"
-python3 - "$SDL2_SRC/src/video/kmsdrm/SDL_kmsdrmopengles.c" <<'PATCH_EOF'
+# 1. CheckEGL: HAVE_OPENGL_EGL erzwingen
+old_check_egl = '''macro(CheckEGL)
+  if (SDL_OPENGL OR SDL_OPENGLES)
+    pkg_check_modules(EGL egl)
+    set(CMAKE_REQUIRED_DEFINITIONS "${CMAKE_REQUIRED_DEFINITIONS} ${EGL_CFLAGS}")
+    check_c_source_compiles("
+        #define EGL_API_FB
+        #define MESA_EGL_NO_X11_HEADERS
+        #define EGL_NO_X11
+        #include <EGL/egl.h>
+        #include <EGL/eglext.h>
+        int main (int argc, char** argv) { return 0; }" HAVE_OPENGL_EGL)
+    if(HAVE_OPENGL_EGL)
+      set(SDL_VIDEO_OPENGL_EGL 1)
+    endif()
+  endif()
+endmacro()'''
+new_check_egl = '''macro(CheckEGL)
+  if (SDL_OPENGL OR SDL_OPENGLES)
+    pkg_check_modules(EGL egl)
+    set(HAVE_OPENGL_EGL TRUE)
+    set(SDL_VIDEO_OPENGL_EGL 1)
+  endif()
+endmacro()'''
+if old_check_egl in text:
+    text = text.replace(old_check_egl, new_check_egl, 1)
+
+# 2. CheckKMSDRM: KMSDRM-Quellen und Treiber aktivieren
+old_kmsdrm = '    if(PKG_KMSDRM_FOUND AND HAVE_OPENGL_EGL)'
+new_kmsdrm = '''    set(PKG_KMSDRM_FOUND TRUE)
+    set(HAVE_OPENGL_EGL TRUE)
+    if(TRUE)'''
+if old_kmsdrm in text:
+    text = text.replace(old_kmsdrm, new_kmsdrm, 1)
+
+# 3. CheckKMSDRM: dynamische Bibliotheksnamen absichern
+target_dyn = '        set(SDL_VIDEO_DRIVER_KMSDRM_DYNAMIC'
+fallback_dyn = '''        if(NOT DRM_LIB_SONAME)
+          set(DRM_LIB_SONAME "libdrm.so.2")
+        endif()
+        if(NOT GBM_LIB_SONAME)
+          set(GBM_LIB_SONAME "libgbm.so.1")
+        endif()
+        set(SDL_VIDEO_DRIVER_KMSDRM_DYNAMIC'''
+if target_dyn in text:
+    text = text.replace(target_dyn, fallback_dyn, 1)
+
+# 4. CheckOpenGLES: GLES2 aktivieren
+old_gles = '''    check_c_source_compiles("
+        #include <GLES2/gl2.h>
+        #include <GLES2/gl2ext.h>
+        int main (int argc, char** argv) { return 0; }" HAVE_OPENGLES_V2)
+    if(HAVE_OPENGLES_V2)
+        set(HAVE_OPENGLES TRUE)
+        set(SDL_VIDEO_OPENGL_ES2 1)
+        set(SDL_VIDEO_RENDER_OGL_ES2 1)
+    endif()'''
+new_gles = '''    set(HAVE_OPENGLES_V2 TRUE)
+    set(HAVE_OPENGLES TRUE)
+    set(SDL_VIDEO_OPENGL_ES2 1)
+    set(SDL_VIDEO_RENDER_OGL_ES2 1)'''
+if old_gles in text:
+    text = text.replace(old_gles, new_gles, 1)
+
+with open(path, 'w') as f:
+    f.write(text)
+print("  SDL2: KMSDRM-, EGL- und GLES-Checks in sdlchecks.cmake angepasst.")
+SDLCHECK_EOF
+
+    echo "== SDL2 KMSDRM Pageflip-Patch fuer Mali-G31 anwenden"
+    python3 - "$SDL2_SRC/src/video/kmsdrm/SDL_kmsdrmopengles.c" <<'PATCH_EOF'
 import sys, re
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
-old = (
-    '    ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_id,\n'
-    'fb_info->fb_id, flip_flags, &windata->waiting_for_flip);\n'
-    'if (ret == 0) {\n'
-    'windata->waiting_for_flip = SDL_TRUE;\n'
-    '} else {\n'
-    'SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not queue pageflip: %d", ret);\n'
-    '}'
-)
+
 new = (
     '    ret = KMSDRM_drmModePageFlip(viddata->drm_fd, dispdata->crtc->crtc_id,\n'
     'fb_info->fb_id, flip_flags, &windata->waiting_for_flip);\n'
@@ -352,85 +443,77 @@ new = (
     'windata->waiting_for_flip = SDL_TRUE;\n'
     '} else {\n'
     'SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not queue pageflip: %d", ret);\n'
-    '}'
+    '}')
+
+pattern = re.compile(
+    r'(ret = KMSDRM_drmModePageFlip\(viddata->drm_fd, dispdata->crtc->crtc_id,\s*'
+    r'\s*fb_info->fb_id, flip_flags, &windata->waiting_for_flip\);\s*'
+    r'\s*if \(ret == 0\) \{\s*'
+    r'\s*windata->waiting_for_flip = SDL_TRUE;\s*'
+    r'\s*\} else \{\s*'
+    r'\s*SDL_LogError\(SDL_LOG_CATEGORY_VIDEO, "Could not queue pageflip: %d", ret\);\s*'
+    r'\s*\})'
 )
-if old not in text:
-    pattern = re.compile(
-        r'(ret = KMSDRM_drmModePageFlip\(viddata->drm_fd, dispdata->crtc->crtc_id,\s*'
-        r'\s*fb_info->fb_id, flip_flags, &windata->waiting_for_flip\);\s*'
-        r'\s*if \(ret == 0\) \{\s*'
-        r'\s*windata->waiting_for_flip = SDL_TRUE;\s*'
-        r'\s*\} else \{\s*'
-        r'\s*SDL_LogError\(SDL_LOG_CATEGORY_VIDEO, "Could not queue pageflip: %d", ret\);\s*'
-        r'\s*\})'
-    )
-    match = pattern.search(text)
-    if not match:
-        print("FEHLER: Pageflip-Code nicht gefunden", file=sys.stderr)
-        sys.exit(1)
-    text = text[:match.start()] + new + text[match.end():]
-else:
-    text = text.replace(old, new, 1)
+match = pattern.search(text)
+if not match:
+    print("FEHLER: Pageflip-Code nicht gefunden", file=sys.stderr)
+    sys.exit(1)
+text = text[:match.start()] + new + text[match.end():]
 with open(path, 'w') as f:
     f.write(text)
 print("SDL2 KMSDRM Pageflip-Patch angewendet")
 PATCH_EOF
 
-cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
--DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
--DCMAKE_C_COMPILER="$HOST_CC" \
--DCMAKE_CXX_COMPILER="$HOST_CXX" \
--DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
--DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
--DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
--DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
--DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
--DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
--DCMAKE_BUILD_TYPE=Release \
--DSDL_SHARED=ON -DSDL_STATIC=OFF \
--DSDL_TESTS=OFF \
--DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
--DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
--DCMAKE_INSTALL_PREFIX="$SDL2_INSTALL"
+    # Includes fuer DRM, EGL, GLES
+    EXTRA_INC=""
+    [ -d "$LIBDRM_INCLUDE" ] && EXTRA_INC="$EXTRA_INC -I$LIBDRM_INCLUDE"
+    [ -d "/usr/include/libdrm" ] && EXTRA_INC="$EXTRA_INC -I/usr/include/libdrm"
+    [ -d "/usr/include" ] && EXTRA_INC="$EXTRA_INC -I/usr/include"
+    if [ -n "${ANDROID_NDK:-}" ]; then
+        NDK_INC=$(find "$ANDROID_NDK" -type d -path '*/sysroot/usr/include' 2>/dev/null | head -1)
+        [ -n "$NDK_INC" ] && EXTRA_INC="$EXTRA_INC -I$NDK_INC"
+    fi
 
-cmake --build "$SDL2_BUILD" -j "$JOBS"
-cmake --install "$SDL2_BUILD"
+    cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
+        -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+        -DCMAKE_C_COMPILER="$HOST_CC" \
+        -DCMAKE_CXX_COMPILER="$HOST_CXX" \
+        -DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 $EXTRA_INC" \
+        -DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 $EXTRA_INC" \
+        -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
+        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+        -DSDL_TESTS=OFF \
+        -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
+        -DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
+        -DCMAKE_INSTALL_PREFIX="$SDL2_INSTALL"
 
-SDL2_LIB=$(find "$SDL2_INSTALL" -name "libSDL2-2.0.so.0*" -type f | head -n 1)
-[ -n "$SDL2_LIB" ] || die "libSDL2-2.0.so.0 nicht gefunden"
-cp -L "$SDL2_LIB" "$SYSROOT_LIB/libSDL2-2.0.so.0"
-echo "== SDL2 nach sysroot kopiert: $(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0") Bytes"
+    cmake --build "$SDL2_BUILD" -j "$JOBS"
+    cmake --install "$SDL2_BUILD"
+
+    SDL2_LIB=$(find "$SDL2_INSTALL" -name "libSDL2-2.0.so.0*" -type f | head -n 1)
+    [ -n "$SDL2_LIB" ] || die "libSDL2-2.0.so.0 nicht gefunden"
+    cp -L "$SDL2_LIB" "$SYSROOT_LIB/libSDL2-2.0.so.0"
+    echo "== SDL2 nach sysroot kopiert: $(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0") Bytes"
+
+    # Verifikation im Build-Script
+    if command -v aarch64-linux-gnu-strings >/dev/null 2>&1; then
+        if aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -q "KMSDRM"; then
+            echo "  OK: KMSDRM ist im SDL2-Binary enthalten"
+        else
+            die "FEHLER: KMSDRM nicht im erzeugten SDL2-Binary"
+        fi
+        if aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -q "Async pageflip rejected"; then
+            echo "  OK: Mali-G31 Pageflip-Patch ist im SDL2-Binary enthalten"
+        else
+            die "FEHLER: Mali-G31 Pageflip-Patch nicht im erzeugten SDL2-Binary"
+        fi
+    fi
 else
-echo "== libSDL2-2.0.so.0 bereits in sysroot"
-fi
-
-if [ ! -d "$SDL2_INSTALL/include/SDL2" ]; then
-echo "== SDL2-Header fehlen, SDL2 neu bauen ..."
-rm -rf "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
-mkdir -p "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
-
-curl -L -o "$WORK/sdl2.tar.gz" "$SDL2_ARCHIVE"
-tar -xzf "$WORK/sdl2.tar.gz" -C "$SDL2_SRC" --strip-components=1
-
-cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
--DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
--DCMAKE_C_COMPILER="$HOST_CC" \
--DCMAKE_CXX_COMPILER="$HOST_CXX" \
--DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
--DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
--DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
--DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
--DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
--DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
--DCMAKE_BUILD_TYPE=Release \
--DSDL_SHARED=ON -DSDL_STATIC=OFF \
--DSDL_TESTS=OFF \
--DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
--DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
--DCMAKE_INSTALL_PREFIX="$SDL2_INSTALL"
-
-cmake --build "$SDL2_BUILD" -j "$JOBS"
-cmake --install "$SDL2_BUILD"
+    echo "== libSDL2-2.0.so.0 (KMSDRM + Pageflip) bereits in sysroot vorhanden"
 fi
 
 export SDL2_INCLUDE="$SDL2_INSTALL/include"
