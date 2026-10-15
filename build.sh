@@ -3,10 +3,8 @@ set -euo pipefail
 # ======================================================================
 # Halo CE Universal - M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
-# Fix v23: _clang_builtin_shim-Block ENTFERNT.
-#          Der vollständige clang-Resource-Include-Pfad verursachte
-#          einen size_t-Konflikt mit musl. Der ursprüngliche Ansatz
-#          (Shim-Ordner mit ARM-Headern) funktioniert.
+# v24: ALSA-Support fuer SDL2, -mno-outline-atomics fuer Cortex-A35,
+#      erweiterte pkg-config- und Binary-Verifikation.
 # ======================================================================
 
 PGO_MODE=${PGO_MODE:-use}
@@ -22,6 +20,8 @@ HOST_CC=${HOST_CC:-aarch64-linux-gnu-gcc}
 HOST_CXX=${HOST_CXX:-aarch64-linux-gnu-g++}
 JOBS=${JOBS:-$(nproc)}
 OPEN_CE_URL=${OPEN_CE_URL:-https://github.com/OpenCommunityEdition/OpenCE.git}
+
+CORTEX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -mno-outline-atomics"
 
 die() { echo "build.sh: $*" >&2; exit 1; }
 need() { command -v "$1" > /dev/null 2>&1 || die "$1 not found: $2"; }
@@ -51,7 +51,12 @@ SYSROOT_LIB=$(cd "$SYSROOT_LIB" && pwd)
 export PKG_CONFIG_PATH="$SYSROOT_LIB/pkgconfig:${PKG_CONFIG_PATH:-}:/usr/lib/aarch64-linux-gnu/pkgconfig"
 
 mkdir -p /usr/aarch64-linux-gnu/lib 2>/dev/null || true
-for pair in "libdrm.so.2:libdrm.so" "libgbm.so.1:libgbm.so" "libEGL.so.1:libEGL.so" "libGLESv2.so.2:libGLESv2.so"; do
+for pair in \
+    "libdrm.so.2:libdrm.so" \
+    "libgbm.so.1:libgbm.so" \
+    "libEGL.so.1:libEGL.so" \
+    "libGLESv2.so.2:libGLESv2.so" \
+    "libasound.so.2:libasound.so"; do
     target="/usr/lib/aarch64-linux-gnu/${pair%%:*}"
     link="/usr/aarch64-linux-gnu/lib/${pair##*:}"
     if [ ! -e "$link" ] && [ -e "$target" ]; then
@@ -59,14 +64,19 @@ for pair in "libdrm.so.2:libdrm.so" "libgbm.so.1:libgbm.so" "libEGL.so.1:libEGL.
     fi
 done
 
-for module in libdrm gbm egl libudev; do
+for module in libdrm gbm egl libudev alsa; do
     if ! pkg-config --exists "$module"; then
         echo " FEHLT im pkg-config: $module"
         exit 1
     fi
 done
 
-for lib in /usr/aarch64-linux-gnu/lib/libdrm.so /usr/aarch64-linux-gnu/lib/libgbm.so /usr/aarch64-linux-gnu/lib/libEGL.so /usr/aarch64-linux-gnu/lib/libGLESv2.so; do
+for lib in \
+    /usr/aarch64-linux-gnu/lib/libdrm.so \
+    /usr/aarch64-linux-gnu/lib/libgbm.so \
+    /usr/aarch64-linux-gnu/lib/libEGL.so \
+    /usr/aarch64-linux-gnu/lib/libGLESv2.so \
+    /usr/aarch64-linux-gnu/lib/libasound.so; do
     if [ ! -e "$lib" ]; then
         die "Cross-aarch64 $lib fehlt. Der Multiarch-Schritt im Workflow legt ihn an."
     fi
@@ -283,8 +293,8 @@ cmake -S "$SDL3_SRC" -B "$SDL3_BUILD" \
 -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
 -DCMAKE_C_COMPILER="$HOST_CC" \
 -DCMAKE_CXX_COMPILER="$HOST_CXX" \
--DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
--DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 -I$LIBDRM_INCLUDE" \
+-DCMAKE_C_FLAGS="$CORTEX_FLAGS -I$LIBDRM_INCLUDE" \
+-DCMAKE_CXX_FLAGS="$CORTEX_FLAGS -I$LIBDRM_INCLUDE" \
 -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
 -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
 -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -295,6 +305,10 @@ cmake -S "$SDL3_SRC" -B "$SDL3_BUILD" \
 -DSDL_INSTALL_TESTS=OFF -DSDL_WERROR=OFF -DSDL_UNIX_CONSOLE_BUILD=ON \
 -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
 -DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
+-DSDL_ALSA=ON -DSDL_PULSEAUDIO=OFF -DSDL_OSS=OFF \
+-DSDL_JACK=OFF -DSDL_SNDIO=OFF -DSDL_NAS=OFF \
+-DSDL_ESD=OFF -DSDL_ARTS=OFF -DSDL_PIPEWIRE=OFF \
+-DSDL_DISKAUDIO=OFF \
 -DCMAKE_INSTALL_PREFIX="$SDL3_INSTALL"
 
 cmake --build "$SDL3_BUILD" -j "$JOBS"
@@ -309,7 +323,7 @@ echo "== libSDL3.so.0 bereits vorhanden"
 fi
 
 # ======================================================================
-# SDL2 mit KMSDRM + Pageflip-Patch
+# SDL2 mit KMSDRM + ALSA + Pageflip-Patch
 # ======================================================================
 SDL2_SRC=$WORK/SDL2-src
 SDL2_BUILD=$WORK/sdl2-build
@@ -333,11 +347,15 @@ else
             echo "== libSDL2 in sysroot enthaelt keinen Pageflip-Patch, baue sauber neu..."
             REBUILD_SDL2=1
         fi
+        if ! aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -qi "alsa"; then
+            echo "== libSDL2 in sysroot enthaelt kein ALSA, baue sauber neu..."
+            REBUILD_SDL2=1
+        fi
     fi
 fi
 
 if [ "$REBUILD_SDL2" -eq 1 ]; then
-    echo "== SDL2 $SDL2_TAG: Quellcode holen und mit GCC bauen (KMSDRM + Mali-Pageflip)"
+    echo "== SDL2 $SDL2_TAG: Quellcode holen und mit GCC bauen (KMSDRM + ALSA + Mali-Pageflip)"
     rm -rf "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
     mkdir -p "$SDL2_SRC" "$SDL2_BUILD" "$SDL2_INSTALL"
     curl -L -o "$WORK/sdl2.tar.gz" "$SDL2_ARCHIVE"
@@ -350,7 +368,6 @@ path = sys.argv[1]
 with open(path) as f:
     text = f.read()
 
-# 1. CheckEGL: HAVE_OPENGL_EGL erzwingen
 old_check_egl = '''macro(CheckEGL)
   if (SDL_OPENGL OR SDL_OPENGLES)
     pkg_check_modules(EGL egl)
@@ -377,7 +394,6 @@ endmacro()'''
 if old_check_egl in text:
     text = text.replace(old_check_egl, new_check_egl, 1)
 
-# 2. CheckKMSDRM: KMSDRM-Quellen und Treiber aktivieren
 old_kmsdrm = '    if(PKG_KMSDRM_FOUND AND HAVE_OPENGL_EGL)'
 new_kmsdrm = '''    set(PKG_KMSDRM_FOUND TRUE)
     set(HAVE_OPENGL_EGL TRUE)
@@ -385,7 +401,6 @@ new_kmsdrm = '''    set(PKG_KMSDRM_FOUND TRUE)
 if old_kmsdrm in text:
     text = text.replace(old_kmsdrm, new_kmsdrm, 1)
 
-# 3. CheckKMSDRM: dynamische Bibliotheksnamen absichern
 target_dyn = '        set(SDL_VIDEO_DRIVER_KMSDRM_DYNAMIC'
 fallback_dyn = '''        if(NOT DRM_LIB_SONAME)
           set(DRM_LIB_SONAME "libdrm.so.2")
@@ -397,7 +412,6 @@ fallback_dyn = '''        if(NOT DRM_LIB_SONAME)
 if target_dyn in text:
     text = text.replace(target_dyn, fallback_dyn, 1)
 
-# 4. CheckOpenGLES: GLES2 aktivieren
 old_gles = '''    check_c_source_compiles("
         #include <GLES2/gl2.h>
         #include <GLES2/gl2ext.h>
@@ -464,7 +478,6 @@ with open(path, 'w') as f:
 print("SDL2 KMSDRM Pageflip-Patch angewendet")
 PATCH_EOF
 
-    # Includes fuer DRM, EGL, GLES
     EXTRA_INC=""
     [ -d "$LIBDRM_INCLUDE" ] && EXTRA_INC="$EXTRA_INC -I$LIBDRM_INCLUDE"
     [ -d "/usr/include/libdrm" ] && EXTRA_INC="$EXTRA_INC -I/usr/include/libdrm"
@@ -478,8 +491,8 @@ PATCH_EOF
         -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_C_COMPILER="$HOST_CC" \
         -DCMAKE_CXX_COMPILER="$HOST_CXX" \
-        -DCMAKE_C_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 $EXTRA_INC" \
-        -DCMAKE_CXX_FLAGS="-O3 -mcpu=cortex-a35 -mtune=cortex-a35 $EXTRA_INC" \
+        -DCMAKE_C_FLAGS="$CORTEX_FLAGS $EXTRA_INC" \
+        -DCMAKE_CXX_FLAGS="$CORTEX_FLAGS $EXTRA_INC" \
         -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -489,6 +502,16 @@ PATCH_EOF
         -DSDL_TESTS=OFF \
         -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=ON \
         -DSDL_OPENGLES=ON -DSDL_OPENGL=OFF \
+        -DSDL_ALSA=ON \
+        -DSDL_PULSEAUDIO=OFF \
+        -DSDL_OSS=OFF \
+        -DSDL_JACK=OFF \
+        -DSDL_SNDIO=OFF \
+        -DSDL_NAS=OFF \
+        -DSDL_ESD=OFF \
+        -DSDL_ARTS=OFF \
+        -DSDL_PIPEWIRE=OFF \
+        -DSDL_DISKAUDIO=OFF \
         -DCMAKE_INSTALL_PREFIX="$SDL2_INSTALL"
 
     cmake --build "$SDL2_BUILD" -j "$JOBS"
@@ -499,7 +522,6 @@ PATCH_EOF
     cp -L "$SDL2_LIB" "$SYSROOT_LIB/libSDL2-2.0.so.0"
     echo "== SDL2 nach sysroot kopiert: $(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0") Bytes"
 
-    # Verifikation im Build-Script
     if command -v aarch64-linux-gnu-strings >/dev/null 2>&1; then
         if aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -q "KMSDRM"; then
             echo "  OK: KMSDRM ist im SDL2-Binary enthalten"
@@ -511,9 +533,14 @@ PATCH_EOF
         else
             die "FEHLER: Mali-G31 Pageflip-Patch nicht im erzeugten SDL2-Binary"
         fi
+        if aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -qi "alsa"; then
+            echo "  OK: ALSA ist im SDL2-Binary enthalten"
+        else
+            die "FEHLER: ALSA nicht im erzeugten SDL2-Binary"
+        fi
     fi
 else
-    echo "== libSDL2-2.0.so.0 (KMSDRM + Pageflip) bereits in sysroot vorhanden"
+    echo "== libSDL2-2.0.so.0 (KMSDRM + ALSA + Pageflip) bereits in sysroot vorhanden"
 fi
 
 export SDL2_INCLUDE="$SDL2_INSTALL/include"
@@ -798,10 +825,10 @@ with open(path) as f:
     text = f.read()
 
 old_mcpu = '"-mcpu=cortex-a53"'
-new_mcpu = '"-mcpu=cortex-a35",\n"-mtune=cortex-a35"'
+new_mcpu = '"-mcpu=cortex-a35",\n"-mtune=cortex-a35",\n"-mno-outline-atomics"'
 if text.count(old_mcpu) > 0:
     text = text.replace(old_mcpu, new_mcpu)
-    print("android_build.py: mcpu=cortex-a53 -> cortex-a35")
+    print("android_build.py: mcpu=cortex-a53 -> cortex-a35 + mno-outline-atomics")
 
 old_flags = '"-ffp-contract=off",\n"-O2",'
 new_flags = (
@@ -839,15 +866,6 @@ with open(path, 'w') as f:
     f.write(text)
 print("android_build.py: -DHALO_ANDROID")
 PYEOF
-
-# ======================================================================
-# Fix v23: _clang_builtin_shim-Block ENTFERNT
-# ======================================================================
-# Der ursprüngliche _clang_builtin_shim in android_build.py (aus build 30)
-# kopierte nur 5 ARM-Header in einen Shim-Ordner und gab diesen zurück.
-# Das funktionierte. Der neue Block, der den kompletten Resource-Pfad
-# zurückgab, verursachte einen size_t-Konflikt mit musl.
-# → Block entfernt, ursprünglicher Ansatz bleibt aktiv.
 
 if [ "$PGO_MODE" = "train" ]; then
 python3 - "$SRC/tools/android_build.py" <<'PYEOF'
@@ -914,7 +932,7 @@ PYEOF
 fi
 
 # ======================================================================
-# Fix 3: linux_build.py - nur Compiler-Flags
+# Fix 3: linux_build.py
 # ======================================================================
 python3 - "$SRC/tools/linux_build.py" <<'PYEOF'
 import sys
@@ -954,7 +972,7 @@ rm -rf "$SRC/port/knulli/__pycache__"
 chmod +x "$SRC/port/knulli/build.sh" 2>/dev/null || true
 
 # ======================================================================
-# DIAGNOSE: Logging in host_glthread.c einfuegen
+# DIAGNOSE: Logging in host_glthread.c
 # ======================================================================
 if [ -f "$HERE/patches/patch_gl_init_order.py" ]; then
 echo ""
@@ -1167,7 +1185,7 @@ cat "$HERE/patches/$p" 2>/dev/null || true
 done
 [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
 echo "pgo-mode=$PGO_MODE"
-echo "gcc9-host-dynamic=v23-clang-builtin-shim-removed"
+echo "gcc9-host-dynamic=v24-alsa-mno-outline-atomics"
 (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 
@@ -1244,8 +1262,15 @@ fi
 
 cat <<'RELEASE'
 --------------------------------------------------------------------
-BUILD v23 - _clang_builtin_shim-Block entfernt (size_t-Konflikt)
+BUILD v24 - ALSA-Support + Cortex-A35 SIGILL-Fix
 --------------------------------------------------------------------
+Aenderungen:
+- libasound2 + libasound2-dev fuer aarch64 installiert
+- alsa.pc pkg-config-Datei fuer Cross-Compile
+- SDL2 mit -DSDL_ALSA=ON gebaut
+- -mno-outline-atomics gegen SIGILL auf Cortex-A35
+- ALSA-Verifikation im SDL2-Binary
+
 Installation auf M9 Pro:
 1. dist/Halo.sh           nach /roms/ports/Halo.sh
 2. dist/halo_guest.elf    nach /roms/ports/halo-ce/halo_guest.elf
