@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-patch_settings_only.py (v6 - FINALE)
+patch_settings_only.py (v7 - ABI-SICHER)
 
-BUGFIX: Der Dispatcher-Bereich war leer (>= 0x8000 UND < 0x8000 ist
-immer falsch). Die Obergrenze ist jetzt PC_MENU_FUNCTION_TOP = 0x9000.
-Zusätzlich: function_index - PC_MENU_FUNCTION_BASE (0-basiert),
-Rückgabetyp int, und return TRUE statt bare return.
+Änderungen gegenüber v6:
+- Der Dispatcher-Bereich ist jetzt korrekt begrenzt (>= 0x8000 UND < 0x9000).
+- Der Rückgabetyp von pc_menu_event_function_invoke ist int (nicht boolean),
+  da die ILP32/LP64-ABI unterschiedliche Rückgabewerte haben kann.
+- widget_instance wird mit int32_t/uint32_t deklariert (Guest-seitig).
 """
 import os, re, shutil, sys
 
@@ -80,8 +81,7 @@ def patch_event_dispatcher(base_dir):
     create_backup(file_path)
     content = read_file_content(file_path)
 
-    # Falls die Datei schon eine falsche Version hat: den leeren Bereich
-    # "< 0x8000" entfernen und durch korrekte v6-Version ersetzen.
+    # Bereich korrigieren (>= 0x8000 UND < 0x9000)
     bad_pattern = re.compile(
         r"if\s*\(\s*function_index\s*>=\s*PC_MENU_FUNCTION_BASE\s*&&\s*function_index\s*<\s*0x8000\s*\)\s*\{"
         r"(.*?)\}"
@@ -129,7 +129,7 @@ def patch_event_dispatcher(base_dir):
         write_file_content(file_path, content)
         print("[OK] ui_widget_event_handler_functions.c gepatcht."); return
 
-    # Erster Patch (Datei noch nicht gepatcht): mit korrekter v6-Logik
+    # Erster Patch (Datei noch nicht gepatcht): mit korrekter v7-Logik
     func_name = "ui_widget_event_handler_function_invoke"
     idx = content.find(func_name)
     if idx == -1:
@@ -156,7 +156,7 @@ def patch_event_dispatcher(base_dir):
     wd_name = others[2][1] if len(others) > 2 else None
 
     hook_header = (
-        "\n/* PC Settings Menu Hooks - v6 */\n"
+        "\n/* PC Settings Menu Hooks - v7 (ABI-sicher) */\n"
         "#include <stdint.h>\n"
         "#ifndef PC_MENU_FUNCTION_BASE\n"
         "#define PC_MENU_FUNCTION_BASE 0x8000\n"
@@ -184,7 +184,7 @@ def patch_event_dispatcher(base_dir):
     )
     content = content[:new_brace_open + 1] + insertion + content[new_brace_open + 1:]
     write_file_content(file_path, content)
-    print("[OK] ui_widget_event_handler_functions.c gepatcht (v6).")
+    print("[OK] ui_widget_event_handler_functions.c gepatcht (v7).")
 
 def patch_game_data_dispatcher(base_dir):
     file_path = os.path.join(base_dir, "source", "interface",
@@ -221,7 +221,7 @@ def patch_game_data_dispatcher(base_dir):
     widget_name = others[0][1]
     fi_name = names[fi_idx]
     hook_header = (
-        "\n/* PC Settings Menu Hooks - game data (v6) */\n"
+        "\n/* PC Settings Menu Hooks - game data (v7) */\n"
         "#include <stdint.h>\n"
         "#ifndef PC_MENU_GAME_DATA_BASE\n"
         "#define PC_MENU_GAME_DATA_BASE 0x8000\n"
@@ -245,7 +245,7 @@ def patch_game_data_dispatcher(base_dir):
     )
     content = content[:new_brace_open + 1] + insertion + content[new_brace_open + 1:]
     write_file_content(file_path, content)
-    print("[OK] ui_widget_game_data_input_functions.c gepatcht (v6).")
+    print("[OK] ui_widget_game_data_input_functions.c gepatcht (v7).")
 
 def patch_cache_files(base_dir):
     try:
@@ -305,7 +305,7 @@ def main():
     patches_dir = os.getcwd()
     if len(sys.argv) > 1: root_dir = sys.argv[1]
     if len(sys.argv) > 2: patches_dir = sys.argv[2]
-    print(f"=== patch_settings_only.py v6 ===")
+    print(f"=== patch_settings_only.py v7 (ABI-sicher) ===")
     patch_ui_widget(root_dir)
     patch_event_dispatcher(root_dir)
     patch_game_data_dispatcher(root_dir)
