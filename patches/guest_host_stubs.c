@@ -1,10 +1,10 @@
 /*
-GUEST_HOST_STUBS.C (v7)
+GUEST_HOST_STUBS.C (v8)
 
-v7:
-  - SDL_LoadFile jetzt mit korrektem Rückgabeverhalten. Liefert
-    eine kleine statische leere Datei statt NULL, damit Caller, die
-    den Rückgabewert ungeprüft nutzen, nicht sofort crashen.
+v8:
+  - SDL_LoadFile gibt jetzt NULL bei nicht existierender Datei zurück,
+    wie das Original. Das verhindert Parsing-Overflows, wenn das Spiel
+    eine leere Datei als gültige Config interpretiert.
   - Alle anderen Stubs unverändert.
 */
 
@@ -12,16 +12,16 @@ v7:
 
 #include <stddef.h>
 
-/* Ein einziges Null-Byte als "leere Datei". Caller, die den Inhalt
-   lesen wollen, bekommen einen gültigen Zeiger auf 1 Byte. */
-static const unsigned char empty_file[1] = { 0 };
-
+/* Gibt NULL zurück, wie das Original-SDL bei nicht existierender Datei.
+   Ein gültiger Zeiger auf eine leere Datei führte zu Parsing-Overflows
+   im TOML-Parser, wenn das Spiel eine gerade erst geschriebene Config
+   liest. */
 void *SDL_LoadFile(const char *file, size_t *datasize)
 {
 	(void)file;
 	if (datasize)
 		*datasize = 0;
-	return (void *)empty_file;
+	return NULL;
 }
 
 #endif /* HALO_ARM64_GUEST */
