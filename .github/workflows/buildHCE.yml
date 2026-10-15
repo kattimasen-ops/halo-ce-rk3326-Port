@@ -31,9 +31,6 @@ jobs:
       PGO_MODE: use
       JOBS: "4"
       DEBIAN_FRONTEND: noninteractive
-      # NEU v18: pkg-config soll die selbst erzeugten aarch64-.pc-Dateien
-      # in $SYSROOT_LIB/pkgconfig finden. PKG_CONFIG_PATH ist additiv zu
-      # den Standardpfaden (amd64-libdrm.pc bleibt auffindbar).
       PKG_CONFIG_PATH: ${{ github.workspace }}/sysroot/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig
 
     steps:
@@ -87,9 +84,10 @@ jobs:
             libgbm-dev \
             libudev-dev \
             libegl1-mesa-dev \
-            libgles2-mesa-dev
+            libgles2-mesa-dev \
+            libasound2-dev
 
-      - name: "aarch64-Multiarch: libdrm, libgbm, EGL, GLES fuer den SDL-Link bereitstellen"
+      - name: "aarch64-Multiarch: libdrm, libgbm, EGL, GLES, ALSA fuer den SDL-Link bereitstellen"
         run: |
           set -e
 
@@ -111,25 +109,24 @@ jobs:
           apt-get update
 
           echo "== arm64-Laufzeitbibliotheken installieren"
-          # libegl1 und libgles2 sind zwingend, sonst deaktiviert SDL2 den
-          # KMSDRM-Backend still und baut ohne Fensterunterstuetzung.
           apt-get install -y --no-install-recommends \
             libdrm2:arm64 \
             libgbm1:arm64 \
             libwayland-server0:arm64 \
             libexpat1:arm64 \
             libegl1:arm64 \
-            libgles2:arm64
+            libgles2:arm64 \
+            libasound2:arm64
 
           echo "== arm64-Libs in den Cross-Sysroot spiegeln"
           mkdir -p /usr/aarch64-linux-gnu/lib
 
-          # Symlinks, die der Cross-Linker (aarch64-linux-gnu-gcc) braucht.
           for pair in \
               "libdrm.so.2:libdrm.so" \
               "libgbm.so.1:libgbm.so" \
               "libEGL.so.1:libEGL.so" \
-              "libGLESv2.so.2:libGLESv2.so"; do
+              "libGLESv2.so.2:libGLESv2.so" \
+              "libasound.so.2:libasound.so"; do
             target="/usr/lib/aarch64-linux-gnu/${pair%%:*}"
             link="/usr/aarch64-linux-gnu/lib/${pair##*:}"
             if [ -e "$target" ]; then
@@ -144,25 +141,6 @@ jobs:
           echo "== Cross-Sysroot:"
           ls -la /usr/aarch64-linux-gnu/lib/ || true
 
-          # ==================================================================
-          # NEU v18: pkg-config-Dateien fuer die aarch64-Zielarchitektur
-          # ==================================================================
-          # Die arm64-Pakete libdrm2:arm64 / libgbm1:arm64 / libegl1:arm64
-          # bringen unter Ubuntu 20.04 keine .pc-Dateien mit; die sind nur
-          # in den Dev-Paketen enthalten, die mit multiarch nicht parallel
-          # zum amd64-Dev-Paket installierbar sind.
-          #
-          # SDL2 2.30.10 prueft in cmake/sdlchecks.cmake:
-          #     pkg_check_modules(KMSDRM libdrm gbm egl)
-          # Faellt auch nur eines der drei durch, wird das gesamte KMSDRM-
-          # Backend still deaktiviert. Deshalb legen wir hier minimale
-          # .pc-Dateien an, die exakt auf die obigen Symlinks in
-          # /usr/aarch64-linux-gnu/lib zeigen. Header sind architektur-
-          # unabhaengig (aus /usr/include bzw. /usr/include/libdrm).
-          #
-          # PKG_CONFIG_PATH (siehe env-Block) enthaelt $SYSROOT_LIB/pkgconfig,
-          # damit sowohl der KMSDRM-Check-Step als auch SDL2s CMake diese
-          # Dateien finden.
           PC_DIR="$SYSROOT_LIB/pkgconfig"
           mkdir -p "$PC_DIR"
 
@@ -216,6 +194,7 @@ jobs:
           Libs: -L${libdir} -lGLESv2
           Cflags: -I${includedir}
           PCEOF
+
           cat > "$PC_DIR/libudev.pc" << 'PCEOF'
           prefix=/usr
           exec_prefix=${prefix}
@@ -229,11 +208,24 @@ jobs:
           Cflags: -I${includedir}
           PCEOF
 
+          cat > "$PC_DIR/alsa.pc" << 'PCEOF'
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=/usr/aarch64-linux-gnu/lib
+          includedir=/usr/include
+
+          Name: alsa
+          Description: Advanced Linux Sound Architecture
+          Version: 1.2.4
+          Libs: -L${libdir} -lasound
+          Cflags: -I${includedir}
+          PCEOF
+
           echo "== aarch64 pkg-config-Dateien in $PC_DIR:"
           ls -la "$PC_DIR"
 
           echo "== pkg-config-Gegenprobe (arm64-Kontext):"
-          for m in libdrm gbm egl glesv2 libudev; do
+          for m in libdrm gbm egl glesv2 libudev alsa; do
             if pkg-config --exists "$m"; then
               echo "  OK: $m -> $(pkg-config --modversion "$m")"
             else
@@ -269,13 +261,11 @@ jobs:
           aarch64-linux-gnu-gcc -o /tmp/test /tmp/test.c
           file /tmp/test
 
-      - name: "KMSDRM-Abhaengigkeiten pruefen"
+      - name: "KMSDRM- und ALSA-Abhaengigkeiten pruefen"
         run: |
           set -e
-          echo "== pkg-config fuer SDL2s KMSDRM-Backend:"
-          # libdrm, gbm, egl und libudev werden alle geprueft. egl ist
-          # zwingend: ohne egl.pc schaltet SDL2 KMSDRM still ab.
-          for module in libdrm gbm egl libudev; do
+          echo "== pkg-config fuer SDL2s KMSDRM- und ALSA-Backend:"
+          for module in libdrm gbm egl libudev alsa; do
             if pkg-config --exists "$module"; then
               echo "  OK: $module $(pkg-config --modversion "$module" 2>/dev/null || echo '?')"
             else
@@ -285,7 +275,7 @@ jobs:
           done
           echo ""
           echo "== aarch64-Cross-Bibliotheken:"
-          for lib in libdrm.so libgbm.so libEGL.so libGLESv2.so; do
+          for lib in libdrm.so libgbm.so libEGL.so libGLESv2.so libasound.so; do
             if [ -e "/usr/aarch64-linux-gnu/lib/$lib" ]; then
               echo "  OK: /usr/aarch64-linux-gnu/lib/$lib -> $(readlink -f /usr/aarch64-linux-gnu/lib/$lib)"
             else
@@ -423,13 +413,19 @@ jobs:
           size=$(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0")
           echo "libSDL2-2.0.so.0: $size Bytes"
           echo ""
-          echo "== KMSDRM im SDL2-Binary (Strings):"
           if command -v aarch64-linux-gnu-strings > /dev/null 2>&1; then
+            echo "== KMSDRM im SDL2-Binary (Strings):"
             if aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -q "KMSDRM"; then
               echo "  OK: KMSDRM ist enthalten"
             else
               echo "  FEHLT: KMSDRM nicht im SDL2-Binary"
-              echo "  (SDL2 wurde ohne libdrm/gbm/egl gebaut)"
+            fi
+            echo ""
+            echo "== ALSA im SDL2-Binary (Strings):"
+            if aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -qi "alsa"; then
+              echo "  OK: ALSA ist enthalten"
+            else
+              echo "  FEHLT: ALSA nicht im SDL2-Binary"
             fi
             echo ""
             echo "== Mali-G31-Pageflip-Patch im SDL2-Binary:"
@@ -437,7 +433,6 @@ jobs:
               echo "  OK: Pageflip-Patch ist kompiliert"
             else
               echo "  FEHLT: Pageflip-Patch nicht im Binary"
-              echo "  (SDL2 wurde ohne den Mali-G31-Patch gebaut)"
             fi
           fi
           echo ""
@@ -446,7 +441,7 @@ jobs:
             aarch64-linux-gnu-readelf -d "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep NEEDED || true
           fi
 
-      - name: "Host-Binary: libmali.so.0 in NEEDED verifizieren"
+      - name: "Host-Binary: libmali.so.0 und libasound.so.2 in NEEDED verifizieren"
         if: always()
         run: |
           set +e
@@ -462,7 +457,11 @@ jobs:
               echo "  OK: libmali.so.0 ist in NEEDED"
             else
               echo "  FEHLER: libmali.so.0 fehlt in NEEDED"
-              echo "  Der Host wird zur Laufzeit mit SIGILL bei glGetString crashen."
+            fi
+            if aarch64-linux-gnu-readelf -d dist/halo | grep -q "libasound.so.2"; then
+              echo "  OK: libasound.so.2 ist in NEEDED"
+            else
+              echo "  HINWEIS: libasound.so.2 fehlt in NEEDED (SDL2 laedt ALSA via dlopen oder linkt direkt)"
             fi
           else
             echo "  (readelf nicht verfuegbar)"
@@ -516,6 +515,7 @@ jobs:
               echo "libSDL2-2.0.so.0: $(stat -c%s "$SYSROOT_LIB/libSDL2-2.0.so.0") Bytes"
               if command -v aarch64-linux-gnu-strings > /dev/null 2>&1; then
                 aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -i "kmsdrm" | head -5 || echo "  (kein KMSDRM-String)"
+                aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep -i "alsa" | head -5 || echo "  (kein ALSA-String)"
                 aarch64-linux-gnu-strings "$SYSROOT_LIB/libSDL2-2.0.so.0" | grep "Async pageflip rejected" | head -1 || echo "  (kein Pageflip-Patch-String)"
               fi
             else
