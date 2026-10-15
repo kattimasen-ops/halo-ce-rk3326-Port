@@ -3,8 +3,15 @@ set -euo pipefail
 # ======================================================================
 # Halo CE Universal - M9 Pro (RK3326 / Cortex-A35 + Mali-G31 MP2)
 #
-# v24: ALSA-Support fuer SDL2, -mno-outline-atomics fuer Cortex-A35,
-#      erweiterte pkg-config- und Binary-Verifikation.
+# v25: SDL2-Build-Fix.
+#      Der SDL2-CMake-Aufruf enthielt zuvor -I/usr/include und
+#      -I$ANDROID_NDK/.../sysroot/usr/include. Beide Pfade sind
+#      Fremd-Architekturen (amd64-glibc bzw. Bionic) und haben die
+#      Cross-Compiler-eigenen Sysroot-Header (pthread.h, dlfcn.h,
+#      stdint.h) ueberschrieben. SDL2s check_c_source_compiles-Tests
+#      schlugen fehl ("pthread.h not found", "dlopen not found",
+#      "Threads are needed by many SDL subsystems").
+#      Jetzt wird nur noch -I$LIBDRM_INCLUDE uebergeben.
 # ======================================================================
 
 PGO_MODE=${PGO_MODE:-use}
@@ -478,14 +485,21 @@ with open(path, 'w') as f:
 print("SDL2 KMSDRM Pageflip-Patch angewendet")
 PATCH_EOF
 
+    # ------------------------------------------------------------------
+    # WICHTIG: KEIN -I/usr/include und KEIN -I$NDK_INC in den SDL2-CFLAGS.
+    #
+    # /usr/include enthaelt die amd64-glibc-Header; der NDK-Sysroot
+    # enthaelt Bionic-Header. Beide ueberschreiben durch -I die
+    # Cross-Compiler-eigenen Sysroot-Header (pthread.h, dlfcn.h,
+    # stdint.h) und lassen SDL2s check_c_source_compiles-Tests
+    # fehlschlagen. Folge: "Threads are needed by many SDL subsystems"
+    # und "You must have SDL_LoadObject() support for dynamic loading".
+    #
+    # libdrm-Header sind architekturunabhaengig; nur dieser Pfad ist
+    # unbedenklich.
+    # ------------------------------------------------------------------
     EXTRA_INC=""
     [ -d "$LIBDRM_INCLUDE" ] && EXTRA_INC="$EXTRA_INC -I$LIBDRM_INCLUDE"
-    [ -d "/usr/include/libdrm" ] && EXTRA_INC="$EXTRA_INC -I/usr/include/libdrm"
-    [ -d "/usr/include" ] && EXTRA_INC="$EXTRA_INC -I/usr/include"
-    if [ -n "${ANDROID_NDK:-}" ]; then
-        NDK_INC=$(find "$ANDROID_NDK" -type d -path '*/sysroot/usr/include' 2>/dev/null | head -1)
-        [ -n "$NDK_INC" ] && EXTRA_INC="$EXTRA_INC -I$NDK_INC"
-    fi
 
     cmake -S "$SDL2_SRC" -B "$SDL2_BUILD" \
         -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
@@ -932,7 +946,7 @@ PYEOF
 fi
 
 # ======================================================================
-# Fix 3: linux_build.py
+# Fix 3: linux_build.py - nur Compiler-Flags
 # ======================================================================
 python3 - "$SRC/tools/linux_build.py" <<'PYEOF'
 import sys
@@ -972,7 +986,7 @@ rm -rf "$SRC/port/knulli/__pycache__"
 chmod +x "$SRC/port/knulli/build.sh" 2>/dev/null || true
 
 # ======================================================================
-# DIAGNOSE: Logging in host_glthread.c
+# DIAGNOSE: Logging in host_glthread.c einfuegen
 # ======================================================================
 if [ -f "$HERE/patches/patch_gl_init_order.py" ]; then
 echo ""
@@ -1185,7 +1199,7 @@ cat "$HERE/patches/$p" 2>/dev/null || true
 done
 [ -f "$HERE/pgo/halo_linux.profdata" ] && sha256sum "$HERE/pgo/halo_linux.profdata" | cut -d' ' -f1
 echo "pgo-mode=$PGO_MODE"
-echo "gcc9-host-dynamic=v24-alsa-mno-outline-atomics"
+echo "gcc9-host-dynamic=v25-sdl2-no-host-includes"
 (cd "$HERE/port/knulli" && find . -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 cat)
 } | sha256sum | cut -d' ' -f1)
 
@@ -1262,12 +1276,20 @@ fi
 
 cat <<'RELEASE'
 --------------------------------------------------------------------
-BUILD v24 - ALSA-Support + Cortex-A35 SIGILL-Fix
+BUILD v25 - SDL2-Build-Fix (Host-Includes entfernt)
 --------------------------------------------------------------------
-Aenderungen:
-- libasound2 + libasound2-dev fuer aarch64 installiert
+Aenderungen gegenueber v24:
+- SDL2-CMake erhaelt nur noch -I$LIBDRM_INCLUDE; /usr/include und
+  der Android-NDK-Sysroot werden NICHT mehr in die CFLAGS geschrieben.
+  Dadurch finden die check_c_source_compiles-Tests von SDL2 die
+  Cross-Compiler-eigenen Header fuer pthread.h, dlfcn.h und stdint.h.
+- Kommentar im Code dokumentiert den Grund.
+
+Bereits in v24:
+- libasound2 + libasound2-dev fuer aarch64
 - alsa.pc pkg-config-Datei fuer Cross-Compile
 - SDL2 mit -DSDL_ALSA=ON gebaut
+- SDL3 mit -DSDL_ALSA=ON gebaut
 - -mno-outline-atomics gegen SIGILL auf Cortex-A35
 - ALSA-Verifikation im SDL2-Binary
 
