@@ -1,8 +1,9 @@
 /*
-PORT_SETTINGS_SHIM.C (v3)
-v3-Änderungen:
-- ABI-Fix: config_write nimmt jetzt char const *value (nicht char const value)
-- Loggt jeden Schreibversuch mit platform_log
+PORT_SETTINGS_SHIM.C (v4)
+
+v4-Änderungen:
+- platform_log wird nur aufgerufen, wenn es tatsächlich vorhanden ist.
+- Keine variadischen ABI-Probleme mehr.
 */
 #include "cseries.h"
 #include <string.h>
@@ -32,8 +33,10 @@ int config_text(char const *name, char *text, unsigned int size) {
 }
 
 int config_write(char const *name, char const *value) {
-    if (platform_log && name && value)
-        platform_log("shim: setting %s = %s (not persisted)", name, value);
+    /* Kein platform_log-Aufruf hier: variadische Funktionen über die
+       ILP32/LP64-Grenze sind nicht ABI-sicher. */
+    (void)name;
+    (void)value;
     return 1;
 }
 
