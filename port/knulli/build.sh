@@ -40,6 +40,22 @@ fi
 
 ninja -j "$JOBS" build/android/halo_guest.elf build/android/host/host_import_table.c
 
+# ======================================================================
+# v24: C_INCLUDE_PATH fuer den Host-Build loeschen.
+# ======================================================================
+# Der Top-Level-build.sh (v24) exportiert C_INCLUDE_PATH auf einen
+# clang-Shim mit arm_neon.h und Co., damit der Guest-Build (clang-22)
+# unter -nostdinc diesen Header findet. GCC respektiert C_INCLUDE_PATH
+# ebenfalls - der Host-Build wuerde also clangs arm_neon.h einlesen und
+# an den clang-spezifischen Builtin-Attributen scheitern
+# (__clang_arm_builtin_alias etc.).
+#
+# Guest-Build oben (ninja) hat C_INCLUDE_PATH gebraucht. Ab hier nur
+# noch Host-Code mit aarch64-linux-gnu-gcc, also weg damit.
+# ======================================================================
+unset C_INCLUDE_PATH
+unset CPLUS_INCLUDE_PATH
+
 # --- KNULLI SO-DEPENDENCIES ---
 echo "== Kopiere Laufzeitbibliotheken nach $OUT/libs.aarch64/"
 copy_runtime_lib() {
