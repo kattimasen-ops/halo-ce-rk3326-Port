@@ -85,7 +85,9 @@ jobs:
             zlib1g-dev \
             libdrm-dev \
             libgbm-dev \
-            libudev-dev
+            libudev-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev
 
       - name: "aarch64-Multiarch: libdrm, libgbm, EGL, GLES fuer den SDL-Link bereitstellen"
         run: |
@@ -203,6 +205,17 @@ jobs:
           Cflags: -I${includedir}
           PCEOF
 
+          cat > "$PC_DIR/glesv2.pc" << 'PCEOF'
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=/usr/aarch64-linux-gnu/lib
+          includedir=/usr/include
+          Name: glesv2
+          Description: OpenGL ES v2 library
+          Version: 2.0
+          Libs: -L${libdir} -lGLESv2
+          Cflags: -I${includedir}
+          PCEOF
           cat > "$PC_DIR/libudev.pc" << 'PCEOF'
           prefix=/usr
           exec_prefix=${prefix}
@@ -220,7 +233,7 @@ jobs:
           ls -la "$PC_DIR"
 
           echo "== pkg-config-Gegenprobe (arm64-Kontext):"
-          for m in libdrm gbm egl libudev; do
+          for m in libdrm gbm egl glesv2 libudev; do
             if pkg-config --exists "$m"; then
               echo "  OK: $m -> $(pkg-config --modversion "$m")"
             else
